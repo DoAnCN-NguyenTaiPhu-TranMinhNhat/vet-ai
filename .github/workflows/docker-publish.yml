@@ -36,6 +36,15 @@ jobs:
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
 
+      - name: Debug ai-service directory
+        run: |
+          echo "--- Repository root ---"
+          ls -la
+          echo "--- ai-service folder ---"
+          ls -la ai-service/ || true
+          echo "--- Check Dockerfile existence ---"
+          test -f ai-service/Dockerfile && echo "Dockerfile exists" || echo "Dockerfile NOT found"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
