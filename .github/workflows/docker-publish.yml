@@ -39,7 +39,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: ./ai-service
+          context: .
           file: ./ai-service/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
