@@ -41,4 +41,10 @@ jobs:
         env:
           MODEL_DIR: ./models/v2
         run: |
-          python -m pytest
+          echo "--- ai-service directory ---"
+          ls -la
+          echo "--- ai-service/tests directory ---"
+          ls -la tests || true
+          echo "--- pytest.ini ---"
+          cat pytest.ini || true
+          python -m pytest -q tests
