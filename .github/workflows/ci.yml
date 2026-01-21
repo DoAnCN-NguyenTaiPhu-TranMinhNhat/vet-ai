@@ -27,9 +27,14 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r ai-service/requirements.txt
 
+      - name: Debug installed packages
+        run: |
+          python -m pip --version
+          python -m pip list | grep -E '^(pytest|fastapi|scikit-learn)\b' || true
+
       - name: Run tests
         working-directory: ai-service
         env:
           MODEL_DIR: ./models/v2
         run: |
-          pytest
+          python -m pytest
