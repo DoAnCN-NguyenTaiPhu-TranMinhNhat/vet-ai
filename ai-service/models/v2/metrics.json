@@ -1,0 +1,12 @@
+{
+  "val_accuracy": 1.0,
+  "val_macro_f1": 1.0,
+  "seed": 42,
+  "data_path_my": "/kaggle/input/animal-disease-prediction/veterinary_full_data_10000.csv",
+  "data_path_kaggle": "/kaggle/input/d/shijo96john/animal-disease-prediction/cleaned_animal_disease_prediction.csv",
+  "mapping_mode": "conservative",
+  "kaggle_oversample": 5,
+  "kaggle_holdout_frac": 0.2,
+  "kaggle_holdout_accuracy": 0.9047619047619048,
+  "kaggle_holdout_macro_f1": 0.9218200100553041
+}

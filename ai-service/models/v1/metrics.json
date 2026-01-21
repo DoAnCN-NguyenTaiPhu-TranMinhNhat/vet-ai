@@ -1,0 +1,6 @@
+{
+  "val_accuracy": 1.0,
+  "val_macro_f1": 1.0,
+  "seed": 42,
+  "data_path": "/kaggle/input/animal-disease-prediction/veterinary_full_data_10000.csv"
+}

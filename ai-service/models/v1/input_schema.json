@@ -1,0 +1,23 @@
+{
+  "required_fields": [
+    "animal_type",
+    "gender",
+    "age_months",
+    "weight_kg",
+    "temperature",
+    "heart_rate",
+    "current_season",
+    "vaccination_status",
+    "medical_history",
+    "symptoms_list",
+    "symptom_duration"
+  ],
+  "target_field": "target_diagnosis",
+  "symptoms_format": "comma-separated string, e.g. 'fever, cough, lethargy'",
+  "notes": {
+    "medical_history_missing": "fill with 'Unknown'",
+    "drop_fields": [
+      "pet_id"
+    ]
+  }
+}
