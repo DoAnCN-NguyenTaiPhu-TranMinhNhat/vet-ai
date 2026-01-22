@@ -42,7 +42,7 @@ class DoctorFeedback(BaseModel):
     data_quality_score: float = Field(ge=0.0, le=1.0, default=1.0)
 
 class TrainingTriggerRequest(BaseModel):
-    trigger_type: str = Field(regex="^(scheduled|manual|automatic)$")
+    trigger_type: str = Field(pattern="^(scheduled|manual|automatic)$")
     trigger_reason: Optional[str] = None
     force: bool = False  # Override threshold check
 
