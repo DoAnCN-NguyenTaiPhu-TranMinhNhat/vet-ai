@@ -66,8 +66,8 @@ async def log_prediction(prediction: PredictionLog) -> int:
     """Log prediction to database and return prediction ID"""
     # TODO: Implement actual database logging
     logger.info(f"Logging prediction for visit {prediction.visit_id}")
-    # Mock implementation
-    return hash(f"{prediction.visit_id}-{prediction.prediction_timestamp}")
+    # Mock implementation - use current timestamp
+    return hash(f"{prediction.visit_id}-{datetime.now()}")
 
 async def save_feedback(feedback: DoctorFeedback) -> bool:
     """Save doctor feedback to database"""
