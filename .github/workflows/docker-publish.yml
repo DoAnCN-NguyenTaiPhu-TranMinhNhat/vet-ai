@@ -36,6 +36,11 @@ jobs:
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
 
+      - name: Install dependencies
+        run: |
+          cd ai-service
+          pip install -r requirements.txt
+
       - name: Debug ai-service directory
         run: |
           echo "--- Repository root ---"
