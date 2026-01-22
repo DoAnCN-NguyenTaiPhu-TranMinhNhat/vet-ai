@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  vet-ai:
+    build: .
+    container_name: vet-ai
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL_DIR=/app/ai-service/models/v2
+      - HOST=0.0.0.0
+      - PORT=8000
+      - LOG_LEVEL=INFO
+      - ENABLE_METRICS=false
+      - METRICS_PORT=9090
+      - ENABLE_SHAP=false
+      - ENABLE_EXPLAINABILITY=false
+      - TRAINING_THRESHOLD=100
+      - TRAINING_WINDOW_DAYS=30
+    volumes:
+      - ./models:/app/models
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  vet-ai-models:
+  vet-ai-logs:
