@@ -8,6 +8,9 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from scipy import sparse
 
+# Import continuous training endpoints
+from continuous_training import router as ct_router
+
 
 def parse_symptoms(s: Any) -> list[str]:
     if s is None:
@@ -34,6 +37,9 @@ class PredictRequest(BaseModel):
 
 
 app = FastAPI(title="Veterinary Diagnosis AI", version="0.1.0")
+
+# Include continuous training endpoints
+app.include_router(ct_router)
 
 
 _DEFAULT_MODEL_DIR = "./models/v2"

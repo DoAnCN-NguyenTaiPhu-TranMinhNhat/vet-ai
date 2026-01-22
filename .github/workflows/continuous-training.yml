@@ -1,0 +1,206 @@
+name: Continuous Training
+
+on:
+  workflow_dispatch:
+    inputs:
+      trigger_reason:
+        description: 'Reason for manual trigger'
+        required: false
+        type: string
+  schedule:
+    # Run daily at 2 AM UTC to check for training eligibility
+    - cron: '0 2 * * *'
+  repository_dispatch:
+    types: [training-trigger]
+
+jobs:
+  check-eligibility:
+    runs-on: ubuntu-latest
+    outputs:
+      should-train: ${{ steps.check.outputs.should-train }}
+      eligible-count: ${{ steps.check.outputs.eligible-count }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          cd ai-service
+          pip install -r requirements.txt
+      
+      - name: Check training eligibility
+        id: check
+        run: |
+          # Call FastAPI endpoint to check eligibility
+          response=$(curl -s "http://localhost:8000/continuous-training/training/eligibility" || echo '{"eligible_feedback_count":0}')
+          eligible_count=$(echo "$response" | python3 -c "import sys, json; print(json.load(sys.stdin).get('eligible_feedback_count', 0))")
+          should_train=$((eligible_count >= 100))
+          
+          echo "eligible-count=$eligible_count" >> $GITHUB_OUTPUT
+          echo "should-train=$should_train" >> $GITHUB_OUTPUT
+          
+          echo "Eligible feedback count: $eligible_count"
+          echo "Should trigger training: $should_train"
+
+  trigger-training:
+    needs: check-eligibility
+    if: needs.check-eligibility.outputs.should-train == '1' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install MLflow and dependencies
+        run: |
+          pip install mlflow scikit-learn pandas numpy
+      
+      - name: Start MLflow server
+        run: |
+          mlflow server --host 0.0.0.0 --port 5000 &
+          sleep 5
+      
+      - name: Run continuous training
+        run: |
+          # For demo, use mock data. In production, this would load from database
+          python3 -c "
+          import requests
+          import json
+          
+          # Trigger training via FastAPI endpoint
+          trigger_type = 'automatic'
+          if [ '${{ github.event_name }}' = 'workflow_dispatch' ]; then
+            trigger_type = 'manual'
+          fi
+          
+          payload = {
+            'trigger_type': trigger_type,
+            'trigger_reason': '${{ github.event.inputs.trigger_reason || GitHub Actions trigger }}',
+            'force': False
+          }
+          
+          response = requests.post(
+            'http://localhost:8000/continuous-training/training/trigger',
+            json=payload
+          )
+          
+          if response.status_code == 201:
+            result = response.json()
+            print(f'Training triggered: {result}')
+            echo 'training_id=${result[\"training_id\"]}' >> $GITHUB_OUTPUT
+          else:
+            echo 'Failed to trigger training'
+            exit 1
+          "
+        id: trigger
+
+  monitor-training:
+    needs: trigger-training
+    if: needs.trigger-training.result == 'success'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Monitor training progress
+        run: |
+          # Poll training status
+          training_id="${{ needs.trigger-training.outputs.training_id }}"
+          max_attempts=30
+          attempt=1
+          
+          while [ $attempt -le $max_attempts ]; do
+            echo "Checking training status (attempt $attempt/$max_attempts)"
+            
+            response=$(curl -s "http://localhost:8000/continuous-training/training/status?training_id=$training_id")
+            status=$(echo "$response" | python3 -c "import sys, json; print(json.load(sys.stdin).get('status', 'unknown'))")
+            
+            echo "Training status: $status"
+            
+            if [ "$status" = "completed" ]; then
+              echo "Training completed successfully!"
+              
+              # Extract metrics
+              accuracy=$(echo "$response" | python3 -c "import sys, json; print(json.load(sys.stdin).get('training_accuracy', 0))")
+              f1_score=$(echo "$response" | python3 -c "import sys, json; print(json.load(sys.stdin).get('f1_score', 0))")
+              
+              echo "Training accuracy: $accuracy"
+              echo "Training F1: $f1_score"
+              
+              # Check if model meets deployment criteria
+              if (( $(echo "$accuracy >= 0.75" | bc -l) )) && (( $(echo "$f1_score >= 0.70" | bc -l) )); then
+                echo "Model meets deployment criteria!"
+                # TODO: Trigger deployment workflow
+              else
+                echo "Model does not meet deployment criteria"
+              fi
+              
+              break
+            elif [ "$status" = "failed" ]; then
+              echo "Training failed!"
+              error_msg=$(echo "$response" | python3 -c "import sys, json; print(json.load(sys.stdin).get('error_message', 'Unknown error'))")
+              echo "Error: $error_msg"
+              exit 1
+            fi
+            
+            sleep 30
+            attempt=$((attempt + 1))
+          done
+          
+          if [ $attempt -gt $max_attempts ]; then
+            echo "Training monitoring timed out"
+            exit 1
+          fi
+
+  notify-results:
+    needs: [check-eligibility, trigger-training, monitor-training]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Prepare notification
+        run: |
+          eligible_count="${{ needs.check-eligibility.outputs.eligible-count }}"
+          should_train="${{ needs.check-eligibility.outputs.should-train }}"
+          
+          if [ "$should_train" = "1" ]; then
+            if [ "${{ needs.trigger-training.result }}" = "success" ]; then
+              if [ "${{ needs.monitor-training.result }}" = "success" ]; then
+                message="✅ Continuous training completed successfully! Eligible feedback: $eligible_count"
+              else
+                message="❌ Continuous training failed. Eligible feedback: $eligible_count"
+              fi
+            else
+              message="❌ Failed to trigger training. Eligible feedback: $eligible_count"
+            fi
+          else
+            message="ℹ️ Insufficient data for training. Eligible feedback: $eligible_count"
+          fi
+          
+          echo "message=$message" >> $GITHUB_OUTPUT
+        id: notify
+      
+      - name: Create issue for failed training
+        if: needs.monitor-training.result == 'failure'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'Continuous Training Failed',
+              body: '${{ steps.notify.outputs.message }}',
+              labels: ['continuous-training', 'failed']
+            })
+      
+      - name: Summary
+        run: echo "${{ steps.notify.outputs.message }}"
