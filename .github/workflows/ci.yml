@@ -20,14 +20,14 @@ jobs:
           python-version: "3.11"
           cache: "pip"
           cache-dependency-path: |
-            ai-service/requirements.txt
+            ai_service/requirements.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          echo "--- ai-service/requirements.txt ---"
-          cat ai-service/requirements.txt
-          python -m pip install -r ai-service/requirements.txt
+          echo "--- ai_service/requirements.txt ---"
+          cat ai_service/requirements.txt
+          python -m pip install -r ai_service/requirements.txt
           # Defensive: ensure test deps exist even if requirements install/caching is incomplete
           python -m pip install pytest httpx
 
@@ -37,13 +37,13 @@ jobs:
           python -m pip list | grep -E '^(pytest|fastapi|scikit-learn)\b' || true
 
       - name: Run tests
-        working-directory: ai-service
+        working-directory: ai_service
         env:
           MODEL_DIR: ./models/v2
         run: |
-          echo "--- ai-service directory ---"
+          echo "--- ai_service directory ---"
           ls -la
-          echo "--- ai-service/tests directory ---"
+          echo "--- ai_service/tests directory ---"
           ls -la tests || true
           echo "--- pytest.ini ---"
           cat pytest.ini || true
