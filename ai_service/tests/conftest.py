@@ -20,8 +20,12 @@ def _configure_model_dir() -> None:
 def client() -> TestClient:
     import sys
     import os
-    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-    from ai_service.main import app
+    # Add parent directory to path for imports
+    parent_dir = os.path.dirname(os.path.dirname(__file__))
+    sys.path.insert(0, parent_dir)
+    
+    # Import main directly since we're in ai_service directory
+    from main import app
 
     with TestClient(app) as c:
         yield c
