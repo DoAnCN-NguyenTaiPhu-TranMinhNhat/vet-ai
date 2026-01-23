@@ -21,7 +21,7 @@ def client() -> TestClient:
     import sys
     import os
     sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-    from main import app
+    from ai_service.main import app
 
     with TestClient(app) as c:
         yield c

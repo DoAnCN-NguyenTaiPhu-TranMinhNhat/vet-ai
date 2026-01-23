@@ -9,7 +9,11 @@ from pydantic import BaseModel
 from scipy import sparse
 
 # Import continuous training endpoints
-from .continuous_training import router as ct_router
+try:
+    from .continuous_training import router as ct_router
+except ImportError:
+    # Fallback for direct execution/testing
+    from continuous_training import router as ct_router
 
 
 def parse_symptoms(s: Any) -> list[str]:
