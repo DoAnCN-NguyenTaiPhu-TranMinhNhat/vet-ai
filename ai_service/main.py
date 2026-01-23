@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from scipy import sparse
 
 # Import continuous training endpoints
-from continuous_training import router as ct_router
+from .continuous_training import router as ct_router
 
 
 def parse_symptoms(s: Any) -> list[str]:
@@ -42,12 +42,12 @@ app = FastAPI(title="Veterinary Diagnosis AI", version="0.1.0")
 app.include_router(ct_router)
 
 
-_DEFAULT_MODEL_DIR = "./models/v2"
+_DEFAULT_MODEL_DIR = "/app/models/v2"
 MODEL_VERSION = os.getenv("MODEL_VERSION")
 MODEL_DIR = os.getenv("MODEL_DIR")
 if MODEL_DIR is None or not str(MODEL_DIR).strip():
     if MODEL_VERSION is not None and str(MODEL_VERSION).strip():
-        MODEL_DIR = os.path.join("./models", str(MODEL_VERSION).strip())
+        MODEL_DIR = os.path.join("/app/models", str(MODEL_VERSION).strip())
     else:
         MODEL_DIR = _DEFAULT_MODEL_DIR
 
