@@ -8,3 +8,5 @@ scikit-learn==1.6.1
 joblib
 pytest
 httpx
+# MLOps dependencies
+evidently>=0.7.0

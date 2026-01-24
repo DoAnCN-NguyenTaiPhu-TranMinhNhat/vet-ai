@@ -15,6 +15,13 @@ except ImportError:
     # Fallback for direct execution/testing
     from continuous_training import router as ct_router
 
+# Import MLOps endpoints
+try:
+    from .mlops_api import router as mlops_router
+except ImportError:
+    # Fallback for direct execution/testing
+    from mlops_api import router as mlops_router
+
 
 def parse_symptoms(s: Any) -> list[str]:
     if s is None:
@@ -45,13 +52,16 @@ app = FastAPI(title="Veterinary Diagnosis AI", version="0.1.0")
 # Include continuous training endpoints
 app.include_router(ct_router)
 
+# Include MLOps endpoints
+app.include_router(mlops_router)
 
-_DEFAULT_MODEL_DIR = "/app/models/v2"
+
+_DEFAULT_MODEL_DIR = "./ai_service/models/v2"
 MODEL_VERSION = os.getenv("MODEL_VERSION")
 MODEL_DIR = os.getenv("MODEL_DIR")
 if MODEL_DIR is None or not str(MODEL_DIR).strip():
     if MODEL_VERSION is not None and str(MODEL_VERSION).strip():
-        MODEL_DIR = os.path.join("/app/models", str(MODEL_VERSION).strip())
+        MODEL_DIR = os.path.join("./ai_service/models", str(MODEL_VERSION).strip())
     else:
         MODEL_DIR = _DEFAULT_MODEL_DIR
 
