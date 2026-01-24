@@ -12,7 +12,7 @@ import pandas as pd
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 
-from .mlops_manager import MLOpsManager
+from ai_service.mlops_manager import MLOpsManager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)

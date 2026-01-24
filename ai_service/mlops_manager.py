@@ -11,8 +11,8 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 import pandas as pd
 import numpy as np
-from .data_drift import DataDriftDetector
-from .model_monitor import ModelMonitor
+from ai_service.data_drift import DataDriftDetector
+from ai_service.model_monitor import ModelMonitor
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)

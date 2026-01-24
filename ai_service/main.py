@@ -10,14 +10,14 @@ from scipy import sparse
 
 # Import continuous training endpoints
 try:
-    from .continuous_training import router as ct_router
+    from ai_service.continuous_training import router as ct_router
 except ImportError:
     # Fallback for direct execution/testing
     from continuous_training import router as ct_router
 
 # Import MLOps endpoints
 try:
-    from .mlops_api import router as mlops_router
+    from ai_service.mlops_api import router as mlops_router
 except ImportError:
     # Fallback for direct execution/testing
     from mlops_api import router as mlops_router
