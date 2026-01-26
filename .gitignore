@@ -37,3 +37,5 @@ Thumbs.db
 # Local artifacts
 artifacts/
 mlruns/
+infrastructure/DEPLOYMENT_GUIDE.md
+infrastructure/ENV_SETUP.md

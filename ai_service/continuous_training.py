@@ -4,12 +4,15 @@ Handles prediction logging and training trigger logic
 """
 
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
+from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
+from fastapi import HTTPException, BackgroundTasks, APIRouter
+import asyncio
 import logging
 import os
 import json
+import uuid
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -63,49 +66,178 @@ class TrainingStatus(BaseModel):
 
 # Mock database functions (replace with actual DB implementation)
 async def log_prediction(prediction: PredictionLog) -> int:
-    """Log prediction to database and return prediction ID"""
-    # TODO: Implement actual database logging
+    """Log prediction to database"""
+    # TODO: Implement actual database save
     logger.info(f"Logging prediction for visit {prediction.visit_id}")
-    # Mock implementation - use current timestamp
-    return hash(f"{prediction.visit_id}-{datetime.now()}")
+    
+    # Store in memory for demo
+    prediction_data = {
+        "id": hash(f"{prediction.visit_id}-{datetime.now()}"),
+        "visit_id": prediction.visit_id,
+        "pet_id": prediction.pet_id,
+        "prediction_input": prediction.prediction_input,
+        "prediction_output": prediction.prediction_output,
+        "model_version": prediction.model_version,
+        "confidence_score": prediction.confidence_score,
+        "top_k_predictions": prediction.top_k_predictions,
+        "veterinarian_id": prediction.veterinarian_id,
+        "clinic_id": prediction.clinic_id,
+        "timestamp": datetime.now()
+    }
+    prediction_logs.append(prediction_data)
+    
+    return prediction_data["id"]
 
 async def save_feedback(feedback: DoctorFeedback) -> bool:
     """Save doctor feedback to database"""
     # TODO: Implement actual database save
     logger.info(f"Saving feedback for prediction {feedback.prediction_id}")
+    
+    # Store in memory for demo
+    feedback_data_item = {
+        "prediction_id": feedback.prediction_id,
+        "final_diagnosis": feedback.final_diagnosis,
+        "is_correct": feedback.is_correct,
+        "confidence_rating": feedback.confidence_rating,
+        "comments": feedback.comments,
+        "veterinarian_id": feedback.veterinarian_id,
+        "is_training_eligible": feedback.is_training_eligible,
+        "data_quality_score": feedback.data_quality_score,
+        "timestamp": datetime.now()
+    }
+    feedback_data.append(feedback_data_item)
+    
+    logger.info(f"Feedback saved. Total feedback count: {len(feedback_data)}")
     return True
+
+# In-memory storage for demo (replace with database in production)
+prediction_logs = []
+feedback_data = []
+training_jobs = {}
+training_counter = 0  # Sequential counter for reliable IDs
+
+# Initialize with existing count (95) to maintain current state
+for i in range(95):
+    feedback_data.append({
+        "prediction_id": i + 1,
+        "final_diagnosis": f"Mock diagnosis {i + 1}",
+        "is_correct": True,
+        "confidence_rating": 4,
+        "comments": "Mock feedback",
+        "veterinarian_id": 1,
+        "is_training_eligible": True,
+        "data_quality_score": 1.0,
+        "timestamp": datetime.now() - timedelta(hours=i+1)
+    })
+
+logger.info(f"Initialized with {len(feedback_data)} existing feedback entries")
 
 async def count_eligible_feedback(days: int = TRAINING_WINDOW_DAYS) -> int:
     """Count eligible feedback in the last N days"""
-    # TODO: Implement actual database query
-    # Mock implementation for demo
-    return 95  # Example count
+    # Count actual feedback from in-memory storage
+    cutoff_date = datetime.now() - timedelta(days=days)
+    eligible_count = 0
+    
+    for feedback in feedback_data:
+        # Check if feedback is within window and eligible
+        feedback_date = feedback.get('timestamp', datetime.now())
+        if feedback_date >= cutoff_date and feedback.get('is_training_eligible', True):
+            eligible_count += 1
+    
+    logger.info(f"Current eligible feedback count: {eligible_count}")
+    return eligible_count
 
 async def trigger_training_job(request: TrainingTriggerRequest) -> int:
     """Trigger a training job and return training ID"""
     # TODO: Implement actual training trigger (MLflow, Airflow, etc.)
     logger.info(f"Triggering training: {request.trigger_type}")
-    # Mock implementation
-    return hash(f"{request.trigger_type}-{datetime.now()}")
+    
+    # Generate reliable sequential training ID
+    global training_counter
+    training_counter += 1
+    training_id = training_counter
+    
+    # Store training job
+    training_jobs[training_id] = {
+        "training_id": training_id,
+        "status": "running",
+        "start_time": datetime.now(),
+        "end_time": None,
+        "total_predictions": len(prediction_logs),
+        "eligible_feedback_count": len(feedback_data),
+        "previous_model_version": "v2.0",
+        "new_model_version": None,
+        "training_accuracy": None,
+        "validation_accuracy": None,
+        "f1_score": None,
+        "is_deployed": False,
+        "error_message": None,
+        "trigger_type": request.trigger_type
+    }
+    
+    # Simulate training completion after 30 seconds
+    logger.info(f"Starting training simulation for job {training_id}")
+    task = asyncio.create_task(simulate_training_completion(training_id))
+    logger.info(f"Training simulation task created: {task}")
+    
+    return training_id
+
+async def simulate_training_completion(training_id: int):
+    """Simulate training completion after delay"""
+    try:
+        logger.info(f"Training simulation started for job {training_id}")
+        await asyncio.sleep(30)  # 30 seconds training time
+        
+        if training_id in training_jobs:
+            # Update training job with completion
+            training_jobs[training_id].update({
+                "status": "completed",
+                "end_time": datetime.now(),
+                "new_model_version": "v2.1",
+                "training_accuracy": 0.92,
+                "validation_accuracy": 0.89,
+                "f1_score": 0.91,
+                "is_deployed": True
+            })
+            
+            # Reset feedback count after successful training
+            global feedback_data
+            feedback_data.clear()
+            logger.info(f"Feedback data reset after training completion. New count: {len(feedback_data)}")
+            
+            logger.info(f"Training {training_id} completed successfully!")
+        else:
+            logger.error(f"Training job {training_id} not found in storage")
+    except Exception as e:
+        logger.error(f"Training simulation failed for {training_id}: {e}")
+        if training_id in training_jobs:
+            training_jobs[training_id].update({
+                "status": "failed",
+                "error_message": str(e)
+            })
 
 async def get_training_status(training_id: int) -> Optional[TrainingStatus]:
     """Get training status by ID"""
-    # TODO: Implement actual database query
-    # Mock implementation
+    # Check if training job exists
+    if training_id in training_jobs:
+        job_data = training_jobs[training_id]
+        return TrainingStatus(**job_data)
+    
+    # Return default pending status for unknown jobs
     return TrainingStatus(
         training_id=training_id,
         status="pending",
         start_time=None,
         end_time=None,
-        total_predictions=150,
-        eligible_feedback_count=95,
+        total_predictions=len(prediction_logs),
+        eligible_feedback_count=len(feedback_data),
         previous_model_version="v2.0",
         new_model_version=None,
         training_accuracy=None,
         validation_accuracy=None,
         f1_score=None,
         is_deployed=False,
-        error_message=None
+        error_message="Training job not found"
     )
 
 # API Endpoints
