@@ -1,0 +1,45 @@
+# Training Dockerfile - Optimized for ML training workloads
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies for ML training
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    make \
+    libopenblas-dev \
+    liblapack-dev \
+    gfortran \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first for better caching
+COPY requirements.txt .
+COPY requirements-training.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements-training.txt
+
+# Copy application code
+COPY ai_service/ ./ai_service/
+COPY train_eks.py ./
+COPY train_local.py ./
+
+# Create non-root user
+RUN useradd --create-home --shell /bin/bash training \
+    && chown -R training:training /app
+USER training
+
+# Set environment variables
+ENV PYTHONPATH=/app
+ENV MLFLOW_TRACKING_URI=${MLFLOW_TRACKING_URI:-http://mlflow:5000}
+ENV DATA_SOURCE=${DATA_SOURCE:-api}
+
+# Health check
+HEALTHCHECK --interval=60s --timeout=10s --start-period=40s --retries=3 \
+    CMD python -c "import sys; sys.exit(0)" || exit 1
+
+# Default command for EKS training
+CMD ["python", "train_eks.py"]

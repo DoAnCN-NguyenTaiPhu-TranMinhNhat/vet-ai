@@ -1,4 +1,5 @@
 import os
+import logging
 from typing import Any
 
 import joblib
@@ -8,19 +9,30 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from scipy import sparse
 
+# Configure logging
+logger = logging.getLogger(__name__)
+
 # Import continuous training endpoints
 try:
     from ai_service.continuous_training import router as ct_router
 except ImportError:
     # Fallback for direct execution/testing
-    from continuous_training import router as ct_router
+    try:
+        from continuous_training import router as ct_router
+    except ImportError:
+        print("Warning: continuous_training module not found")
+        ct_router = None
 
 # Import MLOps endpoints
 try:
     from ai_service.mlops_api import router as mlops_router
 except ImportError:
     # Fallback for direct execution/testing
-    from mlops_api import router as mlops_router
+    try:
+        from mlops_api import router as mlops_router
+    except ImportError:
+        print("Warning: mlops_api module not found")
+        mlops_router = None
 
 
 def parse_symptoms(s: Any) -> list[str]:
@@ -49,11 +61,13 @@ class PredictRequest(BaseModel):
 
 app = FastAPI(title="Veterinary Diagnosis AI", version="0.1.0")
 
-# Include continuous training endpoints
-app.include_router(ct_router)
+# Include continuous training endpoints if available
+if ct_router:
+    app.include_router(ct_router)
 
-# Include MLOps endpoints
-app.include_router(mlops_router)
+# Include MLOps endpoints if available
+if mlops_router:
+    app.include_router(mlops_router)
 
 
 _DEFAULT_MODEL_DIR = "./ai_service/models/v2"
@@ -111,8 +125,13 @@ def model_info() -> dict[str, Any]:
     }
 
 
+# Global counter for prediction IDs
+_prediction_counter = 0
+
 @app.post("/predict")
-def predict(req: PredictRequest) -> dict[str, Any]:
+async def predict(req: PredictRequest) -> dict[str, Any]:
+    global _prediction_counter
+    
     if _model is None:
         load_artifacts()
 
@@ -160,8 +179,41 @@ def predict(req: PredictRequest) -> dict[str, Any]:
             for i in top_idx
         ]
 
+    # Increment prediction counter
+    _prediction_counter += 1
+    prediction_id = _prediction_counter
+
+    # Log prediction for continuous training
+    try:
+        from ai_service.continuous_training import PredictionLog, log_prediction
+        from datetime import datetime
+        
+        prediction_log = PredictionLog(
+            id=prediction_id,  # Simple sequential integer
+            visit_id=prediction_id,  # Same as prediction ID for simplicity
+            pet_id=prediction_id,  # Same as prediction ID for simplicity
+            prediction_input=payload,
+            prediction_output={
+                "diagnosis": str(pred),
+                "confidence": confidence,
+                "top_k": top_k
+            },
+            model_version="v2.0",
+            confidence_score=confidence,
+            top_k_predictions=top_k or [],
+            veterinarian_id=1,  # Default, should come from auth context
+            clinic_id=1,
+            timestamp=datetime.now()
+        )
+        
+        await log_prediction(prediction_log)
+        logger.info(f"Prediction logged successfully with ID: {prediction_id}")
+    except Exception as e:
+        logger.warning(f"Failed to log prediction: {e}")
+
     return {
         "diagnosis": str(pred),
         "confidence": confidence,
         "top_k": top_k,
+        "prediction_id": prediction_id  # Return ID for feedback reference
     }
