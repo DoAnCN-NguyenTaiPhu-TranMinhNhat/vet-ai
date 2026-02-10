@@ -44,7 +44,8 @@ TRAINING_NODE_GROUP = os.getenv("TRAINING_NODE_GROUP", "training-nodes")
 
 # Pydantic models
 class PredictionLog(BaseModel):
-    visit_id: int
+    id: int  # Use ID from main.py
+    visit_id: Optional[int] = None
     pet_id: int
     prediction_input: Dict
     prediction_output: Dict
@@ -58,7 +59,7 @@ class DoctorFeedback(BaseModel):
     prediction_id: int
     final_diagnosis: str
     is_correct: bool
-    confidence_rating: int = Field(ge=1, le=5)
+    confidence_rating: Optional[int] = Field(ge=0, le=5, default=None)
     comments: Optional[str] = None
     veterinarian_id: int
     is_training_eligible: bool = True
@@ -89,10 +90,11 @@ class TrainingStatus(BaseModel):
 # Database functions (currently in-memory, ready for database migration)
 async def log_prediction(prediction: PredictionLog) -> int:
     """Log prediction to storage"""
-    logger.info(f"Logging prediction for visit {prediction.visit_id}")
+    logger.info(f"Logging prediction for visit {prediction.visit_id}, ID: {prediction.id}")
     
+    # Use ID from main.py directly - don't generate new ID
     prediction_data = {
-        "id": hash(f"{prediction.visit_id}-{datetime.now()}"),
+        "id": prediction.id,  # Use the ID from main.py
         "visit_id": prediction.visit_id,
         "pet_id": prediction.pet_id,
         "prediction_input": prediction.prediction_input,
@@ -106,8 +108,8 @@ async def log_prediction(prediction: PredictionLog) -> int:
     }
     prediction_logs.append(prediction_data)
     
-    logger.info(f"Prediction logged successfully. Total predictions: {len(prediction_logs)}")
-    return prediction_data["id"]
+    logger.info(f"Prediction logged successfully. Total predictions: {len(prediction_logs)}, ID: {prediction.id}")
+    return prediction.id  # Return the same ID from main.py
 
 async def save_feedback(feedback: DoctorFeedback) -> bool:
     """Save doctor feedback to storage"""
@@ -455,7 +457,7 @@ async def log_prediction_endpoint(prediction: PredictionLog):
     """Log a prediction for continuous training"""
     try:
         prediction_id = await log_prediction(prediction)
-        return {"prediction_id": prediction_id, "status": "logged"}
+        return {"predictionId": prediction_id, "status": "logged"}
     except Exception as e:
         logger.error(f"Failed to log prediction: {e}")
         raise HTTPException(status_code=500, detail="Failed to log prediction")

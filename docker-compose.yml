@@ -18,7 +18,7 @@ services:
       - TRAINING_THRESHOLD=100
       - TRAINING_WINDOW_DAYS=30
     volumes:
-      - ./models:/app/models
+      - ./ai_service/models:/app/ai_service/models
       - ./logs:/app/logs
     restart: unless-stopped
     healthcheck:

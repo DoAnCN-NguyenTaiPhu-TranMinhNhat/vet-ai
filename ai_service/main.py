@@ -34,6 +34,17 @@ except ImportError:
         print("Warning: mlops_api module not found")
         mlops_router = None
 
+# Import MLOps v2 endpoints (Champion-Challenger)
+try:
+    from ai_service.mlops_api_v2 import router as mlops_v2_router
+except ImportError:
+    # Fallback for direct execution/testing
+    try:
+        from mlops_api_v2 import router as mlops_v2_router
+    except ImportError:
+        print("Warning: mlops_api_v2 module not found")
+        mlops_v2_router = None
+
 
 def parse_symptoms(s: Any) -> list[str]:
     if s is None:
@@ -59,7 +70,11 @@ class PredictRequest(BaseModel):
     symptom_duration: int
 
 
-app = FastAPI(title="Veterinary Diagnosis AI", version="0.1.0")
+app = FastAPI(
+    title="Veterinary Diagnosis AI", 
+    version="2.0.0",
+    description="Veterinary AI Diagnosis System with Champion-Challenger MLOps"
+)
 
 # Include continuous training endpoints if available
 if ct_router:
@@ -69,15 +84,53 @@ if ct_router:
 if mlops_router:
     app.include_router(mlops_router)
 
+# Include MLOps v2 endpoints (Champion-Challenger) if available
+if mlops_v2_router:
+    app.include_router(mlops_v2_router)
+
+
+def get_latest_model_version() -> str:
+    """Get the latest model version from models directory"""
+    try:
+        models_dir = os.path.join(os.path.dirname(__file__), "models")
+        if not os.path.exists(models_dir):
+            return "v2.0"  # fallback
+        
+        versions = []
+        for item in os.listdir(models_dir):
+            if os.path.isdir(os.path.join(models_dir, item)):
+                if item.startswith('v') and (item[1:].replace('.', '').replace('_', '').isdigit()):
+                    versions.append(item)
+        
+        if versions:
+            # Sort by version - prefer timestamped versions, then semantic versions
+            timestamped_versions = [v for v in versions if '_' in v]
+            semantic_versions = [v for v in versions if '_' not in v]
+            
+            if timestamped_versions:
+                return max(timestamped_versions)
+            elif semantic_versions:
+                return max(semantic_versions, key=lambda x: float(x[1:]))
+        
+        return "v2.0"  # fallback
+    except Exception:
+        return "v2.0"  # fallback
+
 
 _DEFAULT_MODEL_DIR = "./ai_service/models/v2"
 MODEL_VERSION = os.getenv("MODEL_VERSION")
 MODEL_DIR = os.getenv("MODEL_DIR")
+
+# Auto-detect latest model if not specified
 if MODEL_DIR is None or not str(MODEL_DIR).strip():
     if MODEL_VERSION is not None and str(MODEL_VERSION).strip():
         MODEL_DIR = os.path.join("./ai_service/models", str(MODEL_VERSION).strip())
     else:
-        MODEL_DIR = _DEFAULT_MODEL_DIR
+        # Auto-detect latest version
+        latest_version = get_latest_model_version()
+        MODEL_DIR = os.path.join("./ai_service/models", latest_version)
+        MODEL_VERSION = latest_version
+        logger.info(f"Auto-detected latest model version: {latest_version}")
 
 _model = None
 _tab_preprocess = None
@@ -198,7 +251,7 @@ async def predict(req: PredictRequest) -> dict[str, Any]:
                 "confidence": confidence,
                 "top_k": top_k
             },
-            model_version="v2.0",
+            model_version=MODEL_VERSION,
             confidence_score=confidence,
             top_k_predictions=top_k or [],
             veterinarian_id=1,  # Default, should come from auth context
@@ -215,5 +268,7 @@ async def predict(req: PredictRequest) -> dict[str, Any]:
         "diagnosis": str(pred),
         "confidence": confidence,
         "top_k": top_k,
-        "prediction_id": prediction_id  # Return ID for feedback reference
+        "modelVersion": MODEL_VERSION,
+        "predictions": top_k or [],
+        "predictionId": prediction_id  # Return ID for feedback reference (camelCase for Java compatibility)
     }

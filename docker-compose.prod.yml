@@ -1,0 +1,79 @@
+version: '3.8'
+
+services:
+  vet-ai:
+    build: .
+    container_name: vet-ai-prod
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL_DIR=/app/models
+      - HOST=0.0.0.0
+      - PORT=8000
+      - LOG_LEVEL=INFO
+      - ENABLE_METRICS=true
+      - METRICS_PORT=9090
+      - ENABLE_SHAP=true
+      - ENABLE_EXPLAINABILITY=true
+      - TRAINING_THRESHOLD=100
+      - TRAINING_WINDOW_DAYS=30
+    volumes:
+      - vet-ai-models:/app/models
+      - vet-ai-logs:/app/logs
+      - vet-ai-data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # PostgreSQL cho production data
+  postgres:
+    image: postgres:15
+    container_name: vet-ai-postgres
+    environment:
+      - POSTGRES_DB=vet_ai
+      - POSTGRES_USER=vet_ai_user
+      - POSTGRES_PASSWORD=vet_ai_password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+
+  # MLflow cho production tracking
+  mlflow:
+    image: python:3.11-slim
+    container_name: vet-ai-mlflow
+    command: >
+      bash -c "
+      pip install mlflow psycopg2-binary &&
+      mlflow server 
+      --host 0.0.0.0 
+      --port 5000 
+      --backend-store-uri postgresql://vet_ai_user:vet_ai_password@postgres:5432/vet_ai
+      --default-artifact-root /app/mlflow/artifacts
+      "
+    environment:
+      - MLFLOW_BACKEND_STORE_URI=postgresql://vet_ai_user:vet_ai_password@postgres:5432/vet_ai
+    volumes:
+      - vet-ai-mlflow:/app/mlflow
+    ports:
+      - "5000:5000"
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+volumes:
+  vet-ai-models:
+    driver: local
+  vet-ai-logs:
+    driver: local
+  vet-ai-data:
+    driver: local
+  postgres-data:
+    driver: local
+  vet-ai-mlflow:
+    driver: local
