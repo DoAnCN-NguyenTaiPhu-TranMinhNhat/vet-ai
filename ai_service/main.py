@@ -6,6 +6,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI
+from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel
 from scipy import sparse
 
@@ -71,9 +72,16 @@ class PredictRequest(BaseModel):
 
 
 app = FastAPI(
-    title="Veterinary Diagnosis AI", 
+    title="Veterinary Diagnosis AI",
     version="2.0.0",
     description="Veterinary AI Diagnosis System with Champion-Challenger MLOps"
+)
+
+# Expose Prometheus metrics for AI service
+Instrumentator().instrument(app).expose(
+    app,
+    endpoint="/metrics",
+    include_in_schema=False,
 )
 
 # Include continuous training endpoints if available

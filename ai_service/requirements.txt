@@ -12,4 +12,5 @@ boto3
 # MLOps dependencies
 evidently>=0.7.0
 mlflow
+prometheus-fastapi-instrumentator
 

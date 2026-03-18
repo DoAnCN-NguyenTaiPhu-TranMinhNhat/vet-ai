@@ -13,3 +13,6 @@ boto3
 evidently>=0.7.0
 mlflow
 
+# Metrics / Prometheus integration
+prometheus-fastapi-instrumentator
+

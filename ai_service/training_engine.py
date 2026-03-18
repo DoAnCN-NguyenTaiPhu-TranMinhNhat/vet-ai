@@ -48,25 +48,63 @@ class ModelTrainer:
         
         self.mlflow_tracking_uri = mlflow_tracking_uri or os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
         self.mlflow_experiment_name = os.getenv("MLFLOW_EXPERIMENT_NAME", "vet-ai-continuous-training")
+        self._mlflow_last_error: Optional[str] = None
         
         # Initialize MLflow
         try:
-            # Add timeout to prevent hanging
             import socket
-            timeout_seconds = int(os.getenv("MLFLOW_TIMEOUT_SECONDS", "5"))
+            timeout_seconds = int(os.getenv("MLFLOW_TIMEOUT_SECONDS", "10"))
             socket.setdefaulttimeout(timeout_seconds)
-            
             mlflow.set_tracking_uri(self.mlflow_tracking_uri)
-            mlflow.set_experiment(self.mlflow_experiment_name)
             self.client = MlflowClient()
+            self._try_set_experiment()
+            self._mlflow_last_error = None
             logger.info(f"MLflow tracking initialized at {self.mlflow_tracking_uri}")
             self.mlflow_available = True
         except Exception as e:
-            logger.warning(f"MLflow initialization failed: {e}")
+            self._mlflow_last_error = str(e)
+            logger.warning(f"MLflow initialization failed: {self._mlflow_last_error}")
             self.client = None
             self.mlflow_available = False
         finally:
-            # Reset socket timeout
+            import socket
+            socket.setdefaulttimeout(None)
+    
+    def _try_set_experiment(self) -> None:
+        """Set active experiment; if it was deleted, restore it first."""
+        try:
+            mlflow.set_experiment(self.mlflow_experiment_name)
+        except Exception as e:
+            if "deleted experiment" in str(e).lower() and self.client is not None:
+                exp = self.client.get_experiment_by_name(self.mlflow_experiment_name)
+                if exp is not None:
+                    self.client.restore_experiment(exp.experiment_id)
+                    logger.info(f"Restored deleted MLflow experiment '{self.mlflow_experiment_name}'")
+                    mlflow.set_experiment(self.mlflow_experiment_name)
+                    return
+            raise
+    
+    def _ensure_mlflow_connected(self) -> bool:
+        """Re-try MLflow connection if not yet available (e.g. server was down at init)."""
+        if self.mlflow_available and self.client is not None:
+            return True
+        logger.info(f"Retrying MLflow connection to {self.mlflow_tracking_uri} ...")
+        try:
+            import socket
+            timeout_seconds = int(os.getenv("MLFLOW_TIMEOUT_SECONDS", "10"))
+            socket.setdefaulttimeout(timeout_seconds)
+            mlflow.set_tracking_uri(self.mlflow_tracking_uri)
+            self.client = MlflowClient()
+            self._try_set_experiment()
+            self._mlflow_last_error = None
+            self.mlflow_available = True
+            logger.info(f"MLflow connected at {self.mlflow_tracking_uri}")
+            return True
+        except Exception as e:
+            self._mlflow_last_error = str(e)
+            logger.warning(f"MLflow reconnection failed: {self._mlflow_last_error}")
+            return False
+        finally:
             import socket
             socket.setdefaulttimeout(None)
         
@@ -573,67 +611,71 @@ class ModelTrainer:
                      X_val: sparse.csr_matrix = None,
                      y_val: pd.Series = None):
         """Log training to MLflow with dynamic experiment name"""
-        if not self.mlflow_available or self.client is None:
-            logger.warning("MLflow not available, skipping logging")
+        # Retry connection when actually logging (MLflow may not have been ready at init)
+        if not self._ensure_mlflow_connected():
+            reason = self._mlflow_last_error or "unknown"
+            logger.warning("MLflow not available, skipping logging (reason: %s)", reason)
             return
         
         try:
             with mlflow.start_run(run_name=f"training-{model_version}") as run:
-                # Log parameters
-                mlflow.log_params(training_metrics.get('model_params', {}))
-                
-                # Log additional parameters
-                default_split_ratio = float(os.getenv("DEFAULT_SPLIT_RATIO", "0.2"))
-                default_cv_folds = int(os.getenv("DEFAULT_CV_FOLDS", "5"))
-                mlflow.log_param("test_split_ratio", training_metrics.get('test_split_ratio', default_split_ratio))
-                mlflow.log_param("cv_folds", training_metrics.get('cv_folds', default_cv_folds))
-                mlflow.log_param("experiment_name", self.mlflow_experiment_name)
-                
-                # Log metrics
-                metrics_to_log = {k: v for k, v in training_metrics.items() 
-                                 if isinstance(v, (int, float)) and k != 'model_params'}
-                mlflow.log_metrics(metrics_to_log)
-                
-                # Log model with artifact_path instead of name
-                mlflow.sklearn.log_model(
-                    model, 
-                    artifact_path="model",
-                    registered_model_name="vet-ai-model"
-                )
-                
-                # Log artifacts using log_artifact instead of log_model for preprocessors
-                if hasattr(self, 'tab_preprocess'):
-                    joblib.dump(self.tab_preprocess, "tab_preprocess.pkl")
-                    mlflow.log_artifact("tab_preprocess.pkl", "preprocessors")
-                    os.remove("tab_preprocess.pkl")
-                
-                if hasattr(self, 'symptoms_mlb'):
-                    joblib.dump(self.symptoms_mlb, "symptoms_mlb.pkl")
-                    mlflow.log_artifact("symptoms_mlb.pkl", "preprocessors")
-                    os.remove("symptoms_mlb.pkl")
-                
-                # Log dataset info
-                dataset_info = {
-                    'n_samples': training_metrics.get('n_samples', 0),
-                    'n_features': training_metrics.get('n_features', 0),
-                    'n_classes': training_metrics.get('n_classes', 0),
-                    'training_date': datetime.now().isoformat(),
-                    'model_version': model_version
-                }
-                mlflow.log_dict(dataset_info, "dataset_info.json")
-                
-                # Log validation dataset info
-                if X_val is not None and y_val is not None:
-                    validation_info = {
-                        'n_validation_samples': len(y_val),
-                        'validation_features': X_val.shape[1]
+                run_id = run.info.run_id
+                # Log từng bước, không re-raise để run không bị FAILED khi một bước lỗi
+                try:
+                    mlflow.log_params(training_metrics.get('model_params', {}))
+                    default_split_ratio = float(os.getenv("DEFAULT_SPLIT_RATIO", "0.2"))
+                    default_cv_folds = int(os.getenv("DEFAULT_CV_FOLDS", "5"))
+                    mlflow.log_param("test_split_ratio", training_metrics.get('test_split_ratio', default_split_ratio))
+                    mlflow.log_param("cv_folds", training_metrics.get('cv_folds', default_cv_folds))
+                    mlflow.log_param("experiment_name", self.mlflow_experiment_name)
+                except Exception as e:
+                    logger.warning("MLflow log params failed: %s", e)
+                try:
+                    metrics_to_log = {k: v for k, v in training_metrics.items()
+                                     if isinstance(v, (int, float)) and k != 'model_params'}
+                    mlflow.log_metrics(metrics_to_log)
+                except Exception as e:
+                    logger.warning("MLflow log metrics failed: %s", e)
+                try:
+                    mlflow.sklearn.log_model(
+                        model, artifact_path="model", registered_model_name="vet-ai-model"
+                    )
+                except Exception as reg_err:
+                    try:
+                        mlflow.sklearn.log_model(model, artifact_path="model")
+                    except Exception as e2:
+                        logger.warning("MLflow log_model failed: %s", e2)
+                try:
+                    if hasattr(self, 'tab_preprocess'):
+                        joblib.dump(self.tab_preprocess, "tab_preprocess.pkl")
+                        mlflow.log_artifact("tab_preprocess.pkl", "preprocessors")
+                        os.remove("tab_preprocess.pkl")
+                    if hasattr(self, 'symptoms_mlb'):
+                        joblib.dump(self.symptoms_mlb, "symptoms_mlb.pkl")
+                        mlflow.log_artifact("symptoms_mlb.pkl", "preprocessors")
+                        os.remove("symptoms_mlb.pkl")
+                except Exception as e:
+                    logger.warning("MLflow log preprocessors failed: %s", e)
+                try:
+                    dataset_info = {
+                        'n_samples': training_metrics.get('n_samples', 0),
+                        'n_features': training_metrics.get('n_features', 0),
+                        'n_classes': training_metrics.get('n_classes', 0),
+                        'training_date': datetime.now().isoformat(),
+                        'model_version': model_version
                     }
-                    mlflow.log_dict(validation_info, "validation_info.json")
-                
-                logger.info(f"Training logged to MLflow experiment '{self.mlflow_experiment_name}': {run.info.run_id}")
+                    mlflow.log_dict(dataset_info, "dataset_info.json")
+                    if X_val is not None and y_val is not None:
+                        validation_info = {
+                            'n_validation_samples': len(y_val),
+                            'validation_features': X_val.shape[1]
+                        }
+                        mlflow.log_dict(validation_info, "validation_info.json")
+                except Exception as e:
+                    logger.warning("MLflow log dataset_info failed: %s", e)
+                logger.info("Training logged to MLflow experiment '%s': %s", self.mlflow_experiment_name, run_id)
         except Exception as e:
-            logger.error(f"Failed to log to MLflow: {str(e)}")
-            # Don't raise - MLflow logging failure should not stop training
+            logger.error("Failed to log to MLflow: %s", e)
     
     def generate_model_version(self) -> str:
         """Generate new model version"""
