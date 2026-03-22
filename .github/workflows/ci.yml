@@ -42,6 +42,8 @@ jobs:
         env:
           MODEL_DIR: ./models/v2
           PYTHONPATH: ${{ github.workspace }}
+          # Champion-Challenger registry; /app is not writable on GitHub-hosted runners
+          VETAI_CHAMPION_REGISTRY_PATH: /tmp/vetai-champion-registry
         run: |
           echo "--- ai_service directory ---"
           ls -la

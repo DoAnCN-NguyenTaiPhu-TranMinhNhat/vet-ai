@@ -8,6 +8,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from typing import Dict, List, Optional
 import logging
+import os
 from datetime import datetime
 
 from .mlops_champion_challenger import ChampionChallengerManager, ModelStatus

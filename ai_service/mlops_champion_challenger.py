@@ -28,10 +28,12 @@ class ChampionChallengerManager:
     """Manages Champion-Challenger MLOps workflow"""
     
     def __init__(self, 
-                 model_registry_path: str = "/app/models",
+                 model_registry_path: str | None = None,
                  mlflow_tracking_uri: str = None,
                  approval_required: bool = True):
-        
+        # Docker image often uses /app; CI/local may not have /app writable — override via env.
+        if model_registry_path is None:
+            model_registry_path = os.getenv("VETAI_CHAMPION_REGISTRY_PATH", "/app/models")
         self.model_registry_path = model_registry_path
         self.approval_required = approval_required
         self.mlflow_tracking_uri = mlflow_tracking_uri or os.getenv("MLFLOW_TRACKING_URI")

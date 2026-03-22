@@ -1,6 +1,7 @@
 import os
 import pathlib
 import sys
+import tempfile
 
 import pytest
 
@@ -21,6 +22,11 @@ def _configure_model_dir() -> None:
         model_dir = root / "models" / "v2"
     
     os.environ.setdefault("MODEL_DIR", str(model_dir))
+    # Avoid PermissionError when importing main → mlops_api_v2 (no /app on dev/CI runners)
+    os.environ.setdefault(
+        "VETAI_CHAMPION_REGISTRY_PATH",
+        os.path.join(tempfile.gettempdir(), "vetai-champion-registry"),
+    )
 
 
 @pytest.fixture()
