@@ -9,10 +9,12 @@ import logging
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 import pandas as pd
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
 from pydantic import BaseModel, Field
 
 from ai_service.mlops_manager import MLOpsManager
+from ai_service.model_registry import list_model_versions, get_active_model, set_active_model
+from ai_service.auth import verify_admin
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -44,6 +46,10 @@ class ConfigUpdateRequest(BaseModel):
     min_training_samples: Optional[int] = Field(None, gt=0)
     max_error_rate: Optional[float] = Field(None, ge=0.0, le=1.0)
     check_interval_hours: Optional[int] = Field(None, gt=0)
+
+
+class ActiveModelRequest(BaseModel):
+    model_version: str = Field(..., description="Model version to activate for inference")
 
 # API Endpoints
 
@@ -178,6 +184,83 @@ async def run_health_check():
         
     except Exception as e:
         logger.error(f"Error running health check: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/models", summary="List available model versions + active")
+async def list_models():
+    active = get_active_model()
+    # Fallback: if not persisted yet, use current in-process model version
+    if active is None:
+        try:
+            from ai_service import main as ai_main
+            mv = getattr(ai_main, "MODEL_VERSION", None)
+            md = getattr(ai_main, "MODEL_DIR", None)
+            if mv and md:
+                return {
+                    "status": "success",
+                    "active": mv,
+                    "active_source": "process",
+                    "versions": list_model_versions(),
+                }
+        except Exception:
+            pass
+    return {
+        "status": "success",
+        "active": active.model_version if active else None,
+        "active_source": "state_file" if active else None,
+        "versions": list_model_versions(),
+    }
+
+
+@router.put("/models/active", summary="Set active model version for inference")
+async def set_active_model_version(request: ActiveModelRequest, _: bool = Depends(verify_admin)):
+    try:
+        active = set_active_model(request.model_version)
+        return {"status": "success", "active": active.model_version, "model_dir": active.model_dir}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Failed to set active model: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/training/last", summary="Get last training job status")
+async def get_last_training_job():
+    """
+    Returns most recent training job from continuous training orchestrator (if running in this process).
+    """
+    try:
+        from ai_service.continuous_training import training_jobs  # in-memory store
+
+        if not training_jobs:
+            return {"status": "success", "last_training": None}
+
+        last_id = max(training_jobs.keys())
+        return {"status": "success", "last_training": training_jobs[last_id]}
+    except Exception as e:
+        logger.error(f"Failed to read training jobs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/drift/summary", summary="Get drift summary + simple alert rule")
+async def get_drift_summary(days: int = 7):
+    try:
+        summary = mlops_manager.drift_detector.get_drift_summary(days=days)
+        # Simple alert rule: if drift score indicates drift, surface it.
+        drift_score = mlops_manager.training_eligibility.get("drift_score", 0.0)
+        alert = None
+        if drift_score > 0.5:
+            alert = {
+                "severity": "warning",
+                "message": "Data drift detected (drift_score > 0.5)",
+                "drift_score": drift_score,
+            }
+        return {"status": "success", "summary": summary, "alert": alert}
+    except Exception as e:
+        logger.error(f"Failed to get drift summary: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/retraining-eligibility", summary="Check if model should be retrained")

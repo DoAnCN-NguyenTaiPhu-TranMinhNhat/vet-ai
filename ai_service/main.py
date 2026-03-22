@@ -6,12 +6,35 @@ import joblib
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI
+from fastapi import Request, Response
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel
 from scipy import sparse
+import contextvars
+import time
+import uuid
+
+from ai_service.model_registry import detect_default_model, list_model_versions, set_active_model
+from prometheus_client import Gauge, Info
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+# Request ID (X-Request-Id) correlation for logs
+_request_id_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar("request_id", default=None)
+
+
+class _RequestIdLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        rid = _request_id_ctx.get()
+        setattr(record, "request_id", rid or "-")
+        return True
+
+
+logging.getLogger().addFilter(_RequestIdLogFilter())
 
 # Import continuous training endpoints
 try:
@@ -77,6 +100,33 @@ app = FastAPI(
     description="Veterinary AI Diagnosis System with Champion-Challenger MLOps"
 )
 
+_UI_DIR = Path(__file__).parent / "ui"
+_UI_STATIC_DIR = _UI_DIR / "static"
+if _UI_STATIC_DIR.exists():
+    app.mount("/mlops-ui/static", StaticFiles(directory=str(_UI_STATIC_DIR)), name="mlops-ui-static")
+
+
+@app.get("/mlops-ui", include_in_schema=False)
+def mlops_ui() -> HTMLResponse:
+    index = _UI_DIR / "index.html"
+    if not index.exists():
+        return HTMLResponse("<h3>UI not found</h3>", status_code=404)
+    return HTMLResponse(index.read_text(encoding="utf-8"))
+
+# Ensure every request has X-Request-Id and expose it back.
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    rid = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    token = _request_id_ctx.set(rid)
+    start = time.time()
+    try:
+        response: Response = await call_next(request)
+    finally:
+        _request_id_ctx.reset(token)
+    response.headers["X-Request-Id"] = rid
+    logger.info("request completed", extra={"path": request.url.path, "method": request.method, "ms": int((time.time() - start) * 1000)})
+    return response
+
 # Expose Prometheus metrics for AI service
 Instrumentator().instrument(app).expose(
     app,
@@ -126,23 +176,21 @@ def get_latest_model_version() -> str:
 
 
 _DEFAULT_MODEL_DIR = "./ai_service/models/v2"
-MODEL_VERSION = os.getenv("MODEL_VERSION")
-MODEL_DIR = os.getenv("MODEL_DIR")
-
-# Auto-detect latest model if not specified
-if MODEL_DIR is None or not str(MODEL_DIR).strip():
-    if MODEL_VERSION is not None and str(MODEL_VERSION).strip():
-        MODEL_DIR = os.path.join("./ai_service/models", str(MODEL_VERSION).strip())
-    else:
-        # Auto-detect latest version
-        latest_version = get_latest_model_version()
-        MODEL_DIR = os.path.join("./ai_service/models", latest_version)
-        MODEL_VERSION = latest_version
-        logger.info(f"Auto-detected latest model version: {latest_version}")
+_active = detect_default_model()
+if _active is None:
+    MODEL_VERSION = os.getenv("MODEL_VERSION") or "v2.0"
+    MODEL_DIR = os.getenv("MODEL_DIR") or os.path.join("./ai_service/models", MODEL_VERSION)
+else:
+    MODEL_VERSION = _active.model_version
+    MODEL_DIR = _active.model_dir
+    logger.info("Using active model: %s (%s)", MODEL_VERSION, MODEL_DIR)
 
 _model = None
 _tab_preprocess = None
 _symptoms_mlb = None
+
+_active_model_info = Info("vetai_active_model", "Active model version for inference")
+_active_model_reload_total = Gauge("vetai_active_model_reload_total", "Number of active model reloads")
 
 
 def load_artifacts() -> None:
@@ -155,6 +203,20 @@ def load_artifacts() -> None:
     _model = joblib.load(model_path)
     _tab_preprocess = joblib.load(tab_preprocess_path)
     _symptoms_mlb = joblib.load(symptoms_mlb_path)
+    _active_model_info.info({"model_version": str(MODEL_VERSION)})
+
+
+def set_active_model_and_reload(model_version: str) -> None:
+    global MODEL_VERSION, MODEL_DIR, _model, _tab_preprocess, _symptoms_mlb
+    active = set_active_model(model_version)
+    MODEL_VERSION = active.model_version
+    MODEL_DIR = active.model_dir
+    # Clear cached artifacts then reload
+    _model = None
+    _tab_preprocess = None
+    _symptoms_mlb = None
+    load_artifacts()
+    _active_model_reload_total.inc()
 
 
 @app.on_event("startup")
@@ -164,7 +226,17 @@ def _startup() -> None:
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "UP"}
+
+
+@app.get("/readyz", include_in_schema=False)
+def readyz() -> dict[str, str]:
+    return {"status": "UP"}
+
+
+@app.get("/livez", include_in_schema=False)
+def livez() -> dict[str, str]:
+    return {"status": "UP"}
 
 
 @app.get("/model/info")
@@ -184,6 +256,24 @@ def model_info() -> dict[str, Any]:
         "model_type": type(_model).__name__,
         "classes": classes.tolist() if isinstance(classes, np.ndarray) else classes,
     }
+
+
+@app.get("/models/versions", include_in_schema=False)
+def model_versions() -> dict[str, Any]:
+    versions = list_model_versions()
+    return {"active": MODEL_VERSION, "versions": versions}
+
+
+@app.post("/models/active", include_in_schema=False)
+def set_active_model_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
+    mv = str(payload.get("model_version") or "").strip()
+    if not mv:
+        return {"status": "error", "error": "model_version is required"}
+    try:
+        set_active_model_and_reload(mv)
+        return {"status": "success", "active": MODEL_VERSION, "model_dir": MODEL_DIR}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 
 # Global counter for prediction IDs

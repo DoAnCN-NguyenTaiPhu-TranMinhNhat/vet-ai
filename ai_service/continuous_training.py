@@ -6,7 +6,7 @@ Handles prediction logging and training trigger logic
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
-from fastapi import HTTPException, BackgroundTasks, APIRouter
+from fastapi import HTTPException, BackgroundTasks, APIRouter, Depends
 import asyncio
 import logging
 import os
@@ -15,6 +15,7 @@ import uuid
 import time
 import subprocess
 import boto3
+from prometheus_client import Gauge, Counter
 
 # Import kubernetes only when needed for EKS training
 try:
@@ -34,9 +35,10 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/continuous-training", tags=["continuous-training"])
+from ai_service.auth import verify_admin
 
-# Configuration
-TRAINING_THRESHOLD = 10  # Reduced from 100 for easier testing
+# Configuration (mutable for P2 UI)
+TRAINING_THRESHOLD = int(os.getenv("TRAINING_THRESHOLD", "10"))  # Reduced from 100 for easier testing
 TRAINING_WINDOW_DAYS = int(os.getenv("TRAINING_WINDOW_DAYS", "30"))
 EKS_CLUSTER_NAME = os.getenv("EKS_CLUSTER_NAME", "vet-ai-dev")
 EKS_REGION = os.getenv("EKS_REGION", "us-east-1")
@@ -87,6 +89,11 @@ class TrainingStatus(BaseModel):
     is_deployed: bool
     error_message: Optional[str]
 
+
+class TrainingPolicyUpdate(BaseModel):
+    training_threshold: int = Field(ge=1)
+    training_window_days: int = Field(ge=1)
+
 # Database functions (currently in-memory, ready for database migration)
 async def log_prediction(prediction: PredictionLog) -> int:
     """Log prediction to storage"""
@@ -107,6 +114,8 @@ async def log_prediction(prediction: PredictionLog) -> int:
         "timestamp": datetime.now()
     }
     prediction_logs.append(prediction_data)
+    _predictions_logged_total.inc()
+    _refresh_training_metrics()
     
     logger.info(f"Prediction logged successfully. Total predictions: {len(prediction_logs)}, ID: {prediction.id}")
     return prediction.id  # Return the same ID from main.py
@@ -128,6 +137,8 @@ async def save_feedback(feedback: DoctorFeedback) -> bool:
         "timestamp": datetime.now()
     }
     feedback_data.append(feedback_data_item)
+    _feedback_saved_total.inc()
+    _refresh_training_metrics()
     
     logger.info(f"Feedback saved. Total feedback count: {len(feedback_data)}")
     return True
@@ -147,8 +158,40 @@ training_counter = 0  # Sequential counter for reliable IDs
 
 logger.info("Production-ready continuous training system initialized")
 
-async def count_eligible_feedback(days: int = TRAINING_WINDOW_DAYS) -> int:
+_predictions_logged_total = Counter("vetai_predictions_logged_total", "Total predictions logged for continuous training")
+_feedback_saved_total = Counter("vetai_feedback_saved_total", "Total feedback entries saved")
+_eligible_feedback_gauge = Gauge("vetai_feedback_eligible_count", "Eligible feedback count for training")
+_training_jobs_gauge = Gauge("vetai_training_jobs", "Training jobs by status", ["status"])
+_training_last_success_timestamp = Gauge("vetai_training_last_success_timestamp_seconds", "Last successful training time (unix seconds)")
+
+
+def _refresh_training_metrics() -> None:
+    try:
+        eligible = len([f for f in feedback_data if f.get("is_training_eligible", True)])
+        _eligible_feedback_gauge.set(float(eligible))
+
+        for s in ["pending", "running", "completed", "failed"]:
+            _training_jobs_gauge.labels(status=s).set(0.0)
+
+        counts = {"pending": 0, "running": 0, "completed": 0, "failed": 0}
+        for job in training_jobs.values():
+            st = str(job.get("status") or "pending").lower()
+            if st in counts:
+                counts[st] += 1
+        for st, c in counts.items():
+            _training_jobs_gauge.labels(status=st).set(float(c))
+
+        completed = [j for j in training_jobs.values() if str(j.get("status")).lower() == "completed" and j.get("end_time")]
+        if completed:
+            last = max(completed, key=lambda j: j.get("end_time"))
+            _training_last_success_timestamp.set(float(last["end_time"].timestamp()))
+    except Exception:
+        return
+
+async def count_eligible_feedback(days: Optional[int] = None) -> int:
     """Count eligible feedback in the last N days"""
+    if days is None:
+        days = TRAINING_WINDOW_DAYS
     # Count actual feedback from in-memory storage
     cutoff_date = datetime.now() - timedelta(days=days)
     eligible_count = 0
@@ -161,6 +204,25 @@ async def count_eligible_feedback(days: int = TRAINING_WINDOW_DAYS) -> int:
     
     logger.info(f"Current eligible feedback count: {eligible_count}")
     return eligible_count
+
+
+@router.get("/config")
+async def get_training_policy():
+    return {
+        "training_threshold": TRAINING_THRESHOLD,
+        "training_window_days": TRAINING_WINDOW_DAYS,
+    }
+
+
+@router.put("/config")
+async def update_training_policy(update: TrainingPolicyUpdate, _: bool = Depends(verify_admin)):
+    global TRAINING_THRESHOLD, TRAINING_WINDOW_DAYS
+    TRAINING_THRESHOLD = int(update.training_threshold)
+    TRAINING_WINDOW_DAYS = int(update.training_window_days)
+    return {
+        "training_threshold": TRAINING_THRESHOLD,
+        "training_window_days": TRAINING_WINDOW_DAYS,
+    }
 
 async def trigger_training_job(request: TrainingTriggerRequest) -> int:
     """Trigger a training job and return training ID"""
@@ -194,6 +256,7 @@ async def trigger_training_job(request: TrainingTriggerRequest) -> int:
     logger.info(f"Starting actual training for job {training_id}")
     task = asyncio.create_task(execute_actual_training(training_id, request.training_mode))
     logger.info(f"Training task created: {task}")
+    _refresh_training_metrics()
     
     return training_id
 
@@ -223,18 +286,30 @@ async def execute_actual_training(training_id: int, training_mode: str):
                     "f1_score": result['training_metrics'].get('validation_f1'),
                     "is_deployed": True
                 })
+
+                # P1: Promote new model to active inference model (in-process + persisted)
+                try:
+                    from ai_service.main import set_active_model_and_reload
+                    new_ver = result.get("model_version")
+                    if new_ver:
+                        set_active_model_and_reload(new_ver)
+                        logger.info("Active model updated to %s after training job %s", new_ver, training_id)
+                except Exception as e:
+                    logger.warning("Failed to set active model after training: %s", e)
                 
                 # Reset feedback count after successful training
                 feedback_data.clear()
                 logger.info(f"Feedback data reset after training completion. New count: {len(feedback_data)}")
                 
                 logger.info(f"Training {training_id} completed successfully!")
+                _refresh_training_metrics()
             else:
                 # Training failed
                 training_jobs[training_id].update({
                     "status": "failed",
                     "error_message": result.get('error', 'Unknown error')
                 })
+                _refresh_training_metrics()
         else:
             logger.error(f"Training job {training_id} not found in storage")
             
@@ -245,6 +320,7 @@ async def execute_actual_training(training_id: int, training_mode: str):
                 "status": "failed",
                 "error_message": str(e)
             })
+            _refresh_training_metrics()
 
 async def run_eks_training(training_id: int) -> Dict[str, Any]:
     """Run training on EKS with node group scaling"""
@@ -499,7 +575,8 @@ async def get_training_status_endpoint(training_id: int):
 @router.post("/training/trigger", status_code=201)
 async def trigger_training_endpoint(
     request: TrainingTriggerRequest,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    _: bool = Depends(verify_admin)
 ):
     """Trigger a training job"""
     try:
@@ -510,6 +587,14 @@ async def trigger_training_endpoint(
                 raise HTTPException(
                     status_code=400, 
                     detail=f"Insufficient data: {eligible_count} < {TRAINING_THRESHOLD}"
+                )
+        else:
+            # Even when forced, training requires at least one eligible feedback+prediction pair
+            eligible_count = await count_eligible_feedback()
+            if eligible_count <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No eligible feedback data to train on. Collect feedback first, then trigger training."
                 )
         
         training_id = await trigger_training_job(request)
@@ -525,6 +610,8 @@ async def trigger_training_endpoint(
             "status": "triggered",
             "trigger_type": request.trigger_type
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to trigger training: {e}")
         raise HTTPException(status_code=500, detail="Failed to trigger training")

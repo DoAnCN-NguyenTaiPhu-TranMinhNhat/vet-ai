@@ -36,10 +36,12 @@ jobs:
           python -m pip --version
           python -m pip list | grep -E '^(pytest|fastapi|scikit-learn)\b' || true
 
+      # Pytest exit code 5 = no tests collected (tests/ had only conftest.py).
       - name: Run tests
         working-directory: ai_service
         env:
           MODEL_DIR: ./models/v2
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           echo "--- ai_service directory ---"
           ls -la

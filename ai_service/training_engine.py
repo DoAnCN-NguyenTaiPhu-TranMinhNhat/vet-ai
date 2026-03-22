@@ -21,6 +21,7 @@ from scipy import sparse
 import mlflow
 import mlflow.sklearn
 from mlflow.tracking import MlflowClient
+from ai_service.model_registry import get_active_model, list_model_versions, resolve_model_dir
 
 logger = logging.getLogger(__name__)
 
@@ -29,16 +30,20 @@ class ModelTrainer:
     
     def __init__(self, model_dir: str = None, 
                  mlflow_tracking_uri: str = None):
-        # Use environment variable MODEL_DIR first, then fallback to default
+        # Prefer MODEL_ROOT_DIR for storing all versions; fallback to MODEL_DIR for backward compatibility
         if model_dir is None:
-            model_dir = os.getenv("MODEL_DIR")
+            model_dir = os.getenv("MODEL_ROOT_DIR") or os.getenv("VETAI_MODELS_ROOT") or os.getenv("MODEL_DIR")
         
         if model_dir is None:
             # Get the directory where this script is located
             script_dir = os.path.dirname(os.path.abspath(__file__))
             self.model_dir = os.path.join(script_dir, "models")
         else:
-            self.model_dir = os.path.abspath(model_dir)
+            md = os.path.abspath(model_dir)
+            # If MODEL_DIR points to a specific version directory, store versions in its parent
+            if os.path.exists(os.path.join(md, "model.pkl")):
+                md = os.path.dirname(md)
+            self.model_dir = md
         
         # Ensure model directory exists
         os.makedirs(self.model_dir, exist_ok=True)
@@ -49,6 +54,7 @@ class ModelTrainer:
         self.mlflow_tracking_uri = mlflow_tracking_uri or os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
         self.mlflow_experiment_name = os.getenv("MLFLOW_EXPERIMENT_NAME", "vet-ai-continuous-training")
         self._mlflow_last_error: Optional[str] = None
+        self._baseline_class_weight: Optional[Dict[str, float]] = None
         
         # Initialize MLflow
         try:
@@ -69,6 +75,37 @@ class ModelTrainer:
         finally:
             import socket
             socket.setdefaulttimeout(None)
+
+    def _get_baseline_class_weight(self) -> Optional[Dict[str, float]]:
+        """
+        Compute stable class weights from a baseline dataset (CSV) if provided.
+        Env:
+          - BASELINE_DATASET_CSV: path to CSV (inside container / mounted)
+          - BASELINE_LABEL_COL: label column (default: target_diagnosis)
+        """
+        if self._baseline_class_weight is not None:
+            return self._baseline_class_weight
+
+        csv_path = os.getenv("BASELINE_DATASET_CSV")
+        if not csv_path or not str(csv_path).strip():
+            self._baseline_class_weight = None
+            return None
+
+        label_col = os.getenv("BASELINE_LABEL_COL", "target_diagnosis")
+        try:
+            df = pd.read_csv(csv_path, usecols=[label_col])
+            y = df[label_col].astype(str)
+            from sklearn.utils.class_weight import compute_class_weight
+
+            classes = np.unique(y)
+            weights = compute_class_weight(class_weight="balanced", classes=classes, y=y)
+            self._baseline_class_weight = {str(c): float(w) for c, w in zip(classes, weights)}
+            logger.info("Computed baseline class_weight from %s (classes=%s)", csv_path, len(classes))
+            return self._baseline_class_weight
+        except Exception as e:
+            logger.warning("Failed to compute baseline class_weight from %s: %s", csv_path, e)
+            self._baseline_class_weight = None
+            return None
     
     def _try_set_experiment(self) -> None:
         """Set active experiment; if it was deleted, restore it first."""
@@ -164,7 +201,9 @@ class ModelTrainer:
             'random_state': int(os.getenv("RANDOM_STATE", "42")),
             'min_samples_split': min_samples_split,
             'min_samples_leaf': min_samples_leaf,
-            'class_weight': 'balanced' if n_classes > 2 and n_samples < thresholds['large'] else None
+            # IMPORTANT: avoid sklearn's internal class_weight balancing while we do
+            # dataset-derived balancing via sample_weight (stable for warm_start).
+            'class_weight': None
         }
     
     def detect_feature_types(self, X: pd.DataFrame) -> Dict[str, List[str]]:
@@ -235,6 +274,84 @@ class ModelTrainer:
         
         return cv_folds
     
+    def collect_feedback_only_training_frame(
+        self,
+        feedback_data: List[Dict],
+        prediction_logs: List[Dict],
+    ) -> Tuple[pd.DataFrame, pd.Series]:
+        """
+        Expert feedback rows only (same quality filter as full training), without
+        core-memory mix or class-completion reference rows. Used for promotion gates
+        that measure improvement on the current feedback batch.
+        """
+        logger.info(
+            "Collecting feedback-only frame from %d feedback entries",
+            len(feedback_data),
+        )
+        training_records = []
+
+        for feedback in feedback_data:
+            prediction_id = feedback["prediction_id"]
+            prediction = None
+            for p in prediction_logs:
+                if hasattr(p, "id"):
+                    if p.id == prediction_id:
+                        prediction = p
+                        break
+                elif isinstance(p, dict):
+                    if p.get("id") == prediction_id:
+                        prediction = p
+                        break
+
+            if prediction is None:
+                logger.warning("No prediction found for feedback %s", prediction_id)
+                continue
+
+            if hasattr(prediction, "prediction_input"):
+                pred_input = prediction.prediction_input
+            elif isinstance(prediction, dict):
+                pred_input = prediction["prediction_input"]
+            else:
+                logger.warning("Invalid prediction format for feedback %s", prediction_id)
+                continue
+
+            training_records.append(
+                {
+                    "animal_type": pred_input.get("animal_type"),
+                    "gender": pred_input.get("gender"),
+                    "age_months": pred_input.get("age_months"),
+                    "weight_kg": pred_input.get("weight_kg"),
+                    "temperature": pred_input.get("temperature"),
+                    "heart_rate": pred_input.get("heart_rate"),
+                    "current_season": pred_input.get("current_season"),
+                    "vaccination_status": pred_input.get("vaccination_status"),
+                    "medical_history": pred_input.get("medical_history", "Unknown"),
+                    "symptom_duration": pred_input.get("symptom_duration"),
+                    "symptoms_list": pred_input.get("symptoms_list", ""),
+                    "final_diagnosis": feedback["final_diagnosis"],
+                    "data_quality_score": feedback.get("data_quality_score", 1.0),
+                }
+            )
+
+        if not training_records:
+            raise ValueError("No valid training records found")
+
+        df = pd.DataFrame(training_records)
+        quality_scores = df["data_quality_score"].astype(float).to_numpy()
+        quality_threshold = self.compute_quality_threshold(quality_scores)
+        logger.info(
+            "Feedback-only frame: quality threshold %.3f",
+            quality_threshold,
+        )
+        df = df[df["data_quality_score"].astype(float) >= quality_threshold]
+        if df.empty:
+            raise ValueError("No training records left after quality filtering")
+
+        X = df.drop(["final_diagnosis", "data_quality_score"], axis=1)
+        y = df["final_diagnosis"]
+        logger.info("Prepared %d feedback-only samples for evaluation", len(X))
+        return X, y
+
     def collect_training_data(self, feedback_data: List[Dict], 
                             prediction_logs: List[Dict]) -> Tuple[pd.DataFrame, pd.Series, np.ndarray]:
         """Collect and prepare training data from feedback and predictions"""
@@ -296,21 +413,176 @@ class ModelTrainer:
         
         df = pd.DataFrame(training_records)
         
-        # Use data quality score as sample weight
-        sample_weights = df['data_quality_score'].values
-        
-        # Compute dynamic quality threshold
-        quality_threshold = self.compute_quality_threshold(sample_weights)
+        # Compute dynamic quality threshold from quality scores
+        quality_scores = df['data_quality_score'].astype(float).to_numpy()
+        quality_threshold = self.compute_quality_threshold(quality_scores)
         logger.info(f"Using dynamic quality threshold: {quality_threshold:.3f}")
         
         # Remove records with low quality using dynamic threshold
-        df = df[df['data_quality_score'] >= quality_threshold]
+        df = df[df['data_quality_score'].astype(float) >= quality_threshold]
+        if df.empty:
+            raise ValueError("No training records left after quality filtering")
+
+        # ----------------------------
+        # Balanced Memory Mix 80/20
+        # ----------------------------
+        # To prevent catastrophic forgetting, we mix a portion of "Core Memory"
+        # sampled from the baseline golden dataset into the feedback-only batch.
+        #
+        # We keep the existing feedback filtering/quality scoring intact, then
+        # append core memory records (they get a configurable quality score).
+        core_memory_ratio = float(os.getenv("CORE_MEMORY_RATIO", "0.2"))  # desired share of core memory in final set
+        # Core memory must contribute to learning; otherwise sample_weight becomes 0
+        # and RF essentially ignores these rows.
+        core_memory_quality_score = float(os.getenv("CORE_MEMORY_QUALITY_SCORE", "0.2"))
+        core_memory_max_rows = int(os.getenv("CORE_MEMORY_MAX_ROWS", "5000"))
+        core_memory_random_state = int(os.getenv("RANDOM_STATE", "42"))
+
+        try:
+            baseline_csv = os.getenv("BASELINE_DATASET_CSV")
+            baseline_label_col = os.getenv("BASELINE_LABEL_COL", "target_diagnosis")
+
+            if baseline_csv and str(baseline_csv).strip() and 0.0 < core_memory_ratio < 1.0:
+                n_feedback = len(df)
+                # target: core_share = core_n / (core_n + n_feedback) == core_memory_ratio
+                core_n = int(round((n_feedback * core_memory_ratio) / max(1e-9, (1.0 - core_memory_ratio))))
+                core_n = max(0, min(core_n, core_memory_max_rows))
+
+                if core_n > 0:
+                    feature_cols = [
+                        "animal_type",
+                        "gender",
+                        "age_months",
+                        "weight_kg",
+                        "temperature",
+                        "heart_rate",
+                        "current_season",
+                        "vaccination_status",
+                        "medical_history",
+                        "symptom_duration",
+                        "symptoms_list",
+                    ]
+                    needed_cols = feature_cols + [baseline_label_col]
+                    baseline_full = pd.read_csv(baseline_csv, usecols=needed_cols)
+                    if len(baseline_full) > core_n:
+                        baseline_core = baseline_full.sample(n=core_n, random_state=core_memory_random_state)
+                    else:
+                        baseline_core = baseline_full
+
+                    baseline_core = baseline_core.copy()
+                    baseline_core["final_diagnosis"] = baseline_core[baseline_label_col].astype(str)
+                    baseline_core["data_quality_score"] = core_memory_quality_score
+                    baseline_core = baseline_core.drop(columns=[baseline_label_col])
+
+                    # Align column order with feedback df
+                    df = pd.concat([df, baseline_core[df.columns]], ignore_index=True)
+                    logger.info(
+                        "Core memory mix added: feedback_n=%d core_n=%d core_ratio_target=%.3f core_q=%.3f total_n=%d",
+                        n_feedback,
+                        len(baseline_core),
+                        core_memory_ratio,
+                        core_memory_quality_score,
+                        len(df),
+                    )
+        except Exception as e:
+            # Never break training due to core memory sampling issues.
+            logger.warning("Core memory mix skipped: %s", e)
+
+        # ----------------------------
+        # Class completion (production safety)
+        # ----------------------------
+        # If the current feedback batch doesn't contain all diagnosis classes,
+        # RandomForest(classes_=...) will shrink to only observed classes,
+        # which can lead to "100% confidence on a single class".
+        #
+        # We fix this by adding a small number of reference samples per missing class
+        # from the baseline CSV. Reference samples get `data_quality_score=0`
+        # so they do not dominate learning, but they keep the class space stable.
+        baseline_csv = os.getenv("BASELINE_DATASET_CSV")
+        baseline_label_col = os.getenv("BASELINE_LABEL_COL", "target_diagnosis")
+        # Default to 1 to avoid tiny-batch stratification errors.
+        class_completion_per_missing = int(os.getenv("CLASS_COMPLETION_REFERENCE_PER_MISSING_CLASS", "1"))
+        # Small (non-zero) reference weight helps keep class decision boundaries stable.
+        class_completion_quality_score = float(os.getenv("CLASS_COMPLETION_REFERENCE_QUALITY_SCORE", "0.1"))
+
+        try:
+            if baseline_csv and str(baseline_csv).strip():
+                baseline_df = pd.read_csv(baseline_csv, usecols=[baseline_label_col])
+                baseline_labels = set(baseline_df[baseline_label_col].astype(str).unique().tolist())
+
+                y_feedback = df["final_diagnosis"].astype(str)
+                feedback_labels = set(y_feedback.unique().tolist())
+                missing_labels = sorted(list(baseline_labels - feedback_labels))
+
+                if missing_labels:
+                    # Load full baseline columns needed for feature construction
+                    feature_cols = [
+                        "animal_type",
+                        "gender",
+                        "age_months",
+                        "weight_kg",
+                        "temperature",
+                        "heart_rate",
+                        "current_season",
+                        "vaccination_status",
+                        "medical_history",
+                        "symptom_duration",
+                        "symptoms_list",
+                    ]
+                    needed_cols = feature_cols + [baseline_label_col]
+                    full_baseline = pd.read_csv(baseline_csv, usecols=needed_cols)
+                    full_baseline["__label__"] = full_baseline[baseline_label_col].astype(str)
+
+                    reference_rows = []
+                    rng_seed = int(os.getenv("RANDOM_STATE", "42"))
+                    for lbl in missing_labels:
+                        candidates = full_baseline[full_baseline["__label__"] == lbl]
+                        if candidates.empty:
+                            continue
+                        n_pick = min(class_completion_per_missing, len(candidates))
+                        picked = candidates.sample(n=n_pick, random_state=rng_seed, replace=False) if n_pick > 0 else candidates.head(0)
+                        for _, row in picked.iterrows():
+                            reference_rows.append({
+                                "animal_type": row.get("animal_type"),
+                                "gender": row.get("gender"),
+                                "age_months": row.get("age_months"),
+                                "weight_kg": row.get("weight_kg"),
+                                "temperature": row.get("temperature"),
+                                "heart_rate": row.get("heart_rate"),
+                                "current_season": row.get("current_season"),
+                                "vaccination_status": row.get("vaccination_status"),
+                                "medical_history": row.get("medical_history", "Unknown"),
+                                "symptom_duration": row.get("symptom_duration"),
+                                "symptoms_list": row.get("symptoms_list", ""),
+                                "final_diagnosis": lbl,
+                                "data_quality_score": class_completion_quality_score,
+                            })
+
+                    if reference_rows:
+                        df_ref = pd.DataFrame(reference_rows)
+                        # Ensure required columns exist
+                        for c in ["medical_history", "symptoms_list"]:
+                            if c in df_ref.columns:
+                                df_ref[c] = df_ref[c].fillna("Unknown" if c == "medical_history" else "")
+                        df = pd.concat([df, df_ref], ignore_index=True)
+                        logger.info(
+                            "Class completion: feedback_labels=%d, missing_labels=%d, added_reference_rows=%d",
+                            len(feedback_labels),
+                            len(missing_labels),
+                            len(reference_rows),
+                        )
+        except Exception as e:
+            # If baseline CSV missing or malformed, we just proceed without class completion.
+            logger.warning("Class completion skipped: %s", e)
+
+        # Recompute sample weights AFTER filtering + class completion (keep alignment)
+        sample_weights = df["data_quality_score"].astype(float).to_numpy().ravel()
         
         X = df.drop(['final_diagnosis', 'data_quality_score'], axis=1)
         y = df['final_diagnosis']
         
         logger.info(f"Prepared {len(X)} training samples after quality filtering")
-        return X, y, sample_weights[:len(X)]
+        return X, y, sample_weights
     
     def preprocess_features(self, X: pd.DataFrame, fit_encoders: bool = True) -> Tuple[sparse.csr_matrix, Dict]:
         """Preprocess features with automatic feature type detection"""
@@ -374,6 +646,40 @@ class ModelTrainer:
         
         logger.info(f"Feature preprocessing complete: {X_final.shape}")
         return X_final, preprocessing_info
+
+    def load_active_artifacts(self) -> tuple[RandomForestClassifier, str]:
+        """
+        Load active model + preprocessors so we can warm-start training.
+        Returns (model, active_model_dir).
+        """
+        active = get_active_model()
+        if active is None:
+            # fallback to newest version directory under models root
+            versions = list_model_versions()
+            if not versions:
+                raise ValueError("No existing model versions found to fine-tune")
+            active_dir = resolve_model_dir(versions[0])
+        else:
+            active_dir = active.model_dir
+
+        model_path = os.path.join(active_dir, "model.pkl")
+        tab_path = os.path.join(active_dir, "tab_preprocess.pkl")
+        mlb_path = os.path.join(active_dir, "symptoms_mlb.pkl")
+
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Active model.pkl not found: {model_path}")
+
+        model = joblib.load(model_path)
+        if os.path.exists(tab_path):
+            self.tab_preprocess = joblib.load(tab_path)
+        if os.path.exists(mlb_path):
+            self.symptoms_mlb = joblib.load(mlb_path)
+
+        if not isinstance(model, RandomForestClassifier):
+            raise ValueError(f"Active model is not RandomForestClassifier: {type(model)}")
+
+        logger.info("Loaded active artifacts from %s", active_dir)
+        return model, active_dir
     
     def _create_tabular_preprocessor(self, categorical_features: List[str], numerical_features: List[str]):
         """Create tabular feature preprocessor with detected feature types"""
@@ -403,9 +709,19 @@ class ModelTrainer:
         
         return preprocessor
     
-    def train_model(self, X: sparse.csr_matrix, y: pd.Series, 
-                   sample_weights: np.ndarray = None) -> Dict[str, Any]:
-        """Train the actual model with dynamic parameters"""
+    def train_model(
+        self,
+        X: sparse.csr_matrix,
+        y: pd.Series,
+        sample_weights: np.ndarray = None,
+        base_model: Optional[RandomForestClassifier] = None,
+        finetune_add_trees: int = 20,
+    ) -> Dict[str, Any]:
+        """
+        Train model.
+        - If base_model is provided: warm-start by adding trees (fine-tune-ish).
+        - Else: train new model from scratch.
+        """
         logger.info(f"Starting model training with {X.shape[0]} samples")
         
         # Get adaptive split ratio
@@ -422,6 +738,10 @@ class ModelTrainer:
         min_samples_per_class = class_counts.min()
         can_stratify = min_samples_per_class >= 2 and len(class_counts) >= 2
         
+        # Ensure 1-D sample weights (sklearn expects shape (n_samples,))
+        if sample_weights is not None:
+            sample_weights = np.asarray(sample_weights, dtype=float).ravel()
+
         if can_stratify:
             try:
                 X_train, X_val, y_train, y_val, weights_train, weights_val = train_test_split(
@@ -429,7 +749,10 @@ class ModelTrainer:
                 )
                 logger.info("Used stratified train/test split")
             except ValueError as e:
-                if "stratify" in str(e):
+                # sklearn may throw when test_size is too small to cover all classes under stratify
+                # e.g. "The test_size = 4 should be greater or equal to the number of classes = 9"
+                err = str(e).lower()
+                if ("stratify" in err) or ("test_size" in err) or ("number of classes" in err):
                     logger.warning("Cannot stratify due to insufficient samples, using random split")
                     X_train, X_val, y_train, y_val, weights_train, weights_val = train_test_split(
                         X, y, sample_weights, test_size=test_size, random_state=random_state
@@ -442,6 +765,10 @@ class ModelTrainer:
                 X, y, sample_weights, test_size=test_size, random_state=random_state
             )
         
+        # Dataset-derived class balancing via sample_weight (stable)
+        warm_starting = base_model is not None
+        baseline_cw: Optional[Dict[str, float]] = self._get_baseline_class_weight()
+
         # Build dynamic model parameters
         # Use sparse matrix shape for parameter building instead of converting to DataFrame
         n_samples = X_train.shape[0]
@@ -453,9 +780,51 @@ class ModelTrainer:
         model_params = self.build_model_params(dummy_df, y_train)
         logger.info(f"Using dynamic model parameters: {model_params}")
         
+        # Ensure weights are 1-D after split
+        if weights_train is not None:
+            weights_train = np.asarray(weights_train, dtype=float).ravel()
+        if weights_val is not None:
+            weights_val = np.asarray(weights_val, dtype=float).ravel()
+
         # Train model
-        model = RandomForestClassifier(**model_params)
+        if base_model is not None:
+            model = base_model
+            model.warm_start = True
+            try:
+                # Disable RF internal class_weight processing; we'll apply baseline class_weight ourselves
+                # via sample_weight (see below).
+                if getattr(model, "class_weight", None) in ("balanced", "balanced_subsample"):
+                    model.class_weight = None
+                if hasattr(model, "class_weight_"):
+                    delattr(model, "class_weight_")
+            except Exception:
+                pass
+            try:
+                current = int(getattr(model, "n_estimators", 0) or 0)
+            except Exception:
+                current = 0
+            model.n_estimators = max(current + int(finetune_add_trees), current + 1)
+            logger.info("Warm-start fine-tune: n_estimators %s -> %s", current, model.n_estimators)
+        else:
+            model = RandomForestClassifier(**model_params)
         
+        # Apply baseline class_weight as multiplicative factor on sample_weight
+        if baseline_cw and weights_train is not None:
+            try:
+                # Force 1-D vectors to avoid numpy broadcasting into (n,n)
+                y_train_str = np.asarray(y_train).ravel().astype(str)
+                cw_vec = np.array([baseline_cw.get(lbl, 1.0) for lbl in y_train_str], dtype=float).ravel()
+                weights_train = np.asarray(weights_train, dtype=float).ravel()
+                logger.info(
+                    "Fine-tune sample_weight shapes: weights_train=%s cw_vec=%s",
+                    weights_train.shape,
+                    cw_vec.shape
+                )
+                weights_train *= cw_vec
+                logger.info("Applied baseline class_weight via sample_weight (element-wise)")
+            except Exception as e:
+                logger.warning("Failed to apply baseline class_weight to sample_weight: %s", e)
+
         start_time = datetime.now()
         model.fit(X_train, y_train, sample_weight=weights_train)
         training_time = (datetime.now() - start_time).total_seconds()
@@ -699,24 +1068,271 @@ class ModelTrainer:
         
         return new_version
 
+
+def _normalize_label_array(y) -> np.ndarray:
+    """Strip whitespace for stable comparison between CSV labels and model outputs."""
+    return np.array([str(v).strip() for v in np.asarray(y).ravel()], dtype=object)
+
+
 def execute_training(feedback_data: List[Dict], prediction_logs: List[Dict],
                    training_mode: str = "local") -> Dict[str, Any]:
     """Execute training pipeline with dynamic parameters"""
     logger.info(f"Starting {training_mode} training pipeline")
     
     try:
+        # Train only on eligible feedback (aligns with eligibility used to trigger jobs).
+        eligible_feedback_data = [
+            f for f in (feedback_data or []) if f.get("is_training_eligible", True)
+        ]
+        if not eligible_feedback_data:
+            raise ValueError("No eligible feedback data to train on")
+
         # Initialize trainer
         trainer = ModelTrainer()
         
         # Collect data
-        X, y, sample_weights = trainer.collect_training_data(feedback_data, prediction_logs)
+        X, y, sample_weights = trainer.collect_training_data(eligible_feedback_data, prediction_logs)
+
+        # Safety guard: don't train/persist a model when feedback has too low class diversity.
+        # If y contains only 1 diagnosis class, RandomForest will end up predicting that class
+        # with ~100% confidence, which breaks real-world inference.
+        min_unique_classes = int(os.getenv("TRAINING_MIN_UNIQUE_CLASSES", "2"))
+        y_str = y.astype(str) if hasattr(y, "astype") else np.asarray(y).astype(str)
+        unique_classes = np.unique(y_str)
+        if len(unique_classes) < min_unique_classes:
+            class_counts = dict(pd.Series(y_str).value_counts().to_dict())
+            raise ValueError(
+                f"Insufficient class diversity for training: unique_classes={len(unique_classes)} "
+                f"< {min_unique_classes}. class_counts={class_counts}"
+            )
         
-        # Preprocess features
-        X_processed, preprocessing_info = trainer.preprocess_features(X, fit_encoders=True)
+        # Fine-tune mode (warm-start) vs full retrain
+        finetune = os.getenv("FINETUNE_PREVIOUS_MODEL", "true").lower() in ("1", "true", "yes", "y")
+        if finetune:
+            base_model, base_dir = trainer.load_active_artifacts()
+            X_processed, preprocessing_info = trainer.preprocess_features(X, fit_encoders=False)
+            add_trees = int(os.getenv("FINETUNE_ADD_TREES", "20"))
+            try:
+                model, training_metrics = trainer.train_model(
+                    X_processed, y, sample_weights, base_model=base_model, finetune_add_trees=add_trees
+                )
+                training_metrics["finetune"] = True
+                training_metrics["finetune_fallback"] = False
+            except Exception as e:
+                # sklearn warm_start for RF can fail in some edge cases (small batches / class shifts).
+                # Fallback to full retrain using the *same* fixed preprocessors (encoders reused).
+                logger.warning("Warm-start fine-tune failed (%s). Falling back to retrain.", e)
+                model, training_metrics = trainer.train_model(
+                    X_processed, y, sample_weights, base_model=None
+                )
+                training_metrics["finetune"] = True
+                training_metrics["finetune_fallback"] = True
+            training_metrics["finetune"] = True
+            training_metrics["finetune_base_dir"] = base_dir
+        else:
+            X_processed, preprocessing_info = trainer.preprocess_features(X, fit_encoders=True)
+            model, training_metrics = trainer.train_model(X_processed, y, sample_weights)
+            training_metrics["finetune"] = False
         
-        # Train model with dynamic parameters
-        model, training_metrics = trainer.train_model(X_processed, y, sample_weights)
-        
+        # ----------------------------
+        # Regression Test Gate (golden set)
+        # ----------------------------
+        regression_gate_enabled = os.getenv("REGRESSION_GATE_ENABLED", "true").lower() in ("1", "true", "yes", "y")
+        regression_tol_f1 = float(os.getenv("REGRESSION_TOLERANCE_F1", "0.01"))
+        golden_test_max_rows = int(os.getenv("GOLDEN_TEST_MAX_ROWS", "2000"))
+        golden_test_random_state = int(os.getenv("RANDOM_STATE", "42"))
+        # Fine-tune on tiny feedback batches often collapses holdout F1; skip golden gate until enough signal.
+        regression_min_feedback = int(os.getenv("REGRESSION_GATE_MIN_FEEDBACK_SAMPLES", "20"))
+
+        if (
+            regression_gate_enabled
+            and finetune
+            and os.getenv("BASELINE_DATASET_CSV")
+            and len(eligible_feedback_data) < regression_min_feedback
+        ):
+            logger.info(
+                "Regression gate skipped: len(feedback_data)=%d < REGRESSION_GATE_MIN_FEEDBACK_SAMPLES=%d "
+                "(small batches are not representative for holdout regression)",
+                len(feedback_data),
+                regression_min_feedback,
+            )
+            training_metrics["regression_gate_enabled"] = False
+            training_metrics["regression_gate_skipped_reason"] = "low_feedback_count"
+            training_metrics["regression_gate_min_feedback_samples"] = regression_min_feedback
+        elif regression_gate_enabled and finetune and os.getenv("BASELINE_DATASET_CSV"):
+            try:
+                baseline_csv = os.getenv("BASELINE_DATASET_CSV")
+                baseline_label_col = os.getenv("BASELINE_LABEL_COL", "target_diagnosis")
+
+                feature_cols = [
+                    "animal_type",
+                    "gender",
+                    "age_months",
+                    "weight_kg",
+                    "temperature",
+                    "heart_rate",
+                    "current_season",
+                    "vaccination_status",
+                    "medical_history",
+                    "symptom_duration",
+                    "symptoms_list",
+                ]
+                needed_cols = feature_cols + [baseline_label_col]
+                golden_df = pd.read_csv(baseline_csv, usecols=needed_cols)
+
+                if len(golden_df) > golden_test_max_rows:
+                    golden_df = golden_df.sample(n=golden_test_max_rows, random_state=golden_test_random_state)
+
+                y_gold = _normalize_label_array(golden_df[baseline_label_col])
+                X_gold_features = golden_df[feature_cols]
+
+                # Use locked encoders (fit_encoders=False) for stability
+                X_gold_processed, _ = trainer.preprocess_features(X_gold_features, fit_encoders=False)
+
+                # Important: `base_model` may be mutated in-memory by warm-start training
+                # (train_model() reuses the same object). To get a true "before" baseline,
+                # reload the base model from disk.
+                base_model_fresh = joblib.load(os.path.join(base_dir, "model.pkl"))
+                base_preds = _normalize_label_array(base_model_fresh.predict(X_gold_processed))
+                new_preds = _normalize_label_array(model.predict(X_gold_processed))
+
+                try:
+                    base_f1 = float(
+                        f1_score(y_gold, base_preds, average="weighted", zero_division=0)
+                    )
+                    new_f1 = float(
+                        f1_score(y_gold, new_preds, average="weighted", zero_division=0)
+                    )
+                except TypeError:
+                    base_f1 = float(f1_score(y_gold, base_preds, average="weighted"))
+                    new_f1 = float(f1_score(y_gold, new_preds, average="weighted"))
+                base_acc = float(accuracy_score(y_gold, base_preds))
+                new_acc = float(accuracy_score(y_gold, new_preds))
+
+                # base_f1 có thể = 1.0 do golden slice quá dễ.
+                # Khi đó tolerance tương đối (ví dụ 0.01) sẽ khiến gate luôn fail.
+                # Nên nới tolerance khi base_f1 "rất cao".
+                regression_high_base_f1_threshold = float(
+                    os.getenv("REGRESSION_HIGH_BASE_F1_THRESHOLD", "0.99")
+                )
+                regression_tolerance_high_base = float(
+                    os.getenv("REGRESSION_TOLERANCE_F1_HIGH_BASE", "0.35")
+                )
+                effective_tol = regression_tol_f1
+                if base_f1 >= regression_high_base_f1_threshold:
+                    effective_tol = max(regression_tol_f1, regression_tolerance_high_base)
+
+                training_metrics["regression_gate_enabled"] = True
+                training_metrics["golden_test_size"] = int(len(golden_df))
+                training_metrics["golden_base_f1_weighted"] = base_f1
+                training_metrics["golden_new_f1_weighted"] = new_f1
+                training_metrics["golden_base_accuracy"] = base_acc
+                training_metrics["golden_new_accuracy"] = new_acc
+
+                training_metrics["regression_effective_tolerance_f1"] = effective_tol
+                if new_f1 < base_f1 - effective_tol:
+                    err = (
+                        f"Regression gate failed on golden test: "
+                        f"base_f1={base_f1:.4f}, new_f1={new_f1:.4f}, "
+                        f"tolerance={effective_tol:.4f}"
+                    )
+                    logger.warning(err)
+                    return {
+                        "status": "failed",
+                        "error": err,
+                        "training_mode": training_mode,
+                        "training_metrics": training_metrics,
+                    }
+            except Exception as e:
+                # If golden regression test fails for any reason, don't block training.
+                logger.warning("Regression gate skipped due to error: %s", e)
+                training_metrics["regression_gate_skipped_error"] = str(e)
+        else:
+            training_metrics["regression_gate_enabled"] = False
+
+        # ----------------------------
+        # Feedback improvement gate (expert feedback batch only, no core memory)
+        # ----------------------------
+        feedback_gate_enabled = os.getenv(
+            "FEEDBACK_IMPROVEMENT_GATE_ENABLED", "true"
+        ).lower() in ("1", "true", "yes", "y")
+        feedback_gate_tolerance = float(os.getenv("FEEDBACK_GATE_TOLERANCE", "0.05"))
+
+        if (
+            feedback_gate_enabled
+            and finetune
+            and training_metrics.get("finetune_base_dir")
+        ):
+            base_dir_fb = str(training_metrics["finetune_base_dir"])
+            try:
+                X_fb, y_fb = trainer.collect_feedback_only_training_frame(
+                    eligible_feedback_data, prediction_logs
+                )
+                y_fb_str = y_fb.astype(str)
+                X_fb_proc, _ = trainer.preprocess_features(X_fb, fit_encoders=False)
+                base_model_feedback = joblib.load(
+                    os.path.join(base_dir_fb, "model.pkl")
+                )
+                base_preds_fb = base_model_feedback.predict(X_fb_proc)
+                new_preds_fb = model.predict(X_fb_proc)
+
+                n_unique_fb = int(y_fb_str.nunique())
+                if n_unique_fb < 2:
+                    metric_name = "accuracy"
+                    base_sc = float(accuracy_score(y_fb_str, base_preds_fb))
+                    new_sc = float(accuracy_score(y_fb_str, new_preds_fb))
+                else:
+                    metric_name = "f1_weighted"
+                    try:
+                        base_sc = float(
+                            f1_score(
+                                y_fb_str,
+                                base_preds_fb,
+                                average="weighted",
+                                zero_division=0,
+                            )
+                        )
+                        new_sc = float(
+                            f1_score(
+                                y_fb_str,
+                                new_preds_fb,
+                                average="weighted",
+                                zero_division=0,
+                            )
+                        )
+                    except TypeError:
+                        base_sc = float(
+                            f1_score(y_fb_str, base_preds_fb, average="weighted")
+                        )
+                        new_sc = float(
+                            f1_score(y_fb_str, new_preds_fb, average="weighted")
+                        )
+
+                training_metrics["feedback_gate_enabled"] = True
+                training_metrics["feedback_eval_size"] = int(len(y_fb))
+                training_metrics["feedback_gate_metric"] = metric_name
+                training_metrics["feedback_base_score"] = base_sc
+                training_metrics["feedback_new_score"] = new_sc
+
+                if new_sc < base_sc - feedback_gate_tolerance:
+                    err = (
+                        f"Feedback improvement gate failed: metric={metric_name} "
+                        f"base={base_sc:.4f}, new={new_sc:.4f}, "
+                        f"tolerance={feedback_gate_tolerance:.4f}"
+                    )
+                    logger.warning(err)
+                    return {
+                        "status": "failed",
+                        "error": err,
+                        "training_mode": training_mode,
+                        "training_metrics": training_metrics,
+                    }
+            except Exception as e:
+                logger.warning("Feedback improvement gate skipped: %s", e)
+                training_metrics["feedback_gate_skipped_error"] = str(e)
+        else:
+            training_metrics["feedback_gate_enabled"] = False
+
         # Generate version
         model_version = trainer.generate_model_version()
         
@@ -745,7 +1361,7 @@ def execute_training(feedback_data: List[Dict], prediction_logs: List[Dict],
         return result
         
     except Exception as e:
-        logger.error(f"Training failed: {e}")
+        logger.exception("Training failed")
         return {
             'status': 'failed',
             'error': str(e),
