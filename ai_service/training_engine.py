@@ -390,7 +390,30 @@ class ModelTrainer:
                 continue
             
             # Create training record
-            record = {
+            base_quality = float(feedback.get('data_quality_score', 1.0))
+            confidence_rating = feedback.get('confidence_rating')
+            try:
+                confidence_rating = int(confidence_rating) if confidence_rating is not None else None
+            except Exception:
+                confidence_rating = None
+                
+            delta_max = float(os.getenv("FEEDBACK_DELTA_MAX", "0.4"))
+            accept_strength = float(os.getenv("FEEDBACK_ACCEPT_STRENGTH", "1.0"))
+            reject_strength = float(os.getenv("FEEDBACK_REJECT_STRENGTH", "1.0"))
+
+            rating = 0.0 if confidence_rating is None else max(0.0, min(5.0, float(confidence_rating)))
+            delta_pos = (rating / 5.0) * delta_max * accept_strength
+            delta_neg = ((5.0 - rating) / 5.0) * delta_max * reject_strength
+
+            pos_weight = min(float(os.getenv("FEEDBACK_POSITIVE_MAX_WEIGHT", "2.0")), base_quality + delta_pos)
+            neg_min_weight = float(os.getenv("FEEDBACK_NEGATIVE_MIN_WEIGHT", "0.51"))
+            neg_weight = max(neg_min_weight, base_quality - delta_neg)
+
+            final_label = feedback['final_diagnosis']
+            is_correct = bool(feedback.get('is_correct', True))
+            ai_label = feedback.get('ai_diagnosis')
+
+            features = {
                 'animal_type': pred_input.get('animal_type'),
                 'gender': pred_input.get('gender'),
                 'age_months': pred_input.get('age_months'),
@@ -401,12 +424,32 @@ class ModelTrainer:
                 'vaccination_status': pred_input.get('vaccination_status'),
                 'medical_history': pred_input.get('medical_history', 'Unknown'),
                 'symptom_duration': pred_input.get('symptom_duration'),
-                'symptoms_list': pred_input.get('symptoms_list', ''),
-                'final_diagnosis': feedback['final_diagnosis'],
-                'data_quality_score': feedback.get('data_quality_score', 1.0)
+                'symptoms_list': pred_input.get('symptoms_list', '')
             }
-            
-            training_records.append(record)
+
+            # On accept (is_correct=true): boost the final_label.
+            # On reject (is_correct=false): penalize the AI-suggested label (ai_label) so next time it should decrease.
+            # - If final_label == ai_label: chỉ penalize label đó (không boost thêm).
+            # - If final_label != ai_label: boost doctor's final_label và penalize ai_label với delta đối xứng.
+            if is_correct:
+                training_records.append({**features,
+                                          'final_diagnosis': final_label,
+                                          'data_quality_score': pos_weight})
+            else:
+                if ai_label is not None and final_label == ai_label:
+                    training_records.append({**features,
+                                              'final_diagnosis': final_label,
+                                              'data_quality_score': neg_weight})
+                else:
+                    # Reinforce doctor's final label with the same magnitude used for accept boost
+                    training_records.append({**features,
+                                              'final_diagnosis': final_label,
+                                              'data_quality_score': pos_weight})
+                    # Penalize AI label (if available)
+                    if ai_label is not None and str(ai_label).strip() != "":
+                        training_records.append({**features,
+                                                  'final_diagnosis': ai_label,
+                                                  'data_quality_score': neg_weight})
         
         if not training_records:
             raise ValueError("No valid training records found")

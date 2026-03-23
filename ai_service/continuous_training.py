@@ -61,6 +61,8 @@ class DoctorFeedback(BaseModel):
     prediction_id: int
     final_diagnosis: str
     is_correct: bool
+    # AI-suggested label (used to apply negative training signal on reject)
+    ai_diagnosis: Optional[str] = None
     confidence_rating: Optional[int] = Field(ge=0, le=5, default=None)
     comments: Optional[str] = None
     veterinarian_id: int
@@ -129,6 +131,7 @@ async def save_feedback(feedback: DoctorFeedback) -> bool:
         "prediction_id": feedback.prediction_id,
         "final_diagnosis": feedback.final_diagnosis,
         "is_correct": feedback.is_correct,
+        "ai_diagnosis": feedback.ai_diagnosis,
         "confidence_rating": feedback.confidence_rating,
         "comments": feedback.comments,
         "veterinarian_id": feedback.veterinarian_id,
