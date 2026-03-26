@@ -229,17 +229,45 @@ async def set_active_model_version(request: ActiveModelRequest, _: bool = Depend
 
 @router.get("/training/last", summary="Get last training job status")
 async def get_last_training_job():
-    """
-    Returns most recent training job from continuous training orchestrator (if running in this process).
-    """
     try:
         from ai_service.continuous_training import training_jobs  # in-memory store
+        from ai_service.model_registry import get_active_model
 
         if not training_jobs:
-            return {"status": "success", "last_training": None}
+            active = get_active_model()
+            return {
+                "status": "success",
+                "last_training": None,
+                "last_successful_training": None,
+                "active_model": active.model_version if active else None,
+            }
 
         last_id = max(training_jobs.keys())
-        return {"status": "success", "last_training": training_jobs[last_id]}
+        last_job = training_jobs[last_id]
+
+        successful_jobs = [
+            j for j in training_jobs.values()
+            if str(j.get("status")).lower() == "completed" and bool(j.get("is_deployed"))
+        ]
+        last_successful = None
+        if successful_jobs:
+            last_successful = max(successful_jobs, key=lambda x: x.get("training_id", 0))
+
+        active = get_active_model()
+        active_model_version = active.model_version if active else None
+
+        return {
+            "status": "success",
+            "last_training": last_job,
+            "last_successful_training": last_successful,
+            "active_model": active_model_version,
+            # Convenience hint for UI: when latest failed, app may still serve previous successful model.
+            "serving_model_source": (
+                "last_successful_training"
+                if last_successful and active_model_version == last_successful.get("new_model_version")
+                else "active_model_registry"
+            ),
+        }
     except Exception as e:
         logger.error(f"Failed to read training jobs: {e}")
         raise HTTPException(status_code=500, detail=str(e))
