@@ -7,6 +7,9 @@ async function jget(url) {
   return data;
 }
 
+const HISTORY_PAGE_SIZE = 10;
+let historyPage = 1;
+
 function getToken() {
   const fromInput = (document.getElementById("admin-token")?.value || "").trim();
   const fromStorage = (localStorage.getItem("vetai_admin_token") || "").trim();
@@ -30,6 +33,23 @@ async function jsend(url, method, body) {
   try { data = text ? JSON.parse(text) : null; } catch (_) { data = text; }
   if (!r.ok) throw { status: r.status, data };
   return data;
+}
+
+async function downloadWithAuth(url, filename) {
+  const r = await fetch(url, { headers: { ...authHeaders() } });
+  if (!r.ok) {
+    const text = await r.text();
+    throw { status: r.status, data: text };
+  }
+  const blob = await r.blob();
+  const a = document.createElement("a");
+  const objUrl = URL.createObjectURL(blob);
+  a.href = objUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(objUrl);
 }
 
 function setText(id, v) {
@@ -79,22 +99,45 @@ async function refreshTraining() {
 }
 
 async function loadHistory() {
-  const h = await jget("/continuous-training/training/history?limit=10&offset=0");
+  const offset = (historyPage - 1) * HISTORY_PAGE_SIZE;
+  const h = await jget(`/continuous-training/training/history?limit=${HISTORY_PAGE_SIZE}&offset=${offset}`);
   const tbody = document.getElementById("history-body");
+  const pag = document.getElementById("history-pagination");
   tbody.innerHTML = "";
   (h.training_runs || []).forEach(run => {
     const tr = document.createElement("tr");
+    const statusBadge = run.status === "completed"
+      ? `<span class="badge text-bg-success">${run.status}</span>`
+      : run.status === "failed"
+        ? `<span class="badge text-bg-danger">${run.status}</span>`
+        : `<span class="badge text-bg-secondary">${run.status || "-"}</span>`;
     tr.innerHTML = `
       <td>${run.training_id}</td>
-      <td>${run.status}</td>
+      <td>${statusBadge}</td>
+      <td>${run.training_mode || "-"}</td>
       <td class="mono">${run.new_model_version || "-"}</td>
       <td>${run.validation_accuracy ?? "-"}</td>
       <td>${run.f1_score ?? "-"}</td>
+      <td>${run.dataset_row_count ?? 0}</td>
+      <td>
+        <button class="btn btn-sm btn-outline-secondary btn-status" data-id="${run.training_id}">Status</button>
+        <button class="btn btn-sm btn-outline-primary btn-download-data" data-id="${run.training_id}">Download data</button>
+      </td>
     `;
     tbody.appendChild(tr);
   });
   if (!h.training_runs || h.training_runs.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="5" class="text-muted">No runs</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="text-muted">No runs</td></tr>`;
+  }
+
+  const total = Number(h.total_count || 0);
+  const pages = Math.max(1, Math.ceil(total / HISTORY_PAGE_SIZE));
+  pag.innerHTML = "";
+  for (let i = 1; i <= pages; i++) {
+    const li = document.createElement("li");
+    li.className = `page-item ${i === historyPage ? "active" : ""}`;
+    li.innerHTML = `<button class="page-link history-page-btn" data-page="${i}">${i}</button>`;
+    pag.appendChild(li);
   }
 }
 
@@ -167,6 +210,43 @@ async function main() {
   });
   document.getElementById("btn-load-history").addEventListener("click", async () => {
     try { await loadHistory(); } catch (e) { toast(`History failed (${e.status || "?"})`); }
+  });
+  document.getElementById("history-pagination").addEventListener("click", async (ev) => {
+    const btn = ev.target.closest(".history-page-btn");
+    if (!btn) return;
+    const p = Number(btn.getAttribute("data-page") || "1");
+    if (!Number.isFinite(p) || p < 1) return;
+    historyPage = p;
+    try { await loadHistory(); } catch (e) { toast(`History page failed (${e.status || "?"})`); }
+  });
+  document.getElementById("history-body").addEventListener("click", async (ev) => {
+    const statusBtn = ev.target.closest(".btn-status");
+    if (statusBtn) {
+      const id = statusBtn.getAttribute("data-id");
+      try {
+        const data = await jget(`/continuous-training/training/status?training_id=${encodeURIComponent(id)}`);
+        toast(JSON.stringify(data, null, 2));
+      } catch (e) {
+        toast(`Load status failed (${e.status || "?"}): ${JSON.stringify(e.data)}`);
+      }
+      return;
+    }
+    const dlBtn = ev.target.closest(".btn-download-data");
+    if (dlBtn) {
+      if (!getToken()) {
+        toast("Admin token required to download training data.");
+        return;
+      }
+      const id = dlBtn.getAttribute("data-id");
+      try {
+        await downloadWithAuth(
+          `/continuous-training/training/dataset/download?training_id=${encodeURIComponent(id)}`,
+          `training_${id}_dataset.csv`
+        );
+      } catch (e) {
+        toast(`Download failed (${e.status || "?"}): ${JSON.stringify(e.data)}`);
+      }
+    }
   });
   document.getElementById("btn-load-policy").addEventListener("click", async () => {
     try { await loadPolicy(); } catch (e) { toast(`Load policy failed (${e.status || "?"})`); }

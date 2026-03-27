@@ -4,9 +4,11 @@ Handles prediction logging and training trigger logic
 """
 
 from datetime import datetime, timedelta
+from io import StringIO
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
 from fastapi import HTTPException, BackgroundTasks, APIRouter, Depends
+from fastapi.responses import StreamingResponse
 import asyncio
 import logging
 import os
@@ -15,6 +17,7 @@ import uuid
 import time
 import subprocess
 import boto3
+import csv
 from prometheus_client import Gauge, Counter
 
 # Import kubernetes only when needed for EKS training
@@ -151,11 +154,13 @@ async def save_feedback(feedback: DoctorFeedback) -> bool:
 prediction_logs: List[PredictionLog] = []
 feedback_data: List[DoctorFeedback] = []
 training_jobs: Dict[str, TrainingStatus] = {}
+training_datasets: Dict[int, List[Dict[str, Any]]] = {}
 
 # Initialize clean storage
 prediction_logs.clear()
 feedback_data.clear()
 training_jobs.clear()
+training_datasets.clear()
 
 training_counter = 0  # Sequential counter for reliable IDs
 
@@ -209,6 +214,61 @@ async def count_eligible_feedback(days: Optional[int] = None) -> int:
     return eligible_count
 
 
+def build_training_dataset_snapshot(
+    feedback_items: List[Dict[str, Any]],
+    predictions: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Build the raw feedback-linked dataset that is fed into training.
+    This captures the source rows before weighting / core-memory augmentation.
+    """
+    rows: List[Dict[str, Any]] = []
+    if not feedback_items:
+        return rows
+
+    pred_by_id = {}
+    for p in predictions:
+        if isinstance(p, dict):
+            pid = p.get("id")
+            if pid is not None:
+                pred_by_id[pid] = p
+
+    for f in feedback_items:
+        if not isinstance(f, dict):
+            continue
+        pred = pred_by_id.get(f.get("prediction_id"))
+        if pred is None:
+            continue
+        pred_input = pred.get("prediction_input") or {}
+        rows.append(
+            {
+                "prediction_id": f.get("prediction_id"),
+                "timestamp": (
+                    f.get("timestamp").isoformat()
+                    if hasattr(f.get("timestamp"), "isoformat")
+                    else str(f.get("timestamp", ""))
+                ),
+                "final_diagnosis": f.get("final_diagnosis"),
+                "ai_diagnosis": f.get("ai_diagnosis"),
+                "is_correct": f.get("is_correct"),
+                "confidence_rating": f.get("confidence_rating"),
+                "data_quality_score": f.get("data_quality_score"),
+                "animal_type": pred_input.get("animal_type"),
+                "gender": pred_input.get("gender"),
+                "age_months": pred_input.get("age_months"),
+                "weight_kg": pred_input.get("weight_kg"),
+                "temperature": pred_input.get("temperature"),
+                "heart_rate": pred_input.get("heart_rate"),
+                "current_season": pred_input.get("current_season"),
+                "vaccination_status": pred_input.get("vaccination_status"),
+                "medical_history": pred_input.get("medical_history"),
+                "symptom_duration": pred_input.get("symptom_duration"),
+                "symptoms_list": pred_input.get("symptoms_list"),
+            }
+        )
+    return rows
+
+
 @router.get("/config")
 async def get_training_policy():
     return {
@@ -254,6 +314,15 @@ async def trigger_training_job(request: TrainingTriggerRequest) -> int:
         "trigger_type": request.trigger_type,
         "training_mode": request.training_mode
     }
+
+    # Snapshot the exact feedback-linked rows used as training input at trigger time.
+    eligible_feedback_items = [
+        f for f in feedback_data if f.get("is_training_eligible", True)
+    ]
+    training_datasets[training_id] = build_training_dataset_snapshot(
+        eligible_feedback_items, prediction_logs
+    )
+    training_jobs[training_id]["dataset_row_count"] = len(training_datasets[training_id])
     
     # Start actual training
     logger.info(f"Starting actual training for job {training_id}")
@@ -665,6 +734,8 @@ async def get_training_history(limit: int = 10, offset: int = 0):
                 "training_mode": job.get("training_mode"),
                 "previous_model_version": job.get("previous_model_version"),
                 "new_model_version": job.get("new_model_version")
+                ,
+                "dataset_row_count": job.get("dataset_row_count", 0)
             })
         
         return {
@@ -676,6 +747,43 @@ async def get_training_history(limit: int = 10, offset: int = 0):
     except Exception as e:
         logger.error(f"Failed to get training history: {e}")
         raise HTTPException(status_code=500, detail="Failed to get training history")
+
+
+@router.get("/training/dataset")
+async def get_training_dataset_summary(training_id: int, _: bool = Depends(verify_admin)):
+    """Get dataset summary for a specific training job."""
+    if training_id not in training_jobs:
+        raise HTTPException(status_code=404, detail="Training job not found")
+
+    rows = training_datasets.get(training_id, [])
+    return {
+        "training_id": training_id,
+        "row_count": len(rows),
+        "columns": list(rows[0].keys()) if rows else [],
+    }
+
+
+@router.get("/training/dataset/download")
+async def download_training_dataset(training_id: int, _: bool = Depends(verify_admin)):
+    """Download raw feedback-linked dataset used for the training trigger."""
+    if training_id not in training_jobs:
+        raise HTTPException(status_code=404, detail="Training job not found")
+
+    rows = training_datasets.get(training_id, [])
+    if not rows:
+        raise HTTPException(status_code=404, detail="No dataset captured for this training run")
+
+    headers = list(rows[0].keys())
+    buf = StringIO()
+    writer = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    buf.seek(0)
+
+    filename = f"training_{training_id}_dataset.csv"
+    response_headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv", headers=response_headers)
 
 async def get_training_overview():
     """Get training system overview"""

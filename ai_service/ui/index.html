@@ -82,7 +82,7 @@
 
               <div class="mt-3">
                 <div class="d-flex justify-content-between align-items-center">
-                  <div class="fw-semibold">Recent training runs</div>
+                  <div class="fw-semibold">Training status</div>
                   <button class="btn btn-sm btn-outline-secondary" id="btn-load-history">Load</button>
                 </div>
                 <div class="table-responsive mt-2">
@@ -91,16 +91,22 @@
                       <tr>
                         <th>ID</th>
                         <th>Status</th>
+                        <th>Mode</th>
                         <th>New version</th>
                         <th>Val acc</th>
                         <th>F1</th>
+                        <th>Data rows</th>
+                        <th>Actions</th>
                       </tr>
                     </thead>
                     <tbody id="history-body">
-                      <tr><td colspan="5" class="text-muted">Not loaded</td></tr>
+                      <tr><td colspan="8" class="text-muted">Not loaded</td></tr>
                     </tbody>
                   </table>
                 </div>
+                <nav class="mt-2" aria-label="Training status pages">
+                  <ul class="pagination pagination-sm mb-0" id="history-pagination"></ul>
+                </nav>
               </div>
 
               <div class="mt-3">
