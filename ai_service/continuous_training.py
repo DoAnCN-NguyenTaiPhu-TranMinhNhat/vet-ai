@@ -6,7 +6,7 @@ Handles prediction logging and training trigger logic
 from datetime import datetime, timedelta
 from io import StringIO
 from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from fastapi import HTTPException, BackgroundTasks, APIRouter, Depends
 from fastapi.responses import StreamingResponse
 import asyncio
@@ -47,6 +47,21 @@ EKS_CLUSTER_NAME = os.getenv("EKS_CLUSTER_NAME", "vet-ai-dev")
 EKS_REGION = os.getenv("EKS_REGION", "us-east-1")
 TRAINING_NODE_GROUP = os.getenv("TRAINING_NODE_GROUP", "training-nodes")
 
+# Trên EKS, training thật = cùng process Python với local (execute_training). Luồng eks_hybrid (Batch Job riêng)
+# chỉ bật khi ALLOW_EKS_HYBRID_TRAINING=true — cần image + node group + RBAC đúng; mặc định tắt.
+def _effective_training_mode(requested: str) -> str:
+    if requested != "eks_hybrid":
+        return requested
+    allow = os.getenv("ALLOW_EKS_HYBRID_TRAINING", "false").lower() in ("1", "true", "yes", "y")
+    if not allow:
+        logger.info(
+            "training_mode=eks_hybrid -> dùng in-process training (giống local). "
+            "Đặt ALLOW_EKS_HYBRID_TRAINING=true chỉ khi đã triển khai Job training riêng."
+        )
+        return "local"
+    return "eks_hybrid"
+
+
 # Pydantic models
 class PredictionLog(BaseModel):
     id: int  # Use ID from main.py
@@ -76,10 +91,13 @@ class TrainingTriggerRequest(BaseModel):
     trigger_type: str = Field(pattern="^(scheduled|manual|automatic)$")
     trigger_reason: Optional[str] = None
     force: bool = False  # Override threshold check
+    # local = execute_training() trong pod (mặc định trên cả máy dev và EKS). eks_hybrid chỉ khi ALLOW_EKS_HYBRID_TRAINING=true.
     training_mode: str = Field(default="local", pattern="^(local|eks_hybrid)$")
     eks_node_group: Optional[str] = None
 
 class TrainingStatus(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     training_id: int
     status: str
     start_time: Optional[datetime]
@@ -93,6 +111,8 @@ class TrainingStatus(BaseModel):
     f1_score: Optional[float]
     is_deployed: bool
     error_message: Optional[str]
+    small_sample_warning: Optional[bool] = None
+    metrics_note: Optional[str] = None
 
 
 class TrainingPolicyUpdate(BaseModel):
@@ -337,26 +357,30 @@ async def execute_actual_training(training_id: int, training_mode: str):
     global feedback_data
     
     try:
-        logger.info(f"Starting actual {training_mode} training for job {training_id}")
+        effective_mode = _effective_training_mode(training_mode)
+        logger.info(f"Starting actual training for job {training_id} (requested={training_mode}, effective={effective_mode})")
         
-        if training_mode == "eks_hybrid":
-            # Scale up node group and run training on EKS
+        if effective_mode == "eks_hybrid":
+            # Tùy chọn: node group + Job riêng (cần ALLOW_EKS_HYBRID_TRAINING=true và hạ tầng đầy đủ)
             result = await run_eks_training(training_id)
         else:
-            # Run local training
+            # Cùng pipeline sklearn/MLflow như chạy local — chạy trong pod FastAPI (EKS hoặc docker-compose)
             result = execute_training(feedback_data, prediction_logs, "local")
         
         if training_id in training_jobs:
             if result['status'] == 'completed':
+                tm = result.get("training_metrics") or {}
                 # Update training job with completion
                 training_jobs[training_id].update({
                     "status": "completed",
                     "end_time": datetime.now(),
                     "new_model_version": result.get('model_version', 'v2.1'),
-                    "training_accuracy": result['training_metrics'].get('training_accuracy'),
-                    "validation_accuracy": result['training_metrics'].get('validation_accuracy'),
-                    "f1_score": result['training_metrics'].get('validation_f1'),
-                    "is_deployed": True
+                    "training_accuracy": tm.get('training_accuracy'),
+                    "validation_accuracy": tm.get('validation_accuracy'),
+                    "f1_score": tm.get('validation_f1'),
+                    "is_deployed": True,
+                    "small_sample_warning": tm.get("small_sample_warning"),
+                    "metrics_note": tm.get("metrics_note"),
                 })
 
                 # P1: Promote new model to active inference model (in-process + persisted)
@@ -596,7 +620,9 @@ async def get_training_status(training_id: int) -> Optional[TrainingStatus]:
         validation_accuracy=None,
         f1_score=None,
         is_deployed=False,
-        error_message="Training job not found"
+        error_message="Training job not found",
+        small_sample_warning=None,
+        metrics_note=None,
     )
 
 # API Endpoints

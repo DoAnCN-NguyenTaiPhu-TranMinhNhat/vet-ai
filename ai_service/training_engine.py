@@ -1117,6 +1117,21 @@ def _normalize_label_array(y) -> np.ndarray:
     return np.array([str(v).strip() for v in np.asarray(y).ravel()], dtype=object)
 
 
+def _annotate_small_sample_metrics(training_metrics: Dict[str, Any]) -> None:
+    try:
+        n_s = int(training_metrics.get("n_samples") or 0)
+    except (TypeError, ValueError):
+        n_s = 0
+    min_rel = int(os.getenv("METRICS_RELIABLE_MIN_SAMPLES", "80"))
+    if n_s > 0 and n_s < min_rel:
+        training_metrics["small_sample_warning"] = True
+        training_metrics["metrics_note"] = (
+            f"n_samples={n_s} < METRICS_RELIABLE_MIN_SAMPLES={min_rel}: "
+            "trên tập nhỏ, train/val accuracy và F1 có thể rất cao (overfit/holdout nhỏ); "
+            "so sánh với chạy local cùng số feedback."
+        )
+
+
 def execute_training(feedback_data: List[Dict], prediction_logs: List[Dict],
                    training_mode: str = "local") -> Dict[str, Any]:
     """Execute training pipeline with dynamic parameters"""
@@ -1129,11 +1144,7 @@ def execute_training(feedback_data: List[Dict], prediction_logs: List[Dict],
         ]
         if not eligible_feedback_data:
             raise ValueError("No eligible feedback data to train on")
-
-        # Initialize trainer
-        trainer = ModelTrainer()
-        
-        # Collect data
+        trainer = ModelTrainer()        
         X, y, sample_weights = trainer.collect_training_data(eligible_feedback_data, prediction_logs)
 
         # Safety guard: don't train/persist a model when feedback has too low class diversity.
@@ -1176,6 +1187,8 @@ def execute_training(feedback_data: List[Dict], prediction_logs: List[Dict],
             X_processed, preprocessing_info = trainer.preprocess_features(X, fit_encoders=True)
             model, training_metrics = trainer.train_model(X_processed, y, sample_weights)
             training_metrics["finetune"] = False
+
+        _annotate_small_sample_metrics(training_metrics)
         
         # ----------------------------
         # Regression Test Gate (golden set)
