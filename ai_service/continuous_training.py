@@ -98,6 +98,34 @@ class CTPostgresStore:
 
         CREATE INDEX IF NOT EXISTS idx_ai_feedback_created_at ON ai_feedback(created_at);
         CREATE INDEX IF NOT EXISTS idx_ai_feedback_eligible ON ai_feedback(is_training_eligible);
+
+        -- Persisted training job status so FastAPI restart won't lose history.
+        CREATE TABLE IF NOT EXISTS ai_training_jobs (
+            training_id BIGSERIAL PRIMARY KEY,
+            status TEXT NOT NULL,
+            start_time TIMESTAMP NOT NULL DEFAULT NOW(),
+            end_time TIMESTAMP NULL,
+            total_predictions BIGINT NOT NULL DEFAULT 0,
+            eligible_feedback_count BIGINT NOT NULL DEFAULT 0,
+            previous_model_version TEXT NULL,
+            new_model_version TEXT NULL,
+            training_accuracy DOUBLE PRECISION NULL,
+            validation_accuracy DOUBLE PRECISION NULL,
+            f1_score DOUBLE PRECISION NULL,
+            is_deployed BOOLEAN NOT NULL DEFAULT FALSE,
+            error_message TEXT NULL,
+            trigger_type TEXT NULL,
+            training_mode TEXT NULL,
+            eks_node_group TEXT NULL,
+            dataset_row_count BIGINT NULL,
+            small_sample_warning BOOLEAN NULL,
+            metrics_note TEXT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_ai_training_jobs_status ON ai_training_jobs(status);
+        CREATE INDEX IF NOT EXISTS idx_ai_training_jobs_start_time ON ai_training_jobs(start_time);
         """
         with self._conn() as conn:
             with conn.cursor() as cur:
@@ -230,6 +258,225 @@ class CTPostgresStore:
             conn.commit()
         return f
 
+    def create_training_job(
+        self,
+        *,
+        status: str,
+        total_predictions: int,
+        eligible_feedback_count: int,
+        previous_model_version: Optional[str],
+        trigger_type: Optional[str],
+        training_mode: Optional[str],
+        eks_node_group: Optional[str],
+        dataset_row_count: Optional[int],
+    ) -> int:
+        """Create a persisted training job record (returns training_id)."""
+        self._ensure_schema()
+        sql = """
+        INSERT INTO ai_training_jobs (
+            status,
+            start_time,
+            total_predictions,
+            eligible_feedback_count,
+            previous_model_version,
+            trigger_type,
+            training_mode,
+            eks_node_group,
+            dataset_row_count,
+            created_at,
+            updated_at
+        ) VALUES (
+            %(status)s,
+            NOW(),
+            %(total_predictions)s,
+            %(eligible_feedback_count)s,
+            %(previous_model_version)s,
+            %(trigger_type)s,
+            %(training_mode)s,
+            %(eks_node_group)s,
+            %(dataset_row_count)s,
+            NOW(),
+            NOW()
+        )
+        RETURNING training_id
+        """
+        params = {
+            "status": status,
+            "total_predictions": int(total_predictions),
+            "eligible_feedback_count": int(eligible_feedback_count),
+            "previous_model_version": previous_model_version,
+            "trigger_type": trigger_type,
+            "training_mode": training_mode,
+            "eks_node_group": eks_node_group,
+            "dataset_row_count": dataset_row_count,
+        }
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                training_id = cur.fetchone()["training_id"]
+        return int(training_id)
+
+    def update_training_job_completed(
+        self,
+        training_id: int,
+        *,
+        model_version: Optional[str],
+        training_metrics: Dict[str, Any],
+        is_deployed: bool = False,
+    ) -> None:
+        """Update training job with completion result."""
+        self._ensure_schema()
+        tm = training_metrics or {}
+        sql = """
+        UPDATE ai_training_jobs
+        SET
+            status = 'completed',
+            end_time = NOW(),
+            new_model_version = %(new_model_version)s,
+            training_accuracy = %(training_accuracy)s,
+            validation_accuracy = %(validation_accuracy)s,
+            f1_score = %(f1_score)s,
+            is_deployed = %(is_deployed)s,
+            error_message = NULL,
+            small_sample_warning = %(small_sample_warning)s,
+            metrics_note = %(metrics_note)s,
+            updated_at = NOW()
+        WHERE training_id = %(training_id)s
+        """
+        params = {
+            "training_id": int(training_id),
+            "new_model_version": model_version,
+            "training_accuracy": tm.get("training_accuracy"),
+            "validation_accuracy": tm.get("validation_accuracy"),
+            "f1_score": tm.get("validation_f1"),
+            "is_deployed": bool(is_deployed),
+            "small_sample_warning": tm.get("small_sample_warning"),
+            "metrics_note": tm.get("metrics_note"),
+        }
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+            conn.commit()
+
+    def update_training_job_failed(
+        self,
+        training_id: int,
+        *,
+        error_message: str,
+    ) -> None:
+        """Update training job with failed result."""
+        self._ensure_schema()
+        sql = """
+        UPDATE ai_training_jobs
+        SET
+            status = 'failed',
+            end_time = NOW(),
+            is_deployed = FALSE,
+            error_message = %(error_message)s,
+            updated_at = NOW()
+        WHERE training_id = %(training_id)s
+        """
+        params = {"training_id": int(training_id), "error_message": str(error_message)[:4000]}
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+            conn.commit()
+
+    def get_training_job(self, training_id: int) -> Optional[Dict[str, Any]]:
+        """Fetch a training job record by id."""
+        self._ensure_schema()
+        sql = """
+        SELECT
+            training_id,
+            status,
+            start_time,
+            end_time,
+            total_predictions,
+            eligible_feedback_count,
+            previous_model_version,
+            new_model_version,
+            training_accuracy,
+            validation_accuracy,
+            f1_score,
+            is_deployed,
+            error_message,
+            trigger_type,
+            training_mode,
+            eks_node_group,
+            dataset_row_count,
+            small_sample_warning,
+            metrics_note
+        FROM ai_training_jobs
+        WHERE training_id = %(training_id)s
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, {"training_id": int(training_id)})
+                row = cur.fetchone()
+        return dict(row) if row else None
+
+    def list_training_jobs(self, *, limit: int = 10, offset: int = 0) -> List[Dict[str, Any]]:
+        """List training jobs (recent first)."""
+        self._ensure_schema()
+        limit = max(1, int(limit))
+        offset = max(0, int(offset))
+        sql = """
+        SELECT
+            training_id,
+            status,
+            start_time,
+            end_time,
+            total_predictions,
+            eligible_feedback_count,
+            trigger_type,
+            training_mode,
+            previous_model_version,
+            new_model_version,
+            training_accuracy,
+            validation_accuracy,
+            f1_score,
+            is_deployed,
+            error_message,
+            dataset_row_count,
+            small_sample_warning,
+            metrics_note
+        FROM ai_training_jobs
+        ORDER BY training_id DESC
+        LIMIT %(limit)s OFFSET %(offset)s
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, {"limit": limit, "offset": offset})
+                rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    def count_training_jobs_by_status(self) -> Dict[str, int]:
+        """Count training jobs by status."""
+        self._ensure_schema()
+        sql = """
+        SELECT status, COUNT(*)::BIGINT AS c
+        FROM ai_training_jobs
+        GROUP BY status
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+        base = {"pending": 0, "running": 0, "completed": 0, "failed": 0}
+        for r in rows:
+            st = str(r["status"]).lower()
+            if st in base:
+                base[st] = int(r["c"])
+        return base
+
+    def count_training_jobs_total(self) -> int:
+        """Count total training jobs."""
+        self._ensure_schema()
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*)::BIGINT AS c FROM ai_training_jobs")
+                return int(cur.fetchone()["c"])
+
 
 ct_store = CTPostgresStore(DATABASE_URL)
 
@@ -351,15 +598,14 @@ async def save_feedback(feedback: DoctorFeedback) -> bool:
     logger.info("Feedback saved successfully.")
     return True
 
-# In-memory job status (phase A+ will move to DB)
-training_jobs: Dict[str, TrainingStatus] = {}
+# In-memory dataset snapshot for download endpoints.
+# Training job status is persisted in PostgreSQL (ai_training_jobs).
+training_jobs: Dict[int, Dict[str, Any]] = {}
 training_datasets: Dict[int, List[Dict[str, Any]]] = {}
 
 # Initialize in-memory runtime caches
 training_jobs.clear()
 training_datasets.clear()
-
-training_counter = 0  # Sequential counter for reliable IDs
 
 logger.info("Production-ready continuous training system initialized")
 
@@ -375,18 +621,15 @@ def _refresh_training_metrics() -> None:
         eligible = ct_store.count_feedback(eligible_only=True, days=TRAINING_WINDOW_DAYS)
         _eligible_feedback_gauge.set(float(eligible))
 
-        for s in ["pending", "running", "completed", "failed"]:
-            _training_jobs_gauge.labels(status=s).set(0.0)
+        counts = ct_store.count_training_jobs_by_status()
+        for st in ["pending", "running", "completed", "failed"]:
+            _training_jobs_gauge.labels(status=st).set(float(counts.get(st, 0)))
 
-        counts = {"pending": 0, "running": 0, "completed": 0, "failed": 0}
-        for job in training_jobs.values():
-            st = str(job.get("status") or "pending").lower()
-            if st in counts:
-                counts[st] += 1
-        for st, c in counts.items():
-            _training_jobs_gauge.labels(status=st).set(float(c))
-
-        completed = [j for j in training_jobs.values() if str(j.get("status")).lower() == "completed" and j.get("end_time")]
+        completed = [
+            j
+            for j in ct_store.list_training_jobs(limit=20, offset=0)
+            if str(j.get("status", "")).lower() == "completed" and j.get("end_time")
+        ]
         if completed:
             last = max(completed, key=lambda j: j.get("end_time"))
             _training_last_success_timestamp.set(float(last["end_time"].timestamp()))
@@ -478,18 +721,32 @@ async def update_training_policy(update: TrainingPolicyUpdate, _: bool = Depends
 async def trigger_training_job(request: TrainingTriggerRequest) -> int:
     """Trigger a training job and return training ID"""
     logger.info(f"Triggering {request.training_mode} training: {request.trigger_type}")
-    
-    # Generate reliable sequential training ID
-    global training_counter
-    training_counter += 1
-    training_id = training_counter
-    
-    # Store training job
+
     total_predictions = ct_store.count_predictions()
     eligible_feedback_count = await count_eligible_feedback()
     all_predictions = ct_store.fetch_predictions()
     eligible_feedback_items = ct_store.fetch_feedback(eligible_only=True, days=TRAINING_WINDOW_DAYS)
 
+    # Snapshot the exact feedback-linked rows used as training input at trigger time.
+    dataset_rows = build_training_dataset_snapshot(
+        eligible_feedback_items,
+        all_predictions,
+    )
+    dataset_row_count = len(dataset_rows)
+
+    training_id = ct_store.create_training_job(
+        status="running",
+        total_predictions=total_predictions,
+        eligible_feedback_count=eligible_feedback_count,
+        previous_model_version="v2.0",
+        trigger_type=request.trigger_type,
+        training_mode=request.training_mode,
+        eks_node_group=request.eks_node_group,
+        dataset_row_count=dataset_row_count,
+    )
+
+    # In-memory snapshot only for dataset download UI.
+    training_datasets[training_id] = dataset_rows
     training_jobs[training_id] = {
         "training_id": training_id,
         "status": "running",
@@ -505,21 +762,18 @@ async def trigger_training_job(request: TrainingTriggerRequest) -> int:
         "is_deployed": False,
         "error_message": None,
         "trigger_type": request.trigger_type,
-        "training_mode": request.training_mode
+        "training_mode": request.training_mode,
+        "dataset_row_count": dataset_row_count,
+        "small_sample_warning": None,
+        "metrics_note": None,
     }
 
-    # Snapshot the exact feedback-linked rows used as training input at trigger time.
-    training_datasets[training_id] = build_training_dataset_snapshot(
-        eligible_feedback_items, all_predictions
-    )
-    training_jobs[training_id]["dataset_row_count"] = len(training_datasets[training_id])
-    
-    # Start actual training
+    # Start actual training (in-process for local, K8s job for eks_hybrid).
     logger.info(f"Starting actual training for job {training_id}")
     task = asyncio.create_task(execute_actual_training(training_id, request.training_mode))
     logger.info(f"Training task created: {task}")
     _refresh_training_metrics()
-    
+
     return training_id
 
 async def execute_actual_training(training_id: int, training_mode: str):
@@ -536,57 +790,70 @@ async def execute_actual_training(training_id: int, training_mode: str):
         else:
             # Cùng pipeline sklearn/MLflow như chạy local — chạy trong pod FastAPI (EKS hoặc docker-compose)
             result = execute_training(current_feedback, current_predictions, "local")
-        
-        if training_id in training_jobs:
-            if result['status'] == 'completed':
-                tm = result.get("training_metrics") or {}
-                # Update training job with completion
+
+        if result.get("status") == "completed":
+            tm = result.get("training_metrics") or {}
+            model_version = result.get("model_version")
+
+            # Persist completion status for UI & restart safety.
+            ct_store.update_training_job_completed(
+                training_id,
+                model_version=model_version,
+                training_metrics=tm,
+                is_deployed=True,
+            )
+
+            if training_id in training_jobs:
+                # Update in-memory snapshot for immediate UI usage.
                 training_jobs[training_id].update({
                     "status": "completed",
                     "end_time": datetime.now(),
-                    "new_model_version": result.get('model_version', 'v2.1'),
-                    "training_accuracy": tm.get('training_accuracy'),
-                    "validation_accuracy": tm.get('validation_accuracy'),
-                    "f1_score": tm.get('validation_f1'),
+                    "new_model_version": model_version,
+                    "training_accuracy": tm.get("training_accuracy"),
+                    "validation_accuracy": tm.get("validation_accuracy"),
+                    "f1_score": tm.get("validation_f1"),
                     "is_deployed": True,
                     "small_sample_warning": tm.get("small_sample_warning"),
                     "metrics_note": tm.get("metrics_note"),
                 })
 
-                # P1: Promote new model to active inference model (in-process + persisted)
-                try:
-                    from ai_service.main import set_active_model_and_reload
-                    new_ver = result.get("model_version")
-                    if new_ver:
-                        set_active_model_and_reload(new_ver)
-                        logger.info("Active model updated to %s after training job %s", new_ver, training_id)
-                except Exception as e:
-                    logger.warning("Failed to set active model after training: %s", e)
-                
-                # Reset feedback rows after successful training to prevent immediate retraining on same batch.
-                cleared = ct_store.clear_feedback()
-                logger.info("Feedback data reset after training completion. Cleared count: %s", cleared)
-                
-                logger.info(f"Training {training_id} completed successfully!")
-                _refresh_training_metrics()
-            else:
-                # Training failed
+            # P1: Promote new model to active inference model (works only if model artifacts are shared)
+            try:
+                from ai_service.main import set_active_model_and_reload
+                if model_version:
+                    set_active_model_and_reload(model_version)
+                    logger.info("Active model updated to %s after training job %s", model_version, training_id)
+            except Exception as e:
+                logger.warning("Failed to set active model after training: %s", e)
+
+            # Reset feedback rows after successful training to prevent immediate retraining on same batch.
+            cleared = ct_store.clear_feedback()
+            logger.info("Feedback data reset after training completion. Cleared count: %s", cleared)
+
+            logger.info(f"Training {training_id} completed successfully!")
+            _refresh_training_metrics()
+        else:
+            error_msg = result.get("error", "Unknown error")
+            ct_store.update_training_job_failed(training_id, error_message=error_msg)
+            if training_id in training_jobs:
                 training_jobs[training_id].update({
                     "status": "failed",
-                    "error_message": result.get('error', 'Unknown error')
+                    "error_message": error_msg,
                 })
-                _refresh_training_metrics()
-        else:
-            logger.error(f"Training job {training_id} not found in storage")
+            _refresh_training_metrics()
             
     except Exception as e:
         logger.error(f"Training execution failed for {training_id}: {e}")
+        try:
+            ct_store.update_training_job_failed(training_id, error_message=str(e))
+        except Exception:
+            pass
         if training_id in training_jobs:
             training_jobs[training_id].update({
                 "status": "failed",
-                "error_message": str(e)
+                "error_message": str(e),
             })
-            _refresh_training_metrics()
+        _refresh_training_metrics()
 
 async def run_eks_training(training_id: int) -> Dict[str, Any]:
     """Run training on EKS with node group scaling"""
@@ -679,7 +946,28 @@ async def run_training_job_on_eks(training_id: int) -> Dict[str, Any]:
                             "image": "vet-ai/training:latest",
                             "env": [
                                 {"name": "TRAINING_ID", "value": str(training_id)},
-                                {"name": "MLFLOW_TRACKING_URI", "value": os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")}
+                                {"name": "DATA_SOURCE", "value": "postgres"},
+                                {"name": "DATABASE_URL", "value": os.getenv("DATABASE_URL", "")},
+                                {"name": "TRAINING_WINDOW_DAYS", "value": str(TRAINING_WINDOW_DAYS)},
+                                {"name": "MLFLOW_TRACKING_URI", "value": os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")},
+                                {"name": "TRAINING_MIN_UNIQUE_CLASSES", "value": os.getenv("TRAINING_MIN_UNIQUE_CLASSES", "2")},
+                                {"name": "FINETUNE_PREVIOUS_MODEL", "value": os.getenv("FINETUNE_PREVIOUS_MODEL", "true")},
+                                {"name": "FINETUNE_ADD_TREES", "value": os.getenv("FINETUNE_ADD_TREES", "20")},
+                                {"name": "FEEDBACK_DELTA_MAX", "value": os.getenv("FEEDBACK_DELTA_MAX", "0.25")},
+                                {"name": "FEEDBACK_ACCEPT_STRENGTH", "value": os.getenv("FEEDBACK_ACCEPT_STRENGTH", "0.8")},
+                                {"name": "FEEDBACK_REJECT_STRENGTH", "value": os.getenv("FEEDBACK_REJECT_STRENGTH", "0.8")},
+                                {"name": "FEEDBACK_POSITIVE_MAX_WEIGHT", "value": os.getenv("FEEDBACK_POSITIVE_MAX_WEIGHT", "1.5")},
+                                {"name": "FEEDBACK_NEGATIVE_MIN_WEIGHT", "value": os.getenv("FEEDBACK_NEGATIVE_MIN_WEIGHT", "0.7")},
+                                {"name": "REGRESSION_GATE_ENABLED", "value": os.getenv("REGRESSION_GATE_ENABLED", "true")},
+                                {"name": "REGRESSION_GATE_MIN_FEEDBACK_SAMPLES", "value": os.getenv("REGRESSION_GATE_MIN_FEEDBACK_SAMPLES", "20")},
+                                {"name": "REGRESSION_TOLERANCE_F1", "value": os.getenv("REGRESSION_TOLERANCE_F1", "0.02")},
+                                {"name": "REGRESSION_HIGH_BASE_F1_THRESHOLD", "value": os.getenv("REGRESSION_HIGH_BASE_F1_THRESHOLD", "0.99")},
+                                {"name": "REGRESSION_TOLERANCE_F1_HIGH_BASE", "value": os.getenv("REGRESSION_TOLERANCE_F1_HIGH_BASE", "0.25")},
+                                {"name": "FEEDBACK_IMPROVEMENT_GATE_ENABLED", "value": os.getenv("FEEDBACK_IMPROVEMENT_GATE_ENABLED", "true")},
+                                {"name": "FEEDBACK_GATE_TOLERANCE", "value": os.getenv("FEEDBACK_GATE_TOLERANCE", "0.03")},
+                                {"name": "METRICS_RELIABLE_MIN_SAMPLES", "value": os.getenv("METRICS_RELIABLE_MIN_SAMPLES", "80")},
+                                {"name": "MODEL_ROOT_DIR", "value": os.getenv("MODEL_ROOT_DIR", "/app/ai_service/models")},
+                                {"name": "MODEL_DIR", "value": os.getenv("MODEL_DIR", "/app/models/v2")},
                             ],
                             "resources": {
                                 "requests": {
@@ -776,6 +1064,27 @@ async def get_training_status(training_id: int) -> Optional[TrainingStatus]:
         job_data = training_jobs[training_id]
         return TrainingStatus(**job_data)
     
+    # Try persisted DB record
+    job_data = ct_store.get_training_job(training_id)
+    if job_data:
+        return TrainingStatus(
+            training_id=job_data["training_id"],
+            status=job_data["status"],
+            start_time=job_data.get("start_time"),
+            end_time=job_data.get("end_time"),
+            total_predictions=job_data.get("total_predictions", 0),
+            eligible_feedback_count=job_data.get("eligible_feedback_count", 0),
+            previous_model_version=job_data.get("previous_model_version"),
+            new_model_version=job_data.get("new_model_version"),
+            training_accuracy=job_data.get("training_accuracy"),
+            validation_accuracy=job_data.get("validation_accuracy"),
+            f1_score=job_data.get("f1_score"),
+            is_deployed=bool(job_data.get("is_deployed", False)),
+            error_message=job_data.get("error_message"),
+            small_sample_warning=job_data.get("small_sample_warning"),
+            metrics_note=job_data.get("metrics_note"),
+        )
+
     # Return default pending status for unknown jobs
     return TrainingStatus(
         training_id=training_id,
@@ -906,17 +1215,9 @@ async def check_training_eligibility():
 async def get_training_history(limit: int = 10, offset: int = 0):
     """Get training job history from actual training jobs"""
     try:
-        # Get all training jobs and sort by ID (most recent first)
-        all_jobs = list(training_jobs.values())
-        all_jobs.sort(key=lambda x: x.get("training_id", 0), reverse=True)
-        
-        # Apply pagination
-        total_count = len(all_jobs)
-        paginated_jobs = all_jobs[offset:offset + limit]
-        
-        # Format response
+        rows = ct_store.list_training_jobs(limit=limit, offset=offset)
         training_runs = []
-        for job in paginated_jobs:
+        for job in rows:
             training_runs.append({
                 "training_id": job.get("training_id"),
                 "status": job.get("status"),
@@ -929,16 +1230,15 @@ async def get_training_history(limit: int = 10, offset: int = 0):
                 "error_message": job.get("error_message"),
                 "training_mode": job.get("training_mode"),
                 "previous_model_version": job.get("previous_model_version"),
-                "new_model_version": job.get("new_model_version")
-                ,
-                "dataset_row_count": job.get("dataset_row_count", 0)
+                "new_model_version": job.get("new_model_version"),
+                "dataset_row_count": job.get("dataset_row_count", 0),
             })
-        
+
         return {
-            "total_count": total_count,
+            "total_count": ct_store.count_training_jobs_total(),
             "limit": limit,
             "offset": offset,
-            "training_runs": training_runs
+            "training_runs": training_runs,
         }
     except Exception as e:
         logger.error(f"Failed to get training history: {e}")
@@ -984,17 +1284,11 @@ async def download_training_dataset(training_id: int, _: bool = Depends(verify_a
 async def get_training_overview():
     """Get training system overview"""
     try:
-        # Count active training jobs
-        active_jobs = sum(1 for job in training_jobs.values() if job.get('status') == 'running')
-        completed_jobs = sum(1 for job in training_jobs.values() if job.get('status') == 'completed')
-        failed_jobs = sum(1 for job in training_jobs.values() if job.get('status') == 'failed')
-        
-        # Get recent training jobs
-        recent_jobs = sorted(
-            training_jobs.values(), 
-            key=lambda x: x.get('start_time', datetime.min), 
-            reverse=True
-        )[:5]
+        counts = ct_store.count_training_jobs_by_status()
+        active_jobs = counts.get("running", 0)
+        completed_jobs = counts.get("completed", 0)
+        failed_jobs = counts.get("failed", 0)
+        recent_rows = ct_store.list_training_jobs(limit=5, offset=0)
         
         total_predictions = ct_store.count_predictions()
         total_feedback = ct_store.count_feedback()
@@ -1009,9 +1303,9 @@ async def get_training_overview():
                 "active": active_jobs,
                 "completed": completed_jobs,
                 "failed": failed_jobs,
-                "total": len(training_jobs)
+                "total": active_jobs + completed_jobs + failed_jobs + counts.get("pending", 0),
             },
-            "recent_training_jobs": recent_jobs,
+            "recent_training_jobs": recent_rows,
             "data_collection": {
                 "total_predictions": total_predictions,
                 "total_feedback": total_feedback,
@@ -1110,16 +1404,31 @@ async def monitor_training_progress(training_id: int):
     start_time = datetime.now()
     
     while (datetime.now() - start_time).seconds < max_wait_time:
-        if training_id in training_jobs:
-            job = training_jobs[training_id]
-            if job.get('status') in ['completed', 'failed']:
-                logger.info(f"Training job {training_id} finished with status: {job.get('status')}")
+        try:
+            job = ct_store.get_training_job(training_id)
+            if job and str(job.get("status", "")).lower() in ["completed", "failed"]:
+                logger.info(
+                    "Training job %s finished with status: %s",
+                    training_id,
+                    job.get("status"),
+                )
                 break
+        except Exception as e:
+            logger.warning("monitor_training_progress: failed to read job from DB: %s", e)
         
         await asyncio.sleep(5)  # Check every 5 seconds
     
     # Timeout handling
-    if training_id in training_jobs and training_jobs[training_id].get('status') == 'running':
-        training_jobs[training_id]['status'] = 'failed'
-        training_jobs[training_id]['error_message'] = 'Training timeout after 5 minutes'
-        logger.warning(f"Training job {training_id} timed out")
+    try:
+        job = ct_store.get_training_job(training_id)
+        if job and str(job.get("status", "")).lower() == "running":
+            ct_store.update_training_job_failed(
+                training_id,
+                error_message="Training timeout after 5 minutes",
+            )
+            if training_id in training_jobs:
+                training_jobs[training_id]["status"] = "failed"
+                training_jobs[training_id]["error_message"] = "Training timeout after 5 minutes"
+            logger.warning("Training job %s timed out", training_id)
+    except Exception as e:
+        logger.warning("monitor_training_progress: failed timeout update: %s", e)

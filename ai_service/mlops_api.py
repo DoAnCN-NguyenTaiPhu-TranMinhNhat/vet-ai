@@ -230,35 +230,43 @@ async def set_active_model_version(request: ActiveModelRequest, _: bool = Depend
 @router.get("/training/last", summary="Get last training job status")
 async def get_last_training_job():
     try:
-        from ai_service.continuous_training import training_jobs  # in-memory store
+        from ai_service.continuous_training import training_jobs, ct_store  # persisted + fallback in-memory
         from ai_service.model_registry import get_active_model
 
-        if not training_jobs:
-            active = get_active_model()
-            return {
-                "status": "success",
-                "last_training": None,
-                "last_successful_training": None,
-                "active_model": active.model_version if active else None,
-            }
+        # Prefer DB (survive FastAPI restart)
+        last_row = None
+        try:
+            recent_rows = ct_store.list_training_jobs(limit=20, offset=0)
+            if recent_rows:
+                last_row = recent_rows[0]
 
-        last_id = max(training_jobs.keys())
-        last_job = training_jobs[last_id]
+            successful_jobs = [
+                j
+                for j in (recent_rows or [])
+                if str(j.get("status", "")).lower() == "completed" and bool(j.get("is_deployed"))
+            ]
+            last_successful = max(successful_jobs, key=lambda x: x.get("training_id", 0)) if successful_jobs else None
+        except Exception:
+            # If DB is not configured, fall back to in-memory.
+            last_row = None
+            last_successful = None
+            if training_jobs:
+                last_id = max(training_jobs.keys())
+                last_row = training_jobs[last_id]
 
-        successful_jobs = [
-            j for j in training_jobs.values()
-            if str(j.get("status")).lower() == "completed" and bool(j.get("is_deployed"))
-        ]
-        last_successful = None
-        if successful_jobs:
-            last_successful = max(successful_jobs, key=lambda x: x.get("training_id", 0))
+                successful_jobs = [
+                    j for j in training_jobs.values()
+                    if str(j.get("status")).lower() == "completed" and bool(j.get("is_deployed"))
+                ]
+                if successful_jobs:
+                    last_successful = max(successful_jobs, key=lambda x: x.get("training_id", 0))
 
         active = get_active_model()
         active_model_version = active.model_version if active else None
 
         return {
             "status": "success",
-            "last_training": last_job,
+            "last_training": last_row,
             "last_successful_training": last_successful,
             "active_model": active_model_version,
             # Convenience hint for UI: when latest failed, app may still serve previous successful model.
