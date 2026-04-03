@@ -9,6 +9,7 @@ joblib
 pytest
 httpx
 boto3
+psycopg2-binary
 # MLOps dependencies
 evidently>=0.7.0
 mlflow

@@ -19,6 +19,8 @@ import subprocess
 import boto3
 import csv
 from prometheus_client import Gauge, Counter
+import psycopg2
+from psycopg2.extras import RealDictCursor, Json
 
 # Import kubernetes only when needed for EKS training
 try:
@@ -46,6 +48,190 @@ TRAINING_WINDOW_DAYS = int(os.getenv("TRAINING_WINDOW_DAYS", "30"))
 EKS_CLUSTER_NAME = os.getenv("EKS_CLUSTER_NAME", "vet-ai-dev")
 EKS_REGION = os.getenv("EKS_REGION", "us-east-1")
 TRAINING_NODE_GROUP = os.getenv("TRAINING_NODE_GROUP", "training-nodes")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+
+class CTPostgresStore:
+    """Lightweight PostgreSQL store for continuous-training data."""
+
+    def __init__(self, dsn: Optional[str]) -> None:
+        self.dsn = dsn
+        self.enabled = bool(dsn and str(dsn).strip())
+        self._initialized = False
+
+    def _conn(self):
+        if not self.enabled:
+            raise RuntimeError("DATABASE_URL is not configured for continuous training.")
+        return psycopg2.connect(self.dsn, cursor_factory=RealDictCursor)
+
+    def _ensure_schema(self) -> None:
+        if not self.enabled or self._initialized:
+            return
+        ddl = """
+        CREATE TABLE IF NOT EXISTS ai_prediction_logs (
+            id BIGINT PRIMARY KEY,
+            visit_id BIGINT NULL,
+            pet_id BIGINT NOT NULL,
+            prediction_input JSONB NOT NULL,
+            prediction_output JSONB NOT NULL,
+            model_version TEXT NOT NULL,
+            confidence_score DOUBLE PRECISION NOT NULL,
+            top_k_predictions JSONB NOT NULL,
+            veterinarian_id BIGINT NULL,
+            clinic_id BIGINT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS ai_feedback (
+            id BIGSERIAL PRIMARY KEY,
+            prediction_id BIGINT NOT NULL REFERENCES ai_prediction_logs(id) ON DELETE CASCADE,
+            final_diagnosis TEXT NOT NULL,
+            is_correct BOOLEAN NOT NULL,
+            ai_diagnosis TEXT NULL,
+            confidence_rating INTEGER NULL,
+            comments TEXT NULL,
+            veterinarian_id BIGINT NOT NULL,
+            is_training_eligible BOOLEAN NOT NULL DEFAULT TRUE,
+            data_quality_score DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_ai_feedback_created_at ON ai_feedback(created_at);
+        CREATE INDEX IF NOT EXISTS idx_ai_feedback_eligible ON ai_feedback(is_training_eligible);
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(ddl)
+            conn.commit()
+        self._initialized = True
+
+    def insert_prediction(self, payload: Dict[str, Any]) -> int:
+        self._ensure_schema()
+        sql = """
+        INSERT INTO ai_prediction_logs
+            (id, visit_id, pet_id, prediction_input, prediction_output, model_version, confidence_score, top_k_predictions, veterinarian_id, clinic_id)
+        VALUES
+            (%(id)s, %(visit_id)s, %(pet_id)s, %(prediction_input)s, %(prediction_output)s, %(model_version)s, %(confidence_score)s, %(top_k_predictions)s, %(veterinarian_id)s, %(clinic_id)s)
+        ON CONFLICT (id) DO UPDATE SET
+            visit_id = EXCLUDED.visit_id,
+            pet_id = EXCLUDED.pet_id,
+            prediction_input = EXCLUDED.prediction_input,
+            prediction_output = EXCLUDED.prediction_output,
+            model_version = EXCLUDED.model_version,
+            confidence_score = EXCLUDED.confidence_score,
+            top_k_predictions = EXCLUDED.top_k_predictions,
+            veterinarian_id = EXCLUDED.veterinarian_id,
+            clinic_id = EXCLUDED.clinic_id
+        """
+        data = dict(payload)
+        data["prediction_input"] = Json(payload.get("prediction_input") or {})
+        data["prediction_output"] = Json(payload.get("prediction_output") or {})
+        data["top_k_predictions"] = Json(payload.get("top_k_predictions") or [])
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, data)
+            conn.commit()
+        return int(payload["id"])
+
+    def insert_feedback(self, payload: Dict[str, Any]) -> bool:
+        self._ensure_schema()
+        sql = """
+        INSERT INTO ai_feedback
+            (prediction_id, final_diagnosis, is_correct, ai_diagnosis, confidence_rating, comments, veterinarian_id, is_training_eligible, data_quality_score)
+        VALUES
+            (%(prediction_id)s, %(final_diagnosis)s, %(is_correct)s, %(ai_diagnosis)s, %(confidence_rating)s, %(comments)s, %(veterinarian_id)s, %(is_training_eligible)s, %(data_quality_score)s)
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, payload)
+            conn.commit()
+        return True
+
+    def count_predictions(self) -> int:
+        self._ensure_schema()
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*)::BIGINT AS c FROM ai_prediction_logs")
+                return int(cur.fetchone()["c"])
+
+    def count_feedback(self, eligible_only: bool = False, days: Optional[int] = None) -> int:
+        self._ensure_schema()
+        cond = []
+        params: List[Any] = []
+        if eligible_only:
+            cond.append("is_training_eligible = TRUE")
+        if days is not None:
+            cond.append("created_at >= NOW() - (%s || ' days')::INTERVAL")
+            params.append(int(days))
+        where = f"WHERE {' AND '.join(cond)}" if cond else ""
+        sql = f"SELECT COUNT(*)::BIGINT AS c FROM ai_feedback {where}"
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                return int(cur.fetchone()["c"])
+
+    def fetch_predictions(self) -> List[Dict[str, Any]]:
+        self._ensure_schema()
+        sql = """
+        SELECT id, visit_id, pet_id, prediction_input, prediction_output, model_version, confidence_score,
+               top_k_predictions, veterinarian_id, clinic_id, created_at
+        FROM ai_prediction_logs
+        ORDER BY created_at ASC
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    def fetch_feedback(self, eligible_only: bool = False, days: Optional[int] = None) -> List[Dict[str, Any]]:
+        self._ensure_schema()
+        cond = []
+        params: List[Any] = []
+        if eligible_only:
+            cond.append("is_training_eligible = TRUE")
+        if days is not None:
+            cond.append("created_at >= NOW() - (%s || ' days')::INTERVAL")
+            params.append(int(days))
+        where = f"WHERE {' AND '.join(cond)}" if cond else ""
+        sql = f"""
+        SELECT prediction_id, final_diagnosis, is_correct, ai_diagnosis, confidence_rating, comments,
+               veterinarian_id, is_training_eligible, data_quality_score, created_at AS timestamp
+        FROM ai_feedback
+        {where}
+        ORDER BY created_at ASC
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    def clear_all(self) -> Dict[str, int]:
+        self._ensure_schema()
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*)::BIGINT AS c FROM ai_prediction_logs")
+                p = int(cur.fetchone()["c"])
+                cur.execute("SELECT COUNT(*)::BIGINT AS c FROM ai_feedback")
+                f = int(cur.fetchone()["c"])
+                cur.execute("DELETE FROM ai_feedback")
+                cur.execute("DELETE FROM ai_prediction_logs")
+            conn.commit()
+        return {"predictions": p, "feedback": f}
+
+    def clear_feedback(self) -> int:
+        self._ensure_schema()
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*)::BIGINT AS c FROM ai_feedback")
+                f = int(cur.fetchone()["c"])
+                cur.execute("DELETE FROM ai_feedback")
+            conn.commit()
+        return f
+
+
+ct_store = CTPostgresStore(DATABASE_URL)
 
 # Trên EKS, training thật = cùng process Python với local (execute_training). Luồng eks_hybrid (Batch Job riêng)
 # chỉ bật khi ALLOW_EKS_HYBRID_TRAINING=true — cần image + node group + RBAC đúng; mặc định tắt.
@@ -119,14 +305,13 @@ class TrainingPolicyUpdate(BaseModel):
     training_threshold: int = Field(ge=1)
     training_window_days: int = Field(ge=1)
 
-# Database functions (currently in-memory, ready for database migration)
+# Database functions
 async def log_prediction(prediction: PredictionLog) -> int:
-    """Log prediction to storage"""
+    """Log prediction to PostgreSQL storage."""
     logger.info(f"Logging prediction for visit {prediction.visit_id}, ID: {prediction.id}")
-    
-    # Use ID from main.py directly - don't generate new ID
+
     prediction_data = {
-        "id": prediction.id,  # Use the ID from main.py
+        "id": prediction.id,
         "visit_id": prediction.visit_id,
         "pet_id": prediction.pet_id,
         "prediction_input": prediction.prediction_input,
@@ -136,20 +321,18 @@ async def log_prediction(prediction: PredictionLog) -> int:
         "top_k_predictions": prediction.top_k_predictions,
         "veterinarian_id": prediction.veterinarian_id,
         "clinic_id": prediction.clinic_id,
-        "timestamp": datetime.now()
     }
-    prediction_logs.append(prediction_data)
+    ct_store.insert_prediction(prediction_data)
     _predictions_logged_total.inc()
     _refresh_training_metrics()
-    
-    logger.info(f"Prediction logged successfully. Total predictions: {len(prediction_logs)}, ID: {prediction.id}")
-    return prediction.id  # Return the same ID from main.py
+
+    logger.info(f"Prediction logged successfully. ID: {prediction.id}")
+    return prediction.id
 
 async def save_feedback(feedback: DoctorFeedback) -> bool:
-    """Save doctor feedback to storage"""
+    """Save doctor feedback to PostgreSQL storage."""
     logger.info(f"Saving feedback for prediction {feedback.prediction_id}")
-    
-    # Store in memory (ready for database migration)
+
     feedback_data_item = {
         "prediction_id": feedback.prediction_id,
         "final_diagnosis": feedback.final_diagnosis,
@@ -157,28 +340,22 @@ async def save_feedback(feedback: DoctorFeedback) -> bool:
         "ai_diagnosis": feedback.ai_diagnosis,
         "confidence_rating": feedback.confidence_rating,
         "comments": feedback.comments,
-        "veterinarian_id": feedback.veterinarian_id,
+        "veterinarian_id": feedback.veterinarian_id or 0,
         "is_training_eligible": feedback.is_training_eligible,
         "data_quality_score": feedback.data_quality_score,
-        "timestamp": datetime.now()
     }
-    feedback_data.append(feedback_data_item)
+    ct_store.insert_feedback(feedback_data_item)
     _feedback_saved_total.inc()
     _refresh_training_metrics()
-    
-    logger.info(f"Feedback saved. Total feedback count: {len(feedback_data)}")
+
+    logger.info("Feedback saved successfully.")
     return True
 
-# Production-ready in-memory storage
-# Ready for database migration to PostgreSQL/Redis
-prediction_logs: List[PredictionLog] = []
-feedback_data: List[DoctorFeedback] = []
+# In-memory job status (phase A+ will move to DB)
 training_jobs: Dict[str, TrainingStatus] = {}
 training_datasets: Dict[int, List[Dict[str, Any]]] = {}
 
-# Initialize clean storage
-prediction_logs.clear()
-feedback_data.clear()
+# Initialize in-memory runtime caches
 training_jobs.clear()
 training_datasets.clear()
 
@@ -195,7 +372,7 @@ _training_last_success_timestamp = Gauge("vetai_training_last_success_timestamp_
 
 def _refresh_training_metrics() -> None:
     try:
-        eligible = len([f for f in feedback_data if f.get("is_training_eligible", True)])
+        eligible = ct_store.count_feedback(eligible_only=True, days=TRAINING_WINDOW_DAYS)
         _eligible_feedback_gauge.set(float(eligible))
 
         for s in ["pending", "running", "completed", "failed"]:
@@ -220,16 +397,7 @@ async def count_eligible_feedback(days: Optional[int] = None) -> int:
     """Count eligible feedback in the last N days"""
     if days is None:
         days = TRAINING_WINDOW_DAYS
-    # Count actual feedback from in-memory storage
-    cutoff_date = datetime.now() - timedelta(days=days)
-    eligible_count = 0
-    
-    for feedback in feedback_data:
-        # Check if feedback is within window and eligible
-        feedback_date = feedback.get('timestamp', datetime.now())
-        if feedback_date >= cutoff_date and feedback.get('is_training_eligible', True):
-            eligible_count += 1
-    
+    eligible_count = ct_store.count_feedback(eligible_only=True, days=days)
     logger.info(f"Current eligible feedback count: {eligible_count}")
     return eligible_count
 
@@ -317,13 +485,18 @@ async def trigger_training_job(request: TrainingTriggerRequest) -> int:
     training_id = training_counter
     
     # Store training job
+    total_predictions = ct_store.count_predictions()
+    eligible_feedback_count = await count_eligible_feedback()
+    all_predictions = ct_store.fetch_predictions()
+    eligible_feedback_items = ct_store.fetch_feedback(eligible_only=True, days=TRAINING_WINDOW_DAYS)
+
     training_jobs[training_id] = {
         "training_id": training_id,
         "status": "running",
         "start_time": datetime.now(),
         "end_time": None,
-        "total_predictions": len(prediction_logs),
-        "eligible_feedback_count": len(feedback_data),
+        "total_predictions": total_predictions,
+        "eligible_feedback_count": eligible_feedback_count,
         "previous_model_version": "v2.0",
         "new_model_version": None,
         "training_accuracy": None,
@@ -336,11 +509,8 @@ async def trigger_training_job(request: TrainingTriggerRequest) -> int:
     }
 
     # Snapshot the exact feedback-linked rows used as training input at trigger time.
-    eligible_feedback_items = [
-        f for f in feedback_data if f.get("is_training_eligible", True)
-    ]
     training_datasets[training_id] = build_training_dataset_snapshot(
-        eligible_feedback_items, prediction_logs
+        eligible_feedback_items, all_predictions
     )
     training_jobs[training_id]["dataset_row_count"] = len(training_datasets[training_id])
     
@@ -354,18 +524,18 @@ async def trigger_training_job(request: TrainingTriggerRequest) -> int:
 
 async def execute_actual_training(training_id: int, training_mode: str):
     """Execute actual ML training"""
-    global feedback_data
-    
     try:
         effective_mode = _effective_training_mode(training_mode)
         logger.info(f"Starting actual training for job {training_id} (requested={training_mode}, effective={effective_mode})")
+        current_feedback = ct_store.fetch_feedback(eligible_only=True, days=TRAINING_WINDOW_DAYS)
+        current_predictions = ct_store.fetch_predictions()
         
         if effective_mode == "eks_hybrid":
             # Tùy chọn: node group + Job riêng (cần ALLOW_EKS_HYBRID_TRAINING=true và hạ tầng đầy đủ)
             result = await run_eks_training(training_id)
         else:
             # Cùng pipeline sklearn/MLflow như chạy local — chạy trong pod FastAPI (EKS hoặc docker-compose)
-            result = execute_training(feedback_data, prediction_logs, "local")
+            result = execute_training(current_feedback, current_predictions, "local")
         
         if training_id in training_jobs:
             if result['status'] == 'completed':
@@ -393,9 +563,9 @@ async def execute_actual_training(training_id: int, training_mode: str):
                 except Exception as e:
                     logger.warning("Failed to set active model after training: %s", e)
                 
-                # Reset feedback count after successful training
-                feedback_data.clear()
-                logger.info(f"Feedback data reset after training completion. New count: {len(feedback_data)}")
+                # Reset feedback rows after successful training to prevent immediate retraining on same batch.
+                cleared = ct_store.clear_feedback()
+                logger.info("Feedback data reset after training completion. Cleared count: %s", cleared)
                 
                 logger.info(f"Training {training_id} completed successfully!")
                 _refresh_training_metrics()
@@ -612,8 +782,8 @@ async def get_training_status(training_id: int) -> Optional[TrainingStatus]:
         status="pending",
         start_time=None,
         end_time=None,
-        total_predictions=len(prediction_logs),
-        eligible_feedback_count=len(feedback_data),
+        total_predictions=ct_store.count_predictions(),
+        eligible_feedback_count=ct_store.count_feedback(eligible_only=True, days=TRAINING_WINDOW_DAYS),
         previous_model_version="v2.0",
         new_model_version=None,
         training_accuracy=None,
@@ -826,11 +996,15 @@ async def get_training_overview():
             reverse=True
         )[:5]
         
+        total_predictions = ct_store.count_predictions()
+        total_feedback = ct_store.count_feedback()
+        eligible_feedback = ct_store.count_feedback(eligible_only=True, days=TRAINING_WINDOW_DAYS)
+
         return {
             "system_status": "active",
-            "current_feedback_count": len(feedback_data),
+            "current_feedback_count": total_feedback,
             "training_threshold": TRAINING_THRESHOLD,
-            "is_eligible_for_training": len(feedback_data) >= TRAINING_THRESHOLD,
+            "is_eligible_for_training": eligible_feedback >= TRAINING_THRESHOLD,
             "training_jobs": {
                 "active": active_jobs,
                 "completed": completed_jobs,
@@ -839,9 +1013,9 @@ async def get_training_overview():
             },
             "recent_training_jobs": recent_jobs,
             "data_collection": {
-                "total_predictions": len(prediction_logs),
-                "total_feedback": len(feedback_data),
-                "eligible_feedback": len([f for f in feedback_data if f.get('is_training_eligible', True)])
+                "total_predictions": total_predictions,
+                "total_feedback": total_feedback,
+                "eligible_feedback": eligible_feedback
             }
         }
     except Exception as e:
@@ -852,11 +1026,9 @@ async def get_training_overview():
 async def reset_all_data():
     """Reset all predictions and feedback data for clean testing"""
     try:
-        prediction_count = len(prediction_logs)
-        feedback_count = len(feedback_data)
-        
-        prediction_logs.clear()
-        feedback_data.clear()
+        cleared = ct_store.clear_all()
+        prediction_count = int(cleared.get("predictions", 0))
+        feedback_count = int(cleared.get("feedback", 0))
         
         # Reset prediction counter in main module
         import sys
@@ -879,10 +1051,11 @@ async def reset_all_data():
 async def get_all_predictions():
     """Get all prediction logs for debugging"""
     try:
+        predictions = ct_store.fetch_predictions()
         return {
             "status": "success",
-            "total_predictions": len(prediction_logs),
-            "predictions": prediction_logs
+            "total_predictions": len(predictions),
+            "predictions": predictions
         }
     except Exception as e:
         logger.error(f"Failed to get predictions: {e}")
@@ -894,7 +1067,7 @@ async def get_predictions_count():
     try:
         return {
             "status": "success",
-            "total_predictions": len(prediction_logs)
+            "total_predictions": ct_store.count_predictions()
         }
     except Exception as e:
         logger.error(f"Failed to get prediction count: {e}")
@@ -906,7 +1079,7 @@ async def get_feedback_count():
     try:
         return {
             "status": "success",
-            "total_feedback": len(feedback_data)
+            "total_feedback": ct_store.count_feedback()
         }
     except Exception as e:
         logger.error(f"Failed to get feedback count: {e}")
@@ -916,8 +1089,7 @@ async def get_feedback_count():
 async def reset_feedback_data():
     """Manually reset feedback data"""
     try:
-        feedback_count = len(feedback_data)
-        feedback_data.clear()
+        feedback_count = ct_store.clear_feedback()
         logger.info(f"Manual feedback reset. Cleared {feedback_count} entries.")
         
         return {
