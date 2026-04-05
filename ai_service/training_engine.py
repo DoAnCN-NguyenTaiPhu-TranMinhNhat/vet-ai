@@ -21,7 +21,8 @@ from scipy import sparse
 import mlflow
 import mlflow.sklearn
 from mlflow.tracking import MlflowClient
-from ai_service.model_registry import get_active_model, list_model_versions, resolve_model_dir
+from ai_service.clinic_scope import clinic_dir_slug, normalize_clinic_key
+from ai_service.model_registry import get_active_model_for_clinic, list_model_versions, resolve_model_dir
 
 logger = logging.getLogger(__name__)
 
@@ -107,19 +108,31 @@ class ModelTrainer:
             self._baseline_class_weight = None
             return None
     
-    def _try_set_experiment(self) -> None:
-        """Set active experiment; if it was deleted, restore it first."""
+    def _experiment_name_for_clinic(self, clinic_key: Optional[str]) -> str:
+        """Shared experiment when global; dedicated MLflow experiment per clinic when scoped."""
+        base = self.mlflow_experiment_name
+        ck = normalize_clinic_key(clinic_key)
+        if ck is None:
+            return base
+        return f"{base}-clinic-{clinic_dir_slug(ck)}"
+
+    def _try_set_experiment_name(self, experiment_name: str) -> None:
+        """Set active MLflow experiment; restore if soft-deleted."""
         try:
-            mlflow.set_experiment(self.mlflow_experiment_name)
+            mlflow.set_experiment(experiment_name)
         except Exception as e:
             if "deleted experiment" in str(e).lower() and self.client is not None:
-                exp = self.client.get_experiment_by_name(self.mlflow_experiment_name)
+                exp = self.client.get_experiment_by_name(experiment_name)
                 if exp is not None:
                     self.client.restore_experiment(exp.experiment_id)
-                    logger.info(f"Restored deleted MLflow experiment '{self.mlflow_experiment_name}'")
-                    mlflow.set_experiment(self.mlflow_experiment_name)
+                    logger.info("Restored deleted MLflow experiment '%s'", experiment_name)
+                    mlflow.set_experiment(experiment_name)
                     return
             raise
+
+    def _try_set_experiment(self) -> None:
+        """Set default experiment from MLFLOW_EXPERIMENT_NAME."""
+        self._try_set_experiment_name(self.mlflow_experiment_name)
     
     def _ensure_mlflow_connected(self) -> bool:
         """Re-try MLflow connection if not yet available (e.g. server was down at init)."""
@@ -290,16 +303,21 @@ class ModelTrainer:
         )
         training_records = []
 
+        def _pred_ids_match(stored, wanted) -> bool:
+            if stored is None or wanted is None:
+                return False
+            return str(stored) == str(wanted)
+
         for feedback in feedback_data:
             prediction_id = feedback["prediction_id"]
             prediction = None
             for p in prediction_logs:
                 if hasattr(p, "id"):
-                    if p.id == prediction_id:
+                    if _pred_ids_match(p.id, prediction_id):
                         prediction = p
                         break
                 elif isinstance(p, dict):
-                    if p.get("id") == prediction_id:
+                    if _pred_ids_match(p.get("id"), prediction_id):
                         prediction = p
                         break
 
@@ -359,6 +377,11 @@ class ModelTrainer:
         
         training_records = []
         
+        def _pred_ids_match(stored, wanted) -> bool:
+            if stored is None or wanted is None:
+                return False
+            return str(stored) == str(wanted)
+
         for feedback in feedback_data:
             # Find corresponding prediction
             prediction_id = feedback['prediction_id']
@@ -367,11 +390,11 @@ class ModelTrainer:
             prediction = None
             for p in prediction_logs:
                 if hasattr(p, 'id'):  # Pydantic object
-                    if p.id == prediction_id:
+                    if _pred_ids_match(p.id, prediction_id):
                         prediction = p
                         break
                 elif isinstance(p, dict):  # Dict object
-                    if p.get('id') == prediction_id:
+                    if _pred_ids_match(p.get('id'), prediction_id):
                         prediction = p
                         break
             
@@ -429,8 +452,8 @@ class ModelTrainer:
 
             # On accept (is_correct=true): boost the final_label.
             # On reject (is_correct=false): penalize the AI-suggested label (ai_label) so next time it should decrease.
-            # - If final_label == ai_label: chỉ penalize label đó (không boost thêm).
-            # - If final_label != ai_label: boost doctor's final_label và penalize ai_label với delta đối xứng.
+            # - If final_label == ai_label: only penalize that label (no extra boost).
+            # - If final_label != ai_label: boost doctor's final_label and penalize ai_label with symmetric delta.
             if is_correct:
                 training_records.append({**features,
                                           'final_diagnosis': final_label,
@@ -690,18 +713,19 @@ class ModelTrainer:
         logger.info(f"Feature preprocessing complete: {X_final.shape}")
         return X_final, preprocessing_info
 
-    def load_active_artifacts(self) -> tuple[RandomForestClassifier, str]:
+    def load_active_artifacts(self, clinic_key: Optional[str] = None) -> tuple[RandomForestClassifier, str]:
         """
         Load active model + preprocessors so we can warm-start training.
         Returns (model, active_model_dir).
         """
-        active = get_active_model()
+        ck = normalize_clinic_key(clinic_key)
+        active = get_active_model_for_clinic(ck)
         if active is None:
-            # fallback to newest version directory under models root
-            versions = list_model_versions()
+            # fallback to newest version directory under models root (global + clinic subdir)
+            versions = list_model_versions(ck)
             if not versions:
                 raise ValueError("No existing model versions found to fine-tune")
-            active_dir = resolve_model_dir(versions[0])
+            active_dir = resolve_model_dir(versions[0], ck)
         else:
             active_dir = active.model_dir
 
@@ -914,13 +938,21 @@ class ModelTrainer:
         
         return model, training_metrics
     
-    def save_model(self, model: RandomForestClassifier, 
-                   training_metrics: Dict[str, Any], 
-                   model_version: str) -> str:
-        """Save trained model and artifacts"""
+    def save_model(
+        self,
+        model: RandomForestClassifier,
+        training_metrics: Dict[str, Any],
+        model_version: str,
+        clinic_key: Optional[str] = None,
+    ) -> str:
+        """Save trained model and artifacts (under clinics/<slug>/ when clinic_key is set)."""
         try:
-            # Create version directory
-            version_dir = os.path.join(self.model_dir, model_version)
+            ck = normalize_clinic_key(clinic_key)
+            root = self.model_dir
+            if ck:
+                root = os.path.join(self.model_dir, "clinics", clinic_dir_slug(ck))
+                os.makedirs(root, exist_ok=True)
+            version_dir = os.path.join(root, model_version)
             os.makedirs(version_dir, exist_ok=True)
             
             # Save model
@@ -1017,29 +1049,44 @@ class ModelTrainer:
             logger.error(f"Failed to save model: {str(e)}")
             raise
     
-    def log_to_mlflow(self, model: RandomForestClassifier, 
-                     training_metrics: Dict[str, Any], 
+    def log_to_mlflow(self, model: RandomForestClassifier,
+                     training_metrics: Dict[str, Any],
                      model_version: str,
                      X_val: sparse.csr_matrix = None,
-                     y_val: pd.Series = None):
-        """Log training to MLflow with dynamic experiment name"""
+                     y_val: pd.Series = None,
+                     clinic_key: Optional[str] = None):
+        """Log training to MLflow (tags clinic_id; separate experiment when clinic-scoped)."""
         # Retry connection when actually logging (MLflow may not have been ready at init)
         if not self._ensure_mlflow_connected():
             reason = self._mlflow_last_error or "unknown"
             logger.warning("MLflow not available, skipping logging (reason: %s)", reason)
             return
-        
+
+        ck = normalize_clinic_key(clinic_key)
+        exp_name = self._experiment_name_for_clinic(ck)
         try:
-            with mlflow.start_run(run_name=f"training-{model_version}") as run:
+            self._try_set_experiment_name(exp_name)
+        except Exception as e:
+            logger.warning("MLflow set experiment '%s' failed: %s", exp_name, e)
+            return
+
+        run_name = f"training-{model_version}"
+        if ck is not None:
+            run_name = f"{run_name}-clinic-{clinic_dir_slug(ck)}"
+
+        try:
+            with mlflow.start_run(run_name=run_name) as run:
                 run_id = run.info.run_id
-                # Log từng bước, không re-raise để run không bị FAILED khi một bước lỗi
+                # Log each step; do not re-raise so the run stays non-FAILED if one step fails
                 try:
+                    mlflow.set_tag("clinic_id", ck if ck is not None else "global")
+                    mlflow.set_tag("mlflow_experiment", exp_name)
                     mlflow.log_params(training_metrics.get('model_params', {}))
                     default_split_ratio = float(os.getenv("DEFAULT_SPLIT_RATIO", "0.2"))
                     default_cv_folds = int(os.getenv("DEFAULT_CV_FOLDS", "5"))
                     mlflow.log_param("test_split_ratio", training_metrics.get('test_split_ratio', default_split_ratio))
                     mlflow.log_param("cv_folds", training_metrics.get('cv_folds', default_cv_folds))
-                    mlflow.log_param("experiment_name", self.mlflow_experiment_name)
+                    mlflow.log_param("experiment_name", exp_name)
                 except Exception as e:
                     logger.warning("MLflow log params failed: %s", e)
                 try:
@@ -1085,7 +1132,7 @@ class ModelTrainer:
                         mlflow.log_dict(validation_info, "validation_info.json")
                 except Exception as e:
                     logger.warning("MLflow log dataset_info failed: %s", e)
-                logger.info("Training logged to MLflow experiment '%s': %s", self.mlflow_experiment_name, run_id)
+                logger.info("Training logged to MLflow experiment '%s': %s", exp_name, run_id)
         except Exception as e:
             logger.error("Failed to log to MLflow: %s", e)
     
@@ -1127,16 +1174,21 @@ def _annotate_small_sample_metrics(training_metrics: Dict[str, Any]) -> None:
         training_metrics["small_sample_warning"] = True
         training_metrics["metrics_note"] = (
             f"n_samples={n_s} < METRICS_RELIABLE_MIN_SAMPLES={min_rel}: "
-            "trên tập nhỏ, train/val accuracy và F1 có thể rất cao (overfit/holdout nhỏ); "
-            "so sánh với chạy local cùng số feedback."
+            "on a small set, train/val accuracy and F1 can be very high (overfit/small holdout); "
+            "compare with a local run using the same amount of feedback."
         )
 
 
-def execute_training(feedback_data: List[Dict], prediction_logs: List[Dict],
-                   training_mode: str = "local") -> Dict[str, Any]:
-    """Execute training pipeline with dynamic parameters"""
-    logger.info(f"Starting {training_mode} training pipeline")
-    
+def execute_training(
+    feedback_data: List[Dict],
+    prediction_logs: List[Dict],
+    training_mode: str = "local",
+    clinic_id: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Execute training pipeline with dynamic parameters."""
+    clinic_key = normalize_clinic_key(clinic_id)
+    logger.info("Starting %s training pipeline (clinic_id=%s)", training_mode, clinic_key)
+
     try:
         # Train only on eligible feedback (aligns with eligibility used to trigger jobs).
         eligible_feedback_data = [
@@ -1163,7 +1215,7 @@ def execute_training(feedback_data: List[Dict], prediction_logs: List[Dict],
         # Fine-tune mode (warm-start) vs full retrain
         finetune = os.getenv("FINETUNE_PREVIOUS_MODEL", "true").lower() in ("1", "true", "yes", "y")
         if finetune:
-            base_model, base_dir = trainer.load_active_artifacts()
+            base_model, base_dir = trainer.load_active_artifacts(clinic_key)
             X_processed, preprocessing_info = trainer.preprocess_features(X, fit_encoders=False)
             add_trees = int(os.getenv("FINETUNE_ADD_TREES", "20"))
             try:
@@ -1189,6 +1241,8 @@ def execute_training(feedback_data: List[Dict], prediction_logs: List[Dict],
             training_metrics["finetune"] = False
 
         _annotate_small_sample_metrics(training_metrics)
+        if clinic_key is not None:
+            training_metrics["clinic_id"] = clinic_key
         
         # ----------------------------
         # Regression Test Gate (golden set)
@@ -1265,9 +1319,9 @@ def execute_training(feedback_data: List[Dict], prediction_logs: List[Dict],
                 base_acc = float(accuracy_score(y_gold, base_preds))
                 new_acc = float(accuracy_score(y_gold, new_preds))
 
-                # base_f1 có thể = 1.0 do golden slice quá dễ.
-                # Khi đó tolerance tương đối (ví dụ 0.01) sẽ khiến gate luôn fail.
-                # Nên nới tolerance khi base_f1 "rất cao".
+                # base_f1 can be 1.0 if the golden slice is too easy.
+                # Then a small relative tolerance (e.g. 0.01) makes the gate always fail.
+                # So widen tolerance when base_f1 is "very high".
                 regression_high_base_f1_threshold = float(
                     os.getenv("REGRESSION_HIGH_BASE_F1_THRESHOLD", "0.99")
                 )
@@ -1393,10 +1447,10 @@ def execute_training(feedback_data: List[Dict], prediction_logs: List[Dict],
         model_version = trainer.generate_model_version()
         
         # Save model
-        model_path = trainer.save_model(model, training_metrics, model_version)
-        
+        model_path = trainer.save_model(model, training_metrics, model_version, clinic_key=clinic_key)
+
         # Log to MLflow
-        trainer.log_to_mlflow(model, training_metrics, model_version)
+        trainer.log_to_mlflow(model, training_metrics, model_version, clinic_key=clinic_key)
         
         result = {
             'status': 'completed',

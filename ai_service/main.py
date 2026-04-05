@@ -8,13 +8,21 @@ import pandas as pd
 from fastapi import FastAPI
 from fastapi import Request, Response
 from prometheus_fastapi_instrumentator import Instrumentator
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from scipy import sparse
 import contextvars
 import time
 import uuid
 
-from ai_service.model_registry import detect_default_model, list_model_versions, set_active_model
+from ai_service.clinic_scope import normalize_clinic_key
+from ai_service.model_registry import (
+    ActiveModel,
+    detect_default_model,
+    get_active_model_for_clinic,
+    list_model_versions,
+    set_active_model,
+    set_clinic_active_model,
+)
 from prometheus_client import Gauge, Info
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -81,7 +89,12 @@ def parse_symptoms(s: Any) -> list[str]:
 
 
 class PredictRequest(BaseModel):
-    animal_type: str
+    model_config = ConfigDict(populate_by_name=True)
+
+    animal_type: str = Field(
+        ...,
+        description="Dog or cat only (case-insensitive): dog or cat.",
+    )
     gender: str
     age_months: int
     weight_kg: float
@@ -92,6 +105,32 @@ class PredictRequest(BaseModel):
     medical_history: str | None = "Unknown"
     symptoms_list: str
     symptom_duration: int
+    clinic_id: int | str | None = Field(
+        default=None,
+        alias="clinicId",
+        description=(
+            "Clinic id (legacy int for pinned model dirs) or UUID string. "
+            "Omit for shared default model (v2)."
+        ),
+    )
+    pet_id: str | None = Field(
+        default=None,
+        alias="petId",
+        description="Pet UUID from customers-service (optional for standalone /predict).",
+    )
+    visit_id: int | str | None = Field(
+        default=None,
+        alias="visitId",
+        description="Visit id from visits-service (UUID string or legacy int) when available.",
+    )
+
+    @field_validator("animal_type")
+    @classmethod
+    def _animal_dog_or_cat_only(cls, v: str) -> str:
+        s = (v or "").strip().lower()
+        if s not in ("dog", "cat"):
+            raise ValueError("animal_type must be 'dog' or 'cat'")
+        return s
 
 
 app = FastAPI(
@@ -189,20 +228,40 @@ _model = None
 _tab_preprocess = None
 _symptoms_mlb = None
 
+# Loaded joblib tuples keyed by absolute model_dir (supports per-clinic dirs without reloading disk every request).
+_artifact_cache: dict[str, tuple[Any, Any, Any]] = {}
+
 _active_model_info = Info("vetai_active_model", "Active model version for inference")
 _active_model_reload_total = Gauge("vetai_active_model_reload_total", "Number of active model reloads")
 
 
+def _cache_key(model_dir: str) -> str:
+    return os.path.normpath(os.path.abspath(model_dir))
+
+
+def clear_artifact_cache() -> None:
+    global _artifact_cache
+    _artifact_cache.clear()
+
+
+def load_artifacts_for_dir(model_dir: str, model_version: str) -> tuple[Any, Any, Any]:
+    k = _cache_key(model_dir)
+    if k not in _artifact_cache:
+        model_path = os.path.join(model_dir, "model.pkl")
+        tab_preprocess_path = os.path.join(model_dir, "tab_preprocess.pkl")
+        symptoms_mlb_path = os.path.join(model_dir, "symptoms_mlb.pkl")
+        _artifact_cache[k] = (
+            joblib.load(model_path),
+            joblib.load(tab_preprocess_path),
+            joblib.load(symptoms_mlb_path),
+        )
+        logger.info("Cached model artifacts: version=%s dir=%s", model_version, k)
+    return _artifact_cache[k]
+
+
 def load_artifacts() -> None:
     global _model, _tab_preprocess, _symptoms_mlb
-
-    model_path = os.path.join(MODEL_DIR, "model.pkl")
-    tab_preprocess_path = os.path.join(MODEL_DIR, "tab_preprocess.pkl")
-    symptoms_mlb_path = os.path.join(MODEL_DIR, "symptoms_mlb.pkl")
-
-    _model = joblib.load(model_path)
-    _tab_preprocess = joblib.load(tab_preprocess_path)
-    _symptoms_mlb = joblib.load(symptoms_mlb_path)
+    _model, _tab_preprocess, _symptoms_mlb = load_artifacts_for_dir(MODEL_DIR, MODEL_VERSION)
     _active_model_info.info({"model_version": str(MODEL_VERSION)})
 
 
@@ -211,7 +270,7 @@ def set_active_model_and_reload(model_version: str) -> None:
     active = set_active_model(model_version)
     MODEL_VERSION = active.model_version
     MODEL_DIR = active.model_dir
-    # Clear cached artifacts then reload
+    clear_artifact_cache()
     _model = None
     _tab_preprocess = None
     _symptoms_mlb = None
@@ -276,17 +335,49 @@ def set_active_model_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
         return {"status": "error", "error": str(e)}
 
 
-# Global counter for prediction IDs
-_prediction_counter = 0
+@app.post("/models/clinic/{clinic_id}/active", include_in_schema=False)
+def set_clinic_active_endpoint(clinic_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Pin active model for one clinic (UUID or legacy id; state under state/clinics/<slug>/)."""
+    mv = str(payload.get("model_version") or "").strip()
+    if not mv:
+        return {"status": "error", "error": "model_version is required"}
+    try:
+        set_clinic_active_model(clinic_id, mv)
+        clear_artifact_cache()
+        return {"status": "success", "clinic_id": clinic_id, "model_version": mv}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def _clinic_id_for_model_router(cid_raw: Any) -> str | None:
+    """Canonical clinic key for registry + on-disk layout (UUID string or legacy numeric string)."""
+    return normalize_clinic_key(cid_raw)
+
+
+def _clinic_id_for_prediction_log(cid_raw: Any) -> str | None:
+    if cid_raw is None:
+        return None
+    t = str(cid_raw).strip()
+    return t or None
+
 
 @app.post("/predict")
 async def predict(req: PredictRequest) -> dict[str, Any]:
-    global _prediction_counter
-    
     if _model is None:
         load_artifacts()
 
+    # Use validated model fields — model_dump() keys can omit alias-only edge cases on some proxies.
+    cid = _clinic_id_for_model_router(req.clinic_id)
+    clinic_log = _clinic_id_for_prediction_log(req.clinic_id)
     payload = req.model_dump()
+    if req.clinic_id is not None:
+        payload["clinic_id"] = req.clinic_id
+
+    active = get_active_model_for_clinic(cid)
+    if active is None:
+        active = ActiveModel(str(MODEL_VERSION), MODEL_DIR)
+    model, tab_preprocess, symptoms_mlb = load_artifacts_for_dir(active.model_dir, active.model_version)
+    eff_version = active.model_version
 
     # Prepare tabular row
     tabular = {
@@ -305,21 +396,21 @@ async def predict(req: PredictRequest) -> dict[str, Any]:
     X_tab = pd.DataFrame([tabular])
 
     # Transform tabular
-    X_tab_p = _tab_preprocess.transform(X_tab)
+    X_tab_p = tab_preprocess.transform(X_tab)
 
     # Transform symptoms
-    X_sym = _symptoms_mlb.transform([parse_symptoms(payload["symptoms_list"])])
+    X_sym = symptoms_mlb.transform([parse_symptoms(payload["symptoms_list"])])
 
     X_final = sparse.hstack([X_tab_p, sparse.csr_matrix(X_sym)]).tocsr()
 
-    pred = _model.predict(X_final)[0]
+    pred = model.predict(X_final)[0]
 
     confidence = None
     top_k = None
 
-    if hasattr(_model, "predict_proba"):
-        proba = _model.predict_proba(X_final)[0]
-        classes = _model.classes_
+    if hasattr(model, "predict_proba"):
+        proba = model.predict_proba(X_final)[0]
+        classes = model.classes_
         best_idx = int(np.argmax(proba))
         confidence = float(proba[best_idx])
 
@@ -330,31 +421,29 @@ async def predict(req: PredictRequest) -> dict[str, Any]:
             for i in top_idx
         ]
 
-    # Increment prediction counter
-    _prediction_counter += 1
-    prediction_id = _prediction_counter
+    prediction_id = uuid.uuid4()
+    pet_key = (payload.get("pet_id") or "").strip() or "00000000-0000-0000-0000-000000000000"
+    visit_key = payload.get("visit_id")
 
     # Log prediction for continuous training
     try:
         from ai_service.continuous_training import PredictionLog, log_prediction
-        from datetime import datetime
-        
+
         prediction_log = PredictionLog(
-            id=prediction_id,  # Simple sequential integer
-            visit_id=prediction_id,  # Same as prediction ID for simplicity
-            pet_id=prediction_id,  # Same as prediction ID for simplicity
+            id=prediction_id,
+            visit_id=visit_key,
+            pet_id=pet_key,
             prediction_input=payload,
             prediction_output={
                 "diagnosis": str(pred),
                 "confidence": confidence,
                 "top_k": top_k
             },
-            model_version=MODEL_VERSION,
-            confidence_score=confidence,
+            model_version=eff_version,
+            confidence_score=confidence if confidence is not None else 0.0,
             top_k_predictions=top_k or [],
-            veterinarian_id=1,  # Default, should come from auth context
-            clinic_id=1,
-            timestamp=datetime.now()
+            veterinarian_id=None,
+            clinic_id=clinic_log,
         )
         
         await log_prediction(prediction_log)
@@ -366,7 +455,9 @@ async def predict(req: PredictRequest) -> dict[str, Any]:
         "diagnosis": str(pred),
         "confidence": confidence,
         "top_k": top_k,
-        "modelVersion": MODEL_VERSION,
+        "modelVersion": eff_version,
         "predictions": top_k or [],
-        "predictionId": prediction_id  # Return ID for feedback reference (camelCase for Java compatibility)
+        "predictionId": str(prediction_id),
+        # Echo for GenAI second upsert: Java may omit clinicId on AiDiagnosisRequest; use this for /predictions/log.
+        "clinicId": clinic_log,
     }

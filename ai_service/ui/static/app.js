@@ -9,6 +9,48 @@ async function jget(url) {
 
 const HISTORY_PAGE_SIZE = 10;
 let historyPage = 1;
+const MLUI_CLINIC_STORAGE_KEY = "vetai_mlops_clinic_id";
+
+function parseClinicFromUrl() {
+  const p = new URLSearchParams(window.location.search || "");
+  const v = (p.get("clinic_id") || p.get("clinic") || "").trim();
+  return v || null;
+}
+
+/** Keep URL and localStorage in sync with the dropdown — bookmark /mlops-ui?clinic_id=... */
+function syncClinicToUrlAndStorage(clinicKey) {
+  const u = new URL(window.location.href);
+  if (clinicKey) {
+    u.searchParams.set("clinic_id", clinicKey);
+    u.searchParams.delete("clinic");
+  } else {
+    u.searchParams.delete("clinic_id");
+    u.searchParams.delete("clinic");
+  }
+  const next = u.pathname + u.search + u.hash;
+  if (next !== window.location.pathname + window.location.search + window.location.hash) {
+    history.replaceState(null, "", next);
+  }
+  try {
+    if (clinicKey) localStorage.setItem(MLUI_CLINIC_STORAGE_KEY, clinicKey);
+    else localStorage.removeItem(MLUI_CLINIC_STORAGE_KEY);
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function updateClinicContextBanner() {
+  const label = document.getElementById("clinic-context-label");
+  const sel = document.getElementById("clinic-scope");
+  if (!label || !sel) return;
+  const key = getSelectedClinicKey();
+  if (!key) {
+    label.textContent = "global (shared)";
+    return;
+  }
+  const opt = sel.options[sel.selectedIndex];
+  label.textContent = opt && opt.textContent ? opt.textContent.trim() : key;
+}
 
 function getToken() {
   const fromInput = (document.getElementById("admin-token")?.value || "").trim();
@@ -67,29 +109,129 @@ function toast(msg) {
   alert(msg);
 }
 
-async function refreshModel() {
-  const models = await jget("/mlops/models");
-  setText("active-model", models.active || "-");
+/** Selected clinic id from customers-service (UUID string or legacy numeric string), or null for global. */
+function getSelectedClinicKey() {
+  const el = document.getElementById("clinic-scope");
+  if (!el) return null;
+  const v = (el.value || "").trim();
+  return v || null;
+}
 
+function clinicQuerySuffix() {
+  const cid = getSelectedClinicKey();
+  return cid == null ? "" : `?clinic_id=${encodeURIComponent(cid)}`;
+}
+
+function clinicQueryPrefix() {
+  const cid = getSelectedClinicKey();
+  return cid == null ? "" : `&clinic_id=${encodeURIComponent(cid)}`;
+}
+
+async function loadClinicOptions() {
+  const sel = document.getElementById("clinic-scope");
+  if (!sel) return;
+  const prev = sel.value;
+  const data = await jget("/mlops/clinics");
+  const srcEl = document.getElementById("clinics-source");
+  if (srcEl && data.source) {
+    srcEl.textContent =
+      data.source === "customers-service"
+        ? "· live"
+        : data.source === "stale"
+          ? "· cached (customers down)"
+          : data.source === "error"
+            ? "· error (no clinics)"
+            : `· ${data.source}`;
+  }
+  sel.innerHTML = `<option value="">Global (shared default)</option>`;
+  (data.clinics || []).forEach((c) => {
+    const opt = document.createElement("option");
+    opt.value = String(c.id);
+    opt.textContent = `${c.name} (${c.id})`;
+    sel.appendChild(opt);
+  });
+
+  let fromUrl = parseClinicFromUrl();
+  let fromStore = null;
+  try {
+    fromStore = (localStorage.getItem(MLUI_CLINIC_STORAGE_KEY) || "").trim() || null;
+  } catch (_) {
+    fromStore = null;
+  }
+  const pick = [fromUrl, fromStore, prev].find(
+    (k) => k && [...sel.options].some((o) => o.value === k)
+  );
+  if (pick) sel.value = pick;
+
+  syncClinicToUrlAndStorage(getSelectedClinicKey());
+  updateClinicContextBanner();
+}
+
+async function refreshModel() {
+  const cid = getSelectedClinicKey();
+  const q = cid == null ? "" : `?clinic_id=${encodeURIComponent(cid)}`;
+  const models = await jget("/mlops/models" + q);
+
+  const hint = document.getElementById("scope-hint");
+  const activeLabel = document.getElementById("active-label");
+  if (models.scope === "clinic") {
+    if (hint) {
+      hint.textContent =
+        models.effective_source === "clinic_pin"
+          ? `Clinic ${models.clinic_id}: using pinned model. Global default: ${models.global_active ?? "—"}.`
+          : `Clinic ${models.clinic_id}: no pin — using global default (${models.global_active ?? "—"}).`;
+    }
+    if (activeLabel) activeLabel.textContent = "Effective model";
+    setText("active-model", models.effective || "-");
+  } else {
+    if (hint) {
+      hint.textContent =
+        "Managing the global default model (used when a clinic has no pinned override).";
+    }
+    if (activeLabel) activeLabel.textContent = "Active";
+    setText("active-model", models.active || "-");
+  }
+
+  const compareVersion =
+    models.scope === "clinic" ? models.effective : models.active;
   const sel = document.getElementById("model-select");
   sel.innerHTML = "";
-  (models.versions || []).forEach(v => {
+  (models.versions || []).forEach((v) => {
     const opt = document.createElement("option");
     opt.value = v;
     opt.textContent = v;
-    if (v === models.active) opt.selected = true;
+    if (v === compareVersion) opt.selected = true;
     sel.appendChild(opt);
   });
 
   const info = await jget("/model/info");
-  setPre("model-info", info);
+  const merged = {
+    ...info,
+    mlops_scope: models.scope,
+    clinic_id: models.clinic_id ?? null,
+    pinned_version: models.pinned ?? null,
+    effective_version: models.effective ?? null,
+    effective_source: models.effective_source ?? null,
+    global_active: models.global_active ?? null,
+  };
+  setPre("model-info", merged);
 }
 
 async function refreshTraining() {
-  const el = await jget("/continuous-training/training/eligibility");
+  const cid = getSelectedClinicKey();
+  const q = clinicQuerySuffix();
+  const el = await jget("/continuous-training/training/eligibility" + q);
   setText("eligibility", `${el.eligible_feedback_count}/${el.training_threshold} eligible`);
 
-  const last = await jget("/mlops/training/last");
+  const scopeEl = document.getElementById("training-scope-label");
+  if (scopeEl) {
+    scopeEl.textContent =
+      cid == null
+        ? "Scope: global (all clinics — eligibility counts every clinic’s feedback)."
+        : `Scope: this clinic only (eligibility & last job are filtered by clinic_id).`;
+  }
+
+  const last = await jget("/mlops/training/last" + q);
   const lj = last.last_training;
   if (!lj) {
     setText("last-job", "none");
@@ -100,7 +242,10 @@ async function refreshTraining() {
 
 async function loadHistory() {
   const offset = (historyPage - 1) * HISTORY_PAGE_SIZE;
-  const h = await jget(`/continuous-training/training/history?limit=${HISTORY_PAGE_SIZE}&offset=${offset}`);
+  const cq = getSelectedClinicKey() == null ? "" : clinicQueryPrefix();
+  const h = await jget(
+    `/continuous-training/training/history?limit=${HISTORY_PAGE_SIZE}&offset=${offset}${cq}`
+  );
   const tbody = document.getElementById("history-body");
   const pag = document.getElementById("history-pagination");
   tbody.innerHTML = "";
@@ -111,8 +256,13 @@ async function loadHistory() {
       : run.status === "failed"
         ? `<span class="badge text-bg-danger">${run.status}</span>`
         : `<span class="badge text-bg-secondary">${run.status || "-"}</span>`;
+    const clinicCell =
+      run.clinic_id != null && run.clinic_id !== ""
+        ? run.clinic_id
+        : "—";
     tr.innerHTML = `
       <td>${run.training_id}</td>
+      <td>${clinicCell}</td>
       <td>${statusBadge}</td>
       <td>${run.training_mode || "-"}</td>
       <td class="mono">${run.new_model_version || "-"}</td>
@@ -127,7 +277,7 @@ async function loadHistory() {
     tbody.appendChild(tr);
   });
   if (!h.training_runs || h.training_runs.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="8" class="text-muted">No runs</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9" class="text-muted">No runs</td></tr>`;
   }
 
   const total = Number(h.total_count || 0);
@@ -165,7 +315,12 @@ async function savePolicy() {
 }
 
 async function loadDrift() {
-  const d = await jget("/mlops/drift/summary?days=7");
+  const cid = getSelectedClinicKey();
+  const q =
+    cid == null
+      ? "?days=7"
+      : `?days=7&clinic_id=${encodeURIComponent(cid)}`;
+  const d = await jget("/mlops/drift/summary" + q);
   setPre("drift-summary", d);
 }
 
@@ -183,11 +338,29 @@ async function main() {
   document.getElementById("btn-refresh").addEventListener("click", async () => {
     try { await refreshModel(); await refreshTraining(); } catch (e) { toast(`Refresh failed (${e.status || "?"})`); }
   });
+  document.getElementById("clinic-scope").addEventListener("change", async () => {
+    historyPage = 1;
+    syncClinicToUrlAndStorage(getSelectedClinicKey());
+    updateClinicContextBanner();
+    try {
+      await refreshModel();
+      await refreshTraining();
+    } catch (e) {
+      toast(`Refresh failed (${e.status || "?"})`);
+    }
+  });
   document.getElementById("btn-set-active").addEventListener("click", async () => {
     const mv = document.getElementById("model-select").value;
+    const cid = getSelectedClinicKey();
     try {
-      const r = await jsend("/models/active", "POST", { model_version: mv });
-      toast(`Active model set: ${r.active}`);
+      let r;
+      if (cid == null) {
+        r = await jsend("/models/active", "POST", { model_version: mv });
+        toast(`Global active model set: ${r.active}`);
+      } else {
+        r = await jsend(`/models/clinic/${encodeURIComponent(cid)}/active`, "POST", { model_version: mv });
+        toast(`Clinic ${cid} pinned to: ${r.model_version || mv}`);
+      }
       await refreshModel();
     } catch (e) {
       toast(`Set active failed (${e.status || "?"}): ${JSON.stringify(e.data)}`);
@@ -196,11 +369,14 @@ async function main() {
   document.getElementById("btn-trigger").addEventListener("click", async () => {
     const t = document.getElementById("trigger-type").value;
     try {
-      const r = await jsend("/continuous-training/training/trigger", "POST", {
+      const tcid = getSelectedClinicKey();
+      const body = {
         trigger_type: t,
         force: false,
         training_mode: "local"
-      });
+      };
+      if (tcid != null) body.clinic_id = tcid;
+      const r = await jsend("/continuous-training/training/trigger", "POST", body);
       toast(`Triggered training #${r.training_id}`);
       await refreshTraining();
       await loadHistory();
@@ -265,6 +441,7 @@ async function main() {
   });
 
   try {
+    await loadClinicOptions();
     await refreshModel();
     await refreshTraining();
     await loadPolicy();

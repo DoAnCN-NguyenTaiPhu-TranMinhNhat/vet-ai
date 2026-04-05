@@ -185,7 +185,7 @@ if __name__ == "__main__":
         'weight_kg': np.random.normal(25.0, 5.0, 1000),
         'heart_rate': np.random.normal(80, 10, 1000),
         'age_months': np.random.randint(1, 180, 1000),
-        'animal_type': np.random.choice(['Dog', 'Cat', 'Bird'], 1000),
+        'animal_type': np.random.choice(['Dog', 'Cat'], 1000),
         'gender': np.random.choice(['Male', 'Female'], 1000),
         'vaccination_status': np.random.choice(['Yes', 'No'], 1000),
         'target_diagnosis': np.random.choice(['Healthy', 'Flu', 'Digestive'], 1000)
@@ -197,7 +197,7 @@ if __name__ == "__main__":
         'weight_kg': np.random.normal(26.5, 5.5, 500),    # Slight drift
         'heart_rate': np.random.normal(82, 11, 500),       # Slight drift
         'age_months': np.random.randint(1, 180, 500),
-        'animal_type': np.random.choice(['Dog', 'Cat', 'Bird'], 500),
+        'animal_type': np.random.choice(['Dog', 'Cat'], 500),
         'gender': np.random.choice(['Male', 'Female'], 500),
         'vaccination_status': np.random.choice(['Yes', 'No'], 500),
         'target_diagnosis': np.random.choice(['Healthy', 'Flu', 'Digestive'], 500)

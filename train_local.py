@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import logging
+import uuid
 import argparse
 from datetime import datetime
 from typing import Dict, List, Any
@@ -30,7 +31,7 @@ def create_sample_data(n_samples: int = 200) -> tuple:
     import numpy as np
     
     # Sample feedback data
-    animal_types = ['Dog', 'Cat', 'Bird', 'Rabbit']
+    animal_types = ['Dog', 'Cat']
     genders = ['Male', 'Female']
     seasons = ['Spring', 'Summer', 'Fall', 'Winter']
     vaccinations = ['Up to date', 'Overdue', 'Not vaccinated']
@@ -49,14 +50,17 @@ def create_sample_data(n_samples: int = 200) -> tuple:
     prediction_logs = []
     
     for i in range(n_samples):
+        pred_uuid = uuid.uuid4()
+        vet_uuid = str(uuid.uuid4())
+        pet_uuid = str(uuid.uuid4())
         # Generate random data
         feedback = {
-            'prediction_id': i + 1,
+            'prediction_id': pred_uuid,
             'final_diagnosis': np.random.choice(diagnoses),
             'is_correct': np.random.choice([True, False], p=[0.85, 0.15]),
             'confidence_rating': np.random.randint(3, 6),
             'comments': f'Sample feedback {i+1}',
-            'veterinarian_id': np.random.randint(1, 4),
+            'veterinarian_id': vet_uuid,
             'is_training_eligible': True,
             'data_quality_score': np.random.uniform(0.7, 1.0),
             'timestamp': datetime.now()
@@ -77,9 +81,9 @@ def create_sample_data(n_samples: int = 200) -> tuple:
         }
         
         prediction = {
-            'id': i + 1,
+            'id': pred_uuid,
             'visit_id': i + 100,
-            'pet_id': i + 50,
+            'pet_id': pet_uuid,
             'prediction_input': pred_input,
             'prediction_output': {
                 'diagnosis': feedback['final_diagnosis'],
@@ -91,7 +95,7 @@ def create_sample_data(n_samples: int = 200) -> tuple:
                 {'label': feedback['final_diagnosis'], 'prob': np.random.uniform(0.7, 0.95)}
             ],
             'veterinarian_id': feedback['veterinarian_id'],
-            'clinic_id': 1,
+            'clinic_id': '78343a5e-047b-5edb-9975-678bf3f815c6',
             'timestamp': datetime.now()
         }
         

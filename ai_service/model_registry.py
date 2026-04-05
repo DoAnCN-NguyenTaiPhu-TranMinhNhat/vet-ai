@@ -2,7 +2,9 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
+
+from ai_service.clinic_scope import clinic_dir_slug, normalize_clinic_key
 
 logger = logging.getLogger(__name__)
 
@@ -39,25 +41,59 @@ def _models_root() -> str:
     return os.path.join(os.path.dirname(__file__), "models")
 
 
-def list_model_versions() -> List[str]:
-    root = _models_root()
-    if not os.path.isdir(root):
+def _collect_versions_under(dir_path: str) -> List[str]:
+    if not os.path.isdir(dir_path):
         return []
-    versions: List[str] = []
-    for item in os.listdir(root):
-        path = os.path.join(root, item)
-        if not os.path.isdir(path):
-            continue
-        if item.startswith("v"):
-            versions.append(item)
-    # newest-first: timestamped versions first, then lexical fallback
-    timestamped = sorted([v for v in versions if "_" in v], reverse=True)
-    semantic = sorted([v for v in versions if "_" not in v], reverse=True)
-    return timestamped + semantic
+    out: List[str] = []
+    for item in os.listdir(dir_path):
+        path = os.path.join(dir_path, item)
+        if os.path.isdir(path) and item.startswith("v"):
+            out.append(item)
+    return out
 
 
-def resolve_model_dir(model_version: str) -> str:
-    return os.path.join(_models_root(), model_version)
+def list_model_versions(clinic_key: Optional[Union[str, int]] = None) -> List[str]:
+    """
+    List version folder names (v...) under global MODEL_ROOT and, when clinic_key is set,
+    under MODEL_ROOT/clinics/<slug>/ (union, de-duplicated).
+    """
+    root = _models_root()
+    seen = set()
+    ordered: List[str] = []
+
+    def add_from(versions: List[str]) -> None:
+        for v in versions:
+            if v not in seen:
+                seen.add(v)
+                ordered.append(v)
+
+    add_from(_collect_versions_under(root))
+
+    ck = normalize_clinic_key(clinic_key)
+    if ck:
+        sub = os.path.join(root, "clinics", clinic_dir_slug(ck))
+        add_from(_collect_versions_under(sub))
+
+    timestamped = sorted([v for v in ordered if "_" in v], reverse=True)
+    semantic = sorted([v for v in ordered if "_" not in v], reverse=True)
+    rest = [v for v in ordered if v not in timestamped and v not in semantic]
+    merged = timestamped + semantic + rest
+    seen_order: List[str] = []
+    for v in merged:
+        if v not in seen_order:
+            seen_order.append(v)
+    return seen_order
+
+
+def resolve_model_dir(model_version: str, clinic_key: Optional[Union[str, int]] = None) -> str:
+    """Resolve a version directory; prefer per-clinic copy when present."""
+    root = _models_root()
+    ck = normalize_clinic_key(clinic_key)
+    if ck:
+        sub = os.path.join(root, "clinics", clinic_dir_slug(ck), model_version)
+        if os.path.isdir(sub):
+            return sub
+    return os.path.join(root, model_version)
 
 
 def get_active_model() -> Optional[ActiveModel]:
@@ -67,7 +103,7 @@ def get_active_model() -> Optional[ActiveModel]:
         mv = str(data.get("model_version") or "").strip()
         if not mv:
             return None
-        md = resolve_model_dir(mv)
+        md = resolve_model_dir(mv, None)
         return ActiveModel(model_version=mv, model_dir=md)
     except FileNotFoundError:
         return None
@@ -80,7 +116,7 @@ def set_active_model(model_version: str) -> ActiveModel:
     mv = str(model_version).strip()
     if not mv:
         raise ValueError("model_version is required")
-    model_dir = resolve_model_dir(mv)
+    model_dir = resolve_model_dir(mv, None)
     if not os.path.isdir(model_dir):
         raise FileNotFoundError(f"Model directory not found: {model_dir}")
 
@@ -107,9 +143,95 @@ def detect_default_model() -> Optional[ActiveModel]:
         mv = str(env_ver).strip() if env_ver and str(env_ver).strip() else os.path.basename(str(env_dir).rstrip("/"))
         return ActiveModel(model_version=mv, model_dir=str(env_dir))
 
-    versions = list_model_versions()
+    versions = list_model_versions(None)
     if not versions:
         return None
     mv = versions[0]
-    return ActiveModel(model_version=mv, model_dir=resolve_model_dir(mv))
+    return ActiveModel(model_version=mv, model_dir=resolve_model_dir(mv, None))
+
+
+def _clinic_active_path(clinic_key: str) -> str:
+    return os.path.join(_STATE_DIR, "clinics", clinic_dir_slug(clinic_key), "active_model.json")
+
+
+def get_active_model_for_clinic(clinic_id: Optional[Union[str, int]]) -> Optional[ActiveModel]:
+    """
+    Model resolution:
+    - clinic_id is None: global default (shared model under MODEL_ROOT).
+    - clinic_id set (UUID or legacy int string): if state/clinics/<slug>/active_model.json exists, use it;
+      otherwise fall back to detect_default_model().
+    """
+    ck = normalize_clinic_key(clinic_id)
+    if ck is None:
+        return detect_default_model()
+
+    path = _clinic_active_path(ck)
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        mv = str(data.get("model_version") or "").strip()
+        md = str(data.get("model_dir") or "").strip()
+        if md and os.path.isdir(md):
+            ver = mv or os.path.basename(md.rstrip("/"))
+            return ActiveModel(model_version=ver, model_dir=md)
+        if mv:
+            d = resolve_model_dir(mv, ck)
+            if os.path.isdir(d):
+                return ActiveModel(model_version=mv, model_dir=d)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning("Clinic %s active model invalid: %s", ck, e)
+
+    return detect_default_model()
+
+
+def get_clinic_pinned_model(clinic_id: Union[str, int]) -> Optional[ActiveModel]:
+    """
+    Return the model explicitly pinned for this clinic (state file only).
+    No fallback to global default — use this to tell override vs default in admin UI.
+    """
+    ck = normalize_clinic_key(clinic_id)
+    if ck is None:
+        return None
+    path = _clinic_active_path(ck)
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        mv = str(data.get("model_version") or "").strip()
+        md = str(data.get("model_dir") or "").strip()
+        if md and os.path.isdir(md):
+            ver = mv or os.path.basename(md.rstrip("/"))
+            return ActiveModel(model_version=ver, model_dir=md)
+        if mv:
+            d = resolve_model_dir(mv, ck)
+            if os.path.isdir(d):
+                return ActiveModel(model_version=mv, model_dir=d)
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        logger.warning("Clinic %s pinned model unreadable: %s", ck, e)
+    return None
+
+
+def set_clinic_active_model(clinic_id: Union[str, int], model_version: str) -> ActiveModel:
+    """Pin a clinic to a version (prefers MODEL_ROOT/clinics/<slug>/<version> if that folder exists)."""
+    ck = normalize_clinic_key(clinic_id)
+    if ck is None:
+        raise ValueError("clinic_id is required")
+    mv = str(model_version).strip()
+    if not mv:
+        raise ValueError("model_version is required")
+    model_dir = resolve_model_dir(mv, ck)
+    if not os.path.isdir(model_dir):
+        raise FileNotFoundError(f"Model directory not found: {model_dir}")
+
+    out = _clinic_active_path(ck)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    tmp = out + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"model_version": mv, "model_dir": model_dir}, f)
+    os.replace(tmp, out)
+    logger.info("Clinic %s active model set to %s (%s)", ck, mv, model_dir)
+    return ActiveModel(model_version=mv, model_dir=model_dir)
 

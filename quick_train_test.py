@@ -7,6 +7,7 @@ import os
 import sys
 import json
 import logging
+import uuid
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 def create_sample_data(n_samples: int = 100) -> tuple:
     """Create sample training data for testing"""
     # Sample feedback data
-    animal_types = ['Dog', 'Cat', 'Bird', 'Rabbit']
+    animal_types = ['Dog', 'Cat']
     genders = ['Male', 'Female']
     seasons = ['Spring', 'Summer', 'Fall', 'Winter']
     vaccinations = ['Up to date', 'Overdue', 'Not vaccinated']
@@ -44,14 +45,17 @@ def create_sample_data(n_samples: int = 100) -> tuple:
     prediction_logs = []
     
     for i in range(n_samples):
+        pred_uuid = uuid.uuid4()
+        vet_uuid = str(uuid.uuid4())
+        pet_uuid = str(uuid.uuid4())
         # Generate random data
         feedback = {
-            'prediction_id': i + 1,
+            'prediction_id': pred_uuid,
             'final_diagnosis': np.random.choice(diagnoses),
             'is_correct': np.random.choice([True, False], p=[0.85, 0.15]),
             'confidence_rating': np.random.randint(3, 6),
             'comments': f'Sample feedback {i+1}',
-            'veterinarian_id': np.random.randint(1, 4),
+            'veterinarian_id': vet_uuid,
             'is_training_eligible': True,
             'data_quality_score': np.random.uniform(0.7, 1.0),
             'timestamp': datetime.now()
@@ -72,9 +76,9 @@ def create_sample_data(n_samples: int = 100) -> tuple:
         }
         
         prediction = {
-            'id': i + 1,
+            'id': pred_uuid,
             'visit_id': i + 100,
-            'pet_id': i + 50,
+            'pet_id': pet_uuid,
             'prediction_input': pred_input,
             'prediction_output': {
                 'diagnosis': feedback['final_diagnosis'],
@@ -85,8 +89,8 @@ def create_sample_data(n_samples: int = 100) -> tuple:
             'top_k_predictions': [
                 {'label': feedback['final_diagnosis'], 'prob': np.random.uniform(0.7, 0.95)}
             ],
-            'veterinarian_id': feedback['veterinarian_id'],
-            'clinic_id': 1,
+            'veterinarian_id': vet_uuid,
+            'clinic_id': '78343a5e-047b-5edb-9975-678bf3f815c6',
             'timestamp': datetime.now()
         }
         
@@ -118,7 +122,7 @@ def quick_train_test():
         training_records = []
         for feedback in feedback_data:
             prediction_id = feedback['prediction_id']
-            prediction = next((p for p in prediction_logs if p.get('id') == prediction_id), None)
+            prediction = next((p for p in prediction_logs if str(p.get('id')) == str(prediction_id)), None)
             
             if prediction is None:
                 continue

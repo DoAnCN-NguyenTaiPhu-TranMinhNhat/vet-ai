@@ -6,8 +6,8 @@ Handles prediction logging and training trigger logic
 from datetime import datetime, timedelta
 from io import StringIO
 from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field, ConfigDict
-from fastapi import HTTPException, BackgroundTasks, APIRouter, Depends
+from pydantic import BaseModel, Field, ConfigDict, field_validator
+from fastapi import HTTPException, BackgroundTasks, APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 import asyncio
 import logging
@@ -20,7 +20,10 @@ import boto3
 import csv
 from prometheus_client import Gauge, Counter
 import psycopg2
-from psycopg2.extras import RealDictCursor, Json
+from psycopg2.extras import RealDictCursor, Json, register_uuid
+
+# psycopg2 does not adapt uuid.UUID for parameters unless registered (else: can't adapt type 'UUID')
+register_uuid()
 
 # Import kubernetes only when needed for EKS training
 try:
@@ -36,6 +39,8 @@ try:
     from ai_service.training_engine import execute_training
 except ImportError:
     from training_engine import execute_training
+
+from ai_service.clinic_scope import normalize_clinic_key
 
 logger = logging.getLogger(__name__)
 
@@ -69,28 +74,28 @@ class CTPostgresStore:
             return
         ddl = """
         CREATE TABLE IF NOT EXISTS ai_prediction_logs (
-            id BIGINT PRIMARY KEY,
-            visit_id BIGINT NULL,
-            pet_id BIGINT NOT NULL,
+            id UUID PRIMARY KEY,
+            visit_id TEXT NULL,
+            pet_id TEXT NOT NULL,
             prediction_input JSONB NOT NULL,
             prediction_output JSONB NOT NULL,
             model_version TEXT NOT NULL,
             confidence_score DOUBLE PRECISION NOT NULL,
             top_k_predictions JSONB NOT NULL,
-            veterinarian_id BIGINT NULL,
-            clinic_id BIGINT NULL,
+            veterinarian_id TEXT NULL,
+            clinic_id TEXT NULL,
             created_at TIMESTAMP NOT NULL DEFAULT NOW()
         );
 
         CREATE TABLE IF NOT EXISTS ai_feedback (
             id BIGSERIAL PRIMARY KEY,
-            prediction_id BIGINT NOT NULL REFERENCES ai_prediction_logs(id) ON DELETE CASCADE,
+            prediction_id UUID NOT NULL REFERENCES ai_prediction_logs(id) ON DELETE CASCADE,
             final_diagnosis TEXT NOT NULL,
             is_correct BOOLEAN NOT NULL,
             ai_diagnosis TEXT NULL,
             confidence_rating INTEGER NULL,
             comments TEXT NULL,
-            veterinarian_id BIGINT NOT NULL,
+            veterinarian_id TEXT NULL,
             is_training_eligible BOOLEAN NOT NULL DEFAULT TRUE,
             data_quality_score DOUBLE PRECISION NOT NULL DEFAULT 1.0,
             created_at TIMESTAMP NOT NULL DEFAULT NOW()
@@ -129,11 +134,116 @@ class CTPostgresStore:
         """
         with self._conn() as conn:
             with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_schema = 'public' AND table_name = 'ai_prediction_logs'
+                    ) AS t
+                    """
+                )
+                pred_table_exists = bool(cur.fetchone()["t"])
+                if pred_table_exists:
+                    cur.execute(
+                        """
+                        SELECT data_type FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name = 'ai_prediction_logs'
+                          AND column_name = 'id'
+                        """
+                    )
+                    id_row = cur.fetchone()
+                    id_type = (id_row or {}).get("data_type") if id_row else None
+                    if id_type in ("bigint", "integer", "smallint"):
+                        logger.warning(
+                            "ai_prediction_logs.id is %s (legacy); dropping ai_feedback + "
+                            "ai_prediction_logs and recreating with UUID primary keys. "
+                            "Continuous-training log rows are reset.",
+                            id_type,
+                        )
+                        cur.execute("DROP TABLE IF EXISTS ai_feedback CASCADE")
+                        cur.execute("DROP TABLE IF EXISTS ai_prediction_logs CASCADE")
+
                 cur.execute(ddl)
+                cur.execute(
+                    "ALTER TABLE ai_training_jobs ADD COLUMN IF NOT EXISTS clinic_id BIGINT NULL"
+                )
+                cur.execute(
+                    """
+                    SELECT data_type FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'ai_training_jobs'
+                      AND column_name = 'clinic_id'
+                    """
+                )
+                cj = cur.fetchone()
+                cj_type = (cj or {}).get("data_type") if cj else None
+                if cj_type in ("bigint", "integer", "smallint"):
+                    logger.warning(
+                        "Widening ai_training_jobs.clinic_id from %s to TEXT for UUID clinic ids.",
+                        cj_type,
+                    )
+                    cur.execute(
+                        "ALTER TABLE ai_training_jobs ALTER COLUMN clinic_id TYPE TEXT USING clinic_id::TEXT"
+                    )
+
+                # Older DBs may still have INTEGER visit_id after IF NOT EXISTS skipped CREATE.
+                cur.execute(
+                    """
+                    SELECT data_type FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'ai_prediction_logs'
+                      AND column_name = 'visit_id'
+                    """
+                )
+                vid = cur.fetchone()
+                vtype = (vid or {}).get("data_type") if vid else None
+                if vtype in ("integer", "bigint", "smallint"):
+                    logger.info(
+                        "Widening ai_prediction_logs.visit_id from %s to TEXT (UUID visit ids).",
+                        vtype,
+                    )
+                    cur.execute(
+                        "ALTER TABLE ai_prediction_logs ALTER COLUMN visit_id TYPE TEXT USING (visit_id::TEXT)"
+                    )
+
+                # Per-clinic policy: where feedback counts for retraining (global pool vs clinic-only pool).
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS clinic_training_policy (
+                        clinic_id TEXT PRIMARY KEY,
+                        feedback_pool TEXT NOT NULL DEFAULT 'CLINIC_ONLY',
+                        updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                        CONSTRAINT clinic_training_policy_pool_chk CHECK (feedback_pool IN ('GLOBAL', 'CLINIC_ONLY'))
+                    )
+                    """
+                )
+                cur.execute(
+                    "ALTER TABLE ai_feedback ADD COLUMN IF NOT EXISTS training_pool TEXT DEFAULT 'CLINIC_ONLY'"
+                )
+                cur.execute(
+                    "UPDATE ai_feedback SET training_pool = 'CLINIC_ONLY' WHERE training_pool IS NULL"
+                )
+                cur.execute(
+                    "ALTER TABLE ai_feedback ALTER COLUMN training_pool SET DEFAULT 'CLINIC_ONLY'"
+                )
+                cur.execute("ALTER TABLE ai_feedback ALTER COLUMN training_pool SET NOT NULL")
+                cur.execute(
+                    """
+                    DO $$ BEGIN
+                        ALTER TABLE ai_feedback ADD CONSTRAINT ai_feedback_training_pool_chk
+                        CHECK (training_pool IN ('GLOBAL', 'CLINIC_ONLY'));
+                    EXCEPTION WHEN duplicate_object THEN NULL;
+                    END $$;
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_ai_feedback_training_pool ON ai_feedback(training_pool)"
+                )
             conn.commit()
         self._initialized = True
 
-    def insert_prediction(self, payload: Dict[str, Any]) -> int:
+    def insert_prediction(self, payload: Dict[str, Any]) -> uuid.UUID:
         self._ensure_schema()
         sql = """
         INSERT INTO ai_prediction_logs
@@ -149,9 +259,12 @@ class CTPostgresStore:
             confidence_score = EXCLUDED.confidence_score,
             top_k_predictions = EXCLUDED.top_k_predictions,
             veterinarian_id = EXCLUDED.veterinarian_id,
-            clinic_id = EXCLUDED.clinic_id
+            -- GenAI calls /predictions/log after /predict; if Java omits clinicId, do not wipe clinic_id set by /predict.
+            clinic_id = COALESCE(EXCLUDED.clinic_id, ai_prediction_logs.clinic_id)
         """
         data = dict(payload)
+        if isinstance(data.get("id"), uuid.UUID):
+            data["id"] = str(data["id"])
         data["prediction_input"] = Json(payload.get("prediction_input") or {})
         data["prediction_output"] = Json(payload.get("prediction_output") or {})
         data["top_k_predictions"] = Json(payload.get("top_k_predictions") or [])
@@ -159,75 +272,176 @@ class CTPostgresStore:
             with conn.cursor() as cur:
                 cur.execute(sql, data)
             conn.commit()
-        return int(payload["id"])
+        raw_id = payload["id"]
+        if isinstance(raw_id, uuid.UUID):
+            return raw_id
+        return uuid.UUID(str(raw_id))
 
     def insert_feedback(self, payload: Dict[str, Any]) -> bool:
         self._ensure_schema()
         sql = """
         INSERT INTO ai_feedback
-            (prediction_id, final_diagnosis, is_correct, ai_diagnosis, confidence_rating, comments, veterinarian_id, is_training_eligible, data_quality_score)
+            (prediction_id, final_diagnosis, is_correct, ai_diagnosis, confidence_rating, comments, veterinarian_id, is_training_eligible, data_quality_score, training_pool)
         VALUES
-            (%(prediction_id)s, %(final_diagnosis)s, %(is_correct)s, %(ai_diagnosis)s, %(confidence_rating)s, %(comments)s, %(veterinarian_id)s, %(is_training_eligible)s, %(data_quality_score)s)
+            (%(prediction_id)s, %(final_diagnosis)s, %(is_correct)s, %(ai_diagnosis)s, %(confidence_rating)s, %(comments)s, %(veterinarian_id)s, %(is_training_eligible)s, %(data_quality_score)s, %(training_pool)s)
         """
+        fb = dict(payload)
+        if isinstance(fb.get("prediction_id"), uuid.UUID):
+            fb["prediction_id"] = str(fb["prediction_id"])
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, payload)
+                cur.execute(sql, fb)
             conn.commit()
         return True
 
-    def count_predictions(self) -> int:
+    def get_clinic_id_for_prediction(self, prediction_id: Any) -> Optional[str]:
+        """Return clinic_id stored on the prediction log row (UUID string), if any."""
+        self._ensure_schema()
+        pid = str(prediction_id).strip()
+        if not pid:
+            return None
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT clinic_id FROM ai_prediction_logs WHERE id = %s",
+                    (pid,),
+                )
+                row = cur.fetchone()
+        if not row or row.get("clinic_id") is None:
+            return None
+        s = str(row["clinic_id"]).strip()
+        return s or None
+
+    def get_clinic_feedback_pool(self, clinic_id: str) -> str:
+        """Policy: GLOBAL = feedback counts only toward system-wide retraining; CLINIC_ONLY = only toward this clinic."""
+        self._ensure_schema()
+        cid = str(clinic_id).strip()
+        if not cid:
+            return "CLINIC_ONLY"
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT feedback_pool FROM clinic_training_policy WHERE clinic_id = %s",
+                    (cid,),
+                )
+                row = cur.fetchone()
+        if not row:
+            return "CLINIC_ONLY"
+        p = str(row.get("feedback_pool") or "").upper()
+        return p if p in ("GLOBAL", "CLINIC_ONLY") else "CLINIC_ONLY"
+
+    def set_clinic_feedback_pool(self, clinic_id: str, feedback_pool: str) -> None:
+        self._ensure_schema()
+        cid = str(clinic_id).strip()
+        fp = str(feedback_pool).upper().strip()
+        if fp not in ("GLOBAL", "CLINIC_ONLY"):
+            raise ValueError("feedback_pool must be GLOBAL or CLINIC_ONLY")
+        if not cid:
+            raise ValueError("clinic_id is required")
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO clinic_training_policy (clinic_id, feedback_pool, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (clinic_id) DO UPDATE SET
+                        feedback_pool = EXCLUDED.feedback_pool,
+                        updated_at = NOW()
+                    """,
+                    (cid, fp),
+                )
+            conn.commit()
+
+    def count_predictions(self, clinic_id: Optional[str] = None) -> int:
         self._ensure_schema()
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*)::BIGINT AS c FROM ai_prediction_logs")
+                if clinic_id is None:
+                    cur.execute("SELECT COUNT(*)::BIGINT AS c FROM ai_prediction_logs")
+                else:
+                    cur.execute(
+                        "SELECT COUNT(*)::BIGINT AS c FROM ai_prediction_logs WHERE clinic_id = %s",
+                        (clinic_id,),
+                    )
                 return int(cur.fetchone()["c"])
 
-    def count_feedback(self, eligible_only: bool = False, days: Optional[int] = None) -> int:
+    def count_feedback(
+        self,
+        eligible_only: bool = False,
+        days: Optional[int] = None,
+        clinic_id: Optional[str] = None,
+    ) -> int:
+        """Global scope (clinic_id None): only rows with training_pool=GLOBAL. Per-clinic: CLINIC_ONLY + matching prediction.clinic_id."""
         self._ensure_schema()
         cond = []
         params: List[Any] = []
+        if clinic_id is None:
+            from_clause = "ai_feedback f"
+            cond.append("f.training_pool = 'GLOBAL'")
+        else:
+            from_clause = "ai_feedback f INNER JOIN ai_prediction_logs p ON f.prediction_id = p.id"
+            cond.append("p.clinic_id = %s")
+            params.append(clinic_id)
+            cond.append("f.training_pool = 'CLINIC_ONLY'")
         if eligible_only:
-            cond.append("is_training_eligible = TRUE")
+            cond.append("f.is_training_eligible = TRUE")
         if days is not None:
-            cond.append("created_at >= NOW() - (%s || ' days')::INTERVAL")
+            cond.append("f.created_at >= NOW() - (%s || ' days')::INTERVAL")
             params.append(int(days))
-        where = f"WHERE {' AND '.join(cond)}" if cond else ""
-        sql = f"SELECT COUNT(*)::BIGINT AS c FROM ai_feedback {where}"
+        where = "WHERE " + " AND ".join(cond)
+        sql = f"SELECT COUNT(*)::BIGINT AS c FROM {from_clause} {where}"
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
                 return int(cur.fetchone()["c"])
 
-    def fetch_predictions(self) -> List[Dict[str, Any]]:
+    def fetch_predictions(self, clinic_id: Optional[str] = None) -> List[Dict[str, Any]]:
         self._ensure_schema()
-        sql = """
+        base = """
         SELECT id, visit_id, pet_id, prediction_input, prediction_output, model_version, confidence_score,
                top_k_predictions, veterinarian_id, clinic_id, created_at
         FROM ai_prediction_logs
-        ORDER BY created_at ASC
         """
+        if clinic_id is None:
+            sql = base + " ORDER BY created_at ASC"
+            params: List[Any] = []
+        else:
+            sql = base + " WHERE clinic_id = %s ORDER BY created_at ASC"
+            params = [clinic_id]
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql)
+                cur.execute(sql, params)
                 rows = cur.fetchall()
         return [dict(r) for r in rows]
 
-    def fetch_feedback(self, eligible_only: bool = False, days: Optional[int] = None) -> List[Dict[str, Any]]:
+    def fetch_feedback(
+        self, eligible_only: bool = False, days: Optional[int] = None, clinic_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         self._ensure_schema()
         cond = []
         params: List[Any] = []
+        if clinic_id is None:
+            from_sql = "ai_feedback f"
+            cond.append("f.training_pool = 'GLOBAL'")
+        else:
+            from_sql = "ai_feedback f INNER JOIN ai_prediction_logs p ON f.prediction_id = p.id"
+            cond.append("p.clinic_id = %s")
+            params.append(clinic_id)
+            cond.append("f.training_pool = 'CLINIC_ONLY'")
         if eligible_only:
-            cond.append("is_training_eligible = TRUE")
+            cond.append("f.is_training_eligible = TRUE")
         if days is not None:
-            cond.append("created_at >= NOW() - (%s || ' days')::INTERVAL")
+            cond.append("f.created_at >= NOW() - (%s || ' days')::INTERVAL")
             params.append(int(days))
-        where = f"WHERE {' AND '.join(cond)}" if cond else ""
+        where = "WHERE " + " AND ".join(cond)
+        select_cols = """f.prediction_id AS prediction_id, f.final_diagnosis, f.is_correct, f.ai_diagnosis,
+               f.confidence_rating, f.comments, f.veterinarian_id, f.is_training_eligible, f.data_quality_score,
+               f.created_at AS timestamp"""
         sql = f"""
-        SELECT prediction_id, final_diagnosis, is_correct, ai_diagnosis, confidence_rating, comments,
-               veterinarian_id, is_training_eligible, data_quality_score, created_at AS timestamp
-        FROM ai_feedback
+        SELECT {select_cols}
+        FROM {from_sql}
         {where}
-        ORDER BY created_at ASC
+        ORDER BY f.created_at ASC
         """
         with self._conn() as conn:
             with conn.cursor() as cur:
@@ -248,15 +462,25 @@ class CTPostgresStore:
             conn.commit()
         return {"predictions": p, "feedback": f}
 
-    def clear_feedback(self) -> int:
+    def clear_feedback(self, clinic_id: Optional[str] = None) -> int:
+        """After global training: delete GLOBAL pool only. After clinic training: delete CLINIC_ONLY for that clinic."""
         self._ensure_schema()
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*)::BIGINT AS c FROM ai_feedback")
-                f = int(cur.fetchone()["c"])
-                cur.execute("DELETE FROM ai_feedback")
+                if clinic_id is None:
+                    cur.execute("DELETE FROM ai_feedback WHERE training_pool = 'GLOBAL'")
+                else:
+                    cur.execute(
+                        """
+                        DELETE FROM ai_feedback f
+                        USING ai_prediction_logs p
+                        WHERE f.prediction_id = p.id AND p.clinic_id = %s AND f.training_pool = 'CLINIC_ONLY'
+                        """,
+                        (clinic_id,),
+                    )
+                n = cur.rowcount
             conn.commit()
-        return f
+        return int(n)
 
     def create_training_job(
         self,
@@ -269,6 +493,7 @@ class CTPostgresStore:
         training_mode: Optional[str],
         eks_node_group: Optional[str],
         dataset_row_count: Optional[int],
+        clinic_id: Optional[str] = None,
     ) -> int:
         """Create a persisted training job record (returns training_id)."""
         self._ensure_schema()
@@ -283,6 +508,7 @@ class CTPostgresStore:
             training_mode,
             eks_node_group,
             dataset_row_count,
+            clinic_id,
             created_at,
             updated_at
         ) VALUES (
@@ -295,6 +521,7 @@ class CTPostgresStore:
             %(training_mode)s,
             %(eks_node_group)s,
             %(dataset_row_count)s,
+            %(clinic_id)s,
             NOW(),
             NOW()
         )
@@ -309,6 +536,7 @@ class CTPostgresStore:
             "training_mode": training_mode,
             "eks_node_group": eks_node_group,
             "dataset_row_count": dataset_row_count,
+            "clinic_id": str(clinic_id).strip() if clinic_id is not None else None,
         }
         with self._conn() as conn:
             with conn.cursor() as cur:
@@ -405,7 +633,8 @@ class CTPostgresStore:
             eks_node_group,
             dataset_row_count,
             small_sample_warning,
-            metrics_note
+            metrics_note,
+            clinic_id
         FROM ai_training_jobs
         WHERE training_id = %(training_id)s
         """
@@ -415,12 +644,19 @@ class CTPostgresStore:
                 row = cur.fetchone()
         return dict(row) if row else None
 
-    def list_training_jobs(self, *, limit: int = 10, offset: int = 0) -> List[Dict[str, Any]]:
-        """List training jobs (recent first)."""
+    def list_training_jobs(
+        self, *, limit: int = 10, offset: int = 0, clinic_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """List training jobs (recent first). When clinic_id is set, only jobs for that clinic."""
         self._ensure_schema()
         limit = max(1, int(limit))
         offset = max(0, int(offset))
-        sql = """
+        where = ""
+        params: Dict[str, Any] = {"limit": limit, "offset": offset}
+        if clinic_id is not None:
+            where = " WHERE clinic_id = %(clinic_id)s"
+            params["clinic_id"] = clinic_id
+        sql = f"""
         SELECT
             training_id,
             status,
@@ -439,14 +675,16 @@ class CTPostgresStore:
             error_message,
             dataset_row_count,
             small_sample_warning,
-            metrics_note
+            metrics_note,
+            clinic_id
         FROM ai_training_jobs
+        {where}
         ORDER BY training_id DESC
         LIMIT %(limit)s OFFSET %(offset)s
         """
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, {"limit": limit, "offset": offset})
+                cur.execute(sql, params)
                 rows = cur.fetchall()
         return [dict(r) for r in rows]
 
@@ -469,27 +707,33 @@ class CTPostgresStore:
                 base[st] = int(r["c"])
         return base
 
-    def count_training_jobs_total(self) -> int:
-        """Count total training jobs."""
+    def count_training_jobs_total(self, clinic_id: Optional[str] = None) -> int:
+        """Count total training jobs (optionally for one clinic)."""
         self._ensure_schema()
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*)::BIGINT AS c FROM ai_training_jobs")
+                if clinic_id is None:
+                    cur.execute("SELECT COUNT(*)::BIGINT AS c FROM ai_training_jobs")
+                else:
+                    cur.execute(
+                        "SELECT COUNT(*)::BIGINT AS c FROM ai_training_jobs WHERE clinic_id = %s",
+                        (clinic_id,),
+                    )
                 return int(cur.fetchone()["c"])
 
 
 ct_store = CTPostgresStore(DATABASE_URL)
 
-# Trên EKS, training thật = cùng process Python với local (execute_training). Luồng eks_hybrid (Batch Job riêng)
-# chỉ bật khi ALLOW_EKS_HYBRID_TRAINING=true — cần image + node group + RBAC đúng; mặc định tắt.
+# On EKS, real training runs in the same Python process as locally (execute_training). eks_hybrid (separate Batch Job)
+# is only enabled when ALLOW_EKS_HYBRID_TRAINING=true — requires correct image, node group, and RBAC; off by default.
 def _effective_training_mode(requested: str) -> str:
     if requested != "eks_hybrid":
         return requested
     allow = os.getenv("ALLOW_EKS_HYBRID_TRAINING", "false").lower() in ("1", "true", "yes", "y")
     if not allow:
         logger.info(
-            "training_mode=eks_hybrid -> dùng in-process training (giống local). "
-            "Đặt ALLOW_EKS_HYBRID_TRAINING=true chỉ khi đã triển khai Job training riêng."
+            "training_mode=eks_hybrid -> using in-process training (same as local). "
+            "Set ALLOW_EKS_HYBRID_TRAINING=true only after a separate training Job is deployed."
         )
         return "local"
     return "eks_hybrid"
@@ -497,36 +741,51 @@ def _effective_training_mode(requested: str) -> str:
 
 # Pydantic models
 class PredictionLog(BaseModel):
-    id: int  # Use ID from main.py
-    visit_id: Optional[int] = None
-    pet_id: int
+    model_config = ConfigDict(extra="ignore")
+
+    id: uuid.UUID
+    # Visits-service uses UUID strings; legacy payloads may send int.
+    visit_id: Optional[str | int] = None
+    pet_id: str
     prediction_input: Dict
     prediction_output: Dict
     model_version: str
     confidence_score: float = Field(ge=0.0, le=1.0)
     top_k_predictions: List[Dict]
-    veterinarian_id: Optional[int] = None
-    clinic_id: Optional[int] = None
+    veterinarian_id: Optional[str] = None
+    clinic_id: Optional[str] = None
 
 class DoctorFeedback(BaseModel):
-    prediction_id: int
+    prediction_id: uuid.UUID
     final_diagnosis: str
     is_correct: bool
     # AI-suggested label (used to apply negative training signal on reject)
     ai_diagnosis: Optional[str] = None
     confidence_rating: Optional[int] = Field(ge=0, le=5, default=None)
     comments: Optional[str] = None
-    veterinarian_id: int
+    veterinarian_id: Optional[str] = None
     is_training_eligible: bool = True
     data_quality_score: float = Field(ge=0.0, le=1.0, default=1.0)
+    # Optional override; otherwise derived from clinic_training_policy + prediction clinic_id.
+    training_pool: Optional[str] = Field(default=None, pattern="^(GLOBAL|CLINIC_ONLY)$")
 
 class TrainingTriggerRequest(BaseModel):
     trigger_type: str = Field(pattern="^(scheduled|manual|automatic)$")
     trigger_reason: Optional[str] = None
     force: bool = False  # Override threshold check
-    # local = execute_training() trong pod (mặc định trên cả máy dev và EKS). eks_hybrid chỉ khi ALLOW_EKS_HYBRID_TRAINING=true.
+    # local = execute_training() in pod (default on dev and EKS). eks_hybrid only when ALLOW_EKS_HYBRID_TRAINING=true.
     training_mode: str = Field(default="local", pattern="^(local|eks_hybrid)$")
     eks_node_group: Optional[str] = None
+    # Scopes Postgres feedback/predictions, model output dir, MLflow experiment, and active pin (UUID or legacy int).
+    clinic_id: Optional[str] = None
+
+    @field_validator("clinic_id", mode="before")
+    @classmethod
+    def _normalize_trigger_clinic(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s if s else None
 
 class TrainingStatus(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -552,14 +811,47 @@ class TrainingPolicyUpdate(BaseModel):
     training_threshold: int = Field(ge=1)
     training_window_days: int = Field(ge=1)
 
+
+def resolve_training_pool_for_feedback(
+    prediction_clinic_id: Optional[str],
+    explicit: Optional[str],
+) -> str:
+    """
+    Mutually exclusive pools: GLOBAL counts only toward system-wide retraining; CLINIC_ONLY toward one clinic.
+    """
+    if explicit in ("GLOBAL", "CLINIC_ONLY"):
+        return explicit
+    if not prediction_clinic_id or not str(prediction_clinic_id).strip():
+        return "GLOBAL"
+    return ct_store.get_clinic_feedback_pool(str(prediction_clinic_id).strip())
+
+
+def _resolved_clinic_id_for_prediction_row(p: PredictionLog) -> Optional[str]:
+    """Top-level clinic_id, else clinic_id / clinicId inside prediction_input (Java may only embed there)."""
+    if p.clinic_id is not None:
+        s = str(p.clinic_id).strip()
+        if s:
+            return s
+    inp = p.prediction_input
+    if isinstance(inp, dict):
+        raw = inp.get("clinic_id") or inp.get("clinicId")
+        if raw is not None:
+            s = str(raw).strip()
+            if s:
+                return s
+    return None
+
+
 # Database functions
-async def log_prediction(prediction: PredictionLog) -> int:
+async def log_prediction(prediction: PredictionLog) -> uuid.UUID:
     """Log prediction to PostgreSQL storage."""
     logger.info(f"Logging prediction for visit {prediction.visit_id}, ID: {prediction.id}")
 
+    visit_db = None if prediction.visit_id is None else str(prediction.visit_id)
+    resolved_clinic = _resolved_clinic_id_for_prediction_row(prediction)
     prediction_data = {
         "id": prediction.id,
-        "visit_id": prediction.visit_id,
+        "visit_id": visit_db,
         "pet_id": prediction.pet_id,
         "prediction_input": prediction.prediction_input,
         "prediction_output": prediction.prediction_output,
@@ -567,7 +859,7 @@ async def log_prediction(prediction: PredictionLog) -> int:
         "confidence_score": prediction.confidence_score,
         "top_k_predictions": prediction.top_k_predictions,
         "veterinarian_id": prediction.veterinarian_id,
-        "clinic_id": prediction.clinic_id,
+        "clinic_id": resolved_clinic,
     }
     ct_store.insert_prediction(prediction_data)
     _predictions_logged_total.inc()
@@ -580,6 +872,14 @@ async def save_feedback(feedback: DoctorFeedback) -> bool:
     """Save doctor feedback to PostgreSQL storage."""
     logger.info(f"Saving feedback for prediction {feedback.prediction_id}")
 
+    pred_clinic = ct_store.get_clinic_id_for_prediction(feedback.prediction_id)
+    pool = resolve_training_pool_for_feedback(pred_clinic, feedback.training_pool)
+    logger.info(
+        "Feedback training_pool=%s (prediction clinic_id=%s)",
+        pool,
+        pred_clinic,
+    )
+
     feedback_data_item = {
         "prediction_id": feedback.prediction_id,
         "final_diagnosis": feedback.final_diagnosis,
@@ -587,9 +887,10 @@ async def save_feedback(feedback: DoctorFeedback) -> bool:
         "ai_diagnosis": feedback.ai_diagnosis,
         "confidence_rating": feedback.confidence_rating,
         "comments": feedback.comments,
-        "veterinarian_id": feedback.veterinarian_id or 0,
+        "veterinarian_id": feedback.veterinarian_id,
         "is_training_eligible": feedback.is_training_eligible,
         "data_quality_score": feedback.data_quality_score,
+        "training_pool": pool,
     }
     ct_store.insert_feedback(feedback_data_item)
     _feedback_saved_total.inc()
@@ -636,12 +937,13 @@ def _refresh_training_metrics() -> None:
     except Exception:
         return
 
-async def count_eligible_feedback(days: Optional[int] = None) -> int:
-    """Count eligible feedback in the last N days"""
+async def count_eligible_feedback(days: Optional[int] = None, clinic_id: Optional[str] = None) -> int:
+    """Count eligible feedback in the last N days (optionally for one clinic's prediction logs)."""
     if days is None:
         days = TRAINING_WINDOW_DAYS
-    eligible_count = ct_store.count_feedback(eligible_only=True, days=days)
-    logger.info(f"Current eligible feedback count: {eligible_count}")
+    ck = normalize_clinic_key(clinic_id)
+    eligible_count = ct_store.count_feedback(eligible_only=True, days=days, clinic_id=ck)
+    logger.info("Current eligible feedback count: %s (clinic_id=%s)", eligible_count, ck)
     return eligible_count
 
 
@@ -662,12 +964,12 @@ def build_training_dataset_snapshot(
         if isinstance(p, dict):
             pid = p.get("id")
             if pid is not None:
-                pred_by_id[pid] = p
+                pred_by_id[str(pid)] = p
 
     for f in feedback_items:
         if not isinstance(f, dict):
             continue
-        pred = pred_by_id.get(f.get("prediction_id"))
+        pred = pred_by_id.get(str(f.get("prediction_id")))
         if pred is None:
             continue
         pred_input = pred.get("prediction_input") or {}
@@ -722,10 +1024,13 @@ async def trigger_training_job(request: TrainingTriggerRequest) -> int:
     """Trigger a training job and return training ID"""
     logger.info(f"Triggering {request.training_mode} training: {request.trigger_type}")
 
-    total_predictions = ct_store.count_predictions()
-    eligible_feedback_count = await count_eligible_feedback()
-    all_predictions = ct_store.fetch_predictions()
-    eligible_feedback_items = ct_store.fetch_feedback(eligible_only=True, days=TRAINING_WINDOW_DAYS)
+    ck = normalize_clinic_key(request.clinic_id)
+    total_predictions = ct_store.count_predictions(clinic_id=ck)
+    eligible_feedback_count = await count_eligible_feedback(clinic_id=ck)
+    all_predictions = ct_store.fetch_predictions(clinic_id=ck)
+    eligible_feedback_items = ct_store.fetch_feedback(
+        eligible_only=True, days=TRAINING_WINDOW_DAYS, clinic_id=ck
+    )
 
     # Snapshot the exact feedback-linked rows used as training input at trigger time.
     dataset_rows = build_training_dataset_snapshot(
@@ -743,6 +1048,7 @@ async def trigger_training_job(request: TrainingTriggerRequest) -> int:
         training_mode=request.training_mode,
         eks_node_group=request.eks_node_group,
         dataset_row_count=dataset_row_count,
+        clinic_id=ck,
     )
 
     # In-memory snapshot only for dataset download UI.
@@ -766,6 +1072,7 @@ async def trigger_training_job(request: TrainingTriggerRequest) -> int:
         "dataset_row_count": dataset_row_count,
         "small_sample_warning": None,
         "metrics_note": None,
+        "clinic_id": ck,
     }
 
     # Start actual training (in-process for local, K8s job for eks_hybrid).
@@ -779,17 +1086,37 @@ async def trigger_training_job(request: TrainingTriggerRequest) -> int:
 async def execute_actual_training(training_id: int, training_mode: str):
     """Execute actual ML training"""
     try:
+        clinic_key: Optional[str] = None
+        try:
+            row = ct_store.get_training_job(training_id)
+            if row and row.get("clinic_id") is not None:
+                clinic_key = normalize_clinic_key(row["clinic_id"])
+        except Exception:
+            pass
+        if clinic_key is None and training_id in training_jobs:
+            c = training_jobs[training_id].get("clinic_id")
+            if c is not None:
+                clinic_key = normalize_clinic_key(c)
+
         effective_mode = _effective_training_mode(training_mode)
-        logger.info(f"Starting actual training for job {training_id} (requested={training_mode}, effective={effective_mode})")
-        current_feedback = ct_store.fetch_feedback(eligible_only=True, days=TRAINING_WINDOW_DAYS)
-        current_predictions = ct_store.fetch_predictions()
+        logger.info(
+            "Starting actual training for job %s (requested=%s, effective=%s, clinic_id=%s)",
+            training_id,
+            training_mode,
+            effective_mode,
+            clinic_key,
+        )
+        current_feedback = ct_store.fetch_feedback(
+            eligible_only=True, days=TRAINING_WINDOW_DAYS, clinic_id=clinic_key
+        )
+        current_predictions = ct_store.fetch_predictions(clinic_id=clinic_key)
         
         if effective_mode == "eks_hybrid":
-            # Tùy chọn: node group + Job riêng (cần ALLOW_EKS_HYBRID_TRAINING=true và hạ tầng đầy đủ)
+            # Optional: dedicated node group + Job (needs ALLOW_EKS_HYBRID_TRAINING=true and full infra)
             result = await run_eks_training(training_id)
         else:
-            # Cùng pipeline sklearn/MLflow như chạy local — chạy trong pod FastAPI (EKS hoặc docker-compose)
-            result = execute_training(current_feedback, current_predictions, "local")
+            # Same sklearn/MLflow pipeline as local — runs inside FastAPI pod (EKS or docker-compose)
+            result = execute_training(current_feedback, current_predictions, "local", clinic_id=clinic_key)
 
         if result.get("status") == "completed":
             tm = result.get("training_metrics") or {}
@@ -817,17 +1144,35 @@ async def execute_actual_training(training_id: int, training_mode: str):
                     "metrics_note": tm.get("metrics_note"),
                 })
 
-            # P1: Promote new model to active inference model (works only if model artifacts are shared)
+            # Promote new model: global default or per-clinic pin when clinic_id was set on the job.
             try:
-                from ai_service.main import set_active_model_and_reload
                 if model_version:
-                    set_active_model_and_reload(model_version)
-                    logger.info("Active model updated to %s after training job %s", model_version, training_id)
+                    if clinic_key is not None:
+                        from ai_service.model_registry import set_clinic_active_model
+                        from ai_service.main import clear_artifact_cache
+
+                        set_clinic_active_model(clinic_key, model_version)
+                        clear_artifact_cache()
+                        logger.info(
+                            "Clinic %s active model updated to %s after training job %s",
+                            clinic_key,
+                            model_version,
+                            training_id,
+                        )
+                    else:
+                        from ai_service.main import set_active_model_and_reload
+
+                        set_active_model_and_reload(model_version)
+                        logger.info(
+                            "Active model updated to %s after training job %s",
+                            model_version,
+                            training_id,
+                        )
             except Exception as e:
                 logger.warning("Failed to set active model after training: %s", e)
 
             # Reset feedback rows after successful training to prevent immediate retraining on same batch.
-            cleared = ct_store.clear_feedback()
+            cleared = ct_store.clear_feedback(clinic_id=clinic_key)
             logger.info("Feedback data reset after training completion. Cleared count: %s", cleared)
 
             logger.info(f"Training {training_id} completed successfully!")
@@ -1110,7 +1455,7 @@ async def log_prediction_endpoint(prediction: PredictionLog):
     """Log a prediction for continuous training"""
     try:
         prediction_id = await log_prediction(prediction)
-        return {"predictionId": prediction_id, "status": "logged"}
+        return {"predictionId": str(prediction_id), "status": "logged"}
     except Exception as e:
         logger.error(f"Failed to log prediction: {e}")
         raise HTTPException(status_code=500, detail="Failed to log prediction")
@@ -1122,16 +1467,37 @@ async def save_feedback_endpoint(feedback: DoctorFeedback):
         success = await save_feedback(feedback)
         if not success:
             raise HTTPException(status_code=400, detail="Failed to save feedback")
-        
-        # Check if we should trigger retraining
-        eligible_count = await count_eligible_feedback()
-        should_trigger = eligible_count >= TRAINING_THRESHOLD
-        
+
+        pred_clinic = ct_store.get_clinic_id_for_prediction(feedback.prediction_id)
+        pool = resolve_training_pool_for_feedback(pred_clinic, feedback.training_pool)
+        ck = normalize_clinic_key(pred_clinic)
+        if ck is None:
+            logger.warning(
+                "Feedback for prediction_id=%s: ai_prediction_logs.clinic_id is NULL. "
+                "Use global training scope; per-clinic counts need clinic_id on predictions.",
+                feedback.prediction_id,
+            )
+
+        eligible_global = await count_eligible_feedback(clinic_id=None)
+        eligible_clinic = await count_eligible_feedback(clinic_id=ck) if ck else 0
+        if pool == "GLOBAL":
+            eligible_for_pool = eligible_global
+        else:
+            eligible_for_pool = eligible_clinic
+        should_trigger = eligible_for_pool >= TRAINING_THRESHOLD
+        # Hint for auto-trigger clients: which scope this feedback advanced.
+        auto_scope = "global" if pool == "GLOBAL" else "clinic"
+
         return {
             "status": "saved",
-            "eligible_feedback_count": eligible_count,
+            "training_pool": pool,
+            "auto_trigger_scope": auto_scope,
+            "eligible_feedback_count": eligible_for_pool,
+            "eligible_feedback_count_global": eligible_global,
+            "eligible_feedback_count_clinic": eligible_clinic if ck else None,
             "training_threshold": TRAINING_THRESHOLD,
-            "should_trigger_training": should_trigger
+            "should_trigger_training": should_trigger,
+            "clinic_id": ck,
         }
     except Exception as e:
         logger.error(f"Failed to save feedback: {e}")
@@ -1157,9 +1523,10 @@ async def trigger_training_endpoint(
 ):
     """Trigger a training job"""
     try:
+        ck = normalize_clinic_key(request.clinic_id)
         # Check threshold unless forced
         if not request.force:
-            eligible_count = await count_eligible_feedback()
+            eligible_count = await count_eligible_feedback(clinic_id=ck)
             if eligible_count < TRAINING_THRESHOLD:
                 raise HTTPException(
                     status_code=400, 
@@ -1167,7 +1534,7 @@ async def trigger_training_endpoint(
                 )
         else:
             # Even when forced, training requires at least one eligible feedback+prediction pair
-            eligible_count = await count_eligible_feedback()
+            eligible_count = await count_eligible_feedback(clinic_id=ck)
             if eligible_count <= 0:
                 raise HTTPException(
                     status_code=400,
@@ -1194,30 +1561,44 @@ async def trigger_training_endpoint(
         raise HTTPException(status_code=500, detail="Failed to trigger training")
 
 @router.get("/training/eligibility")
-async def check_training_eligibility():
-    """Check if system is eligible for retraining"""
+async def check_training_eligibility(clinic_id: Optional[str] = Query(None)):
+    """Check if system is eligible for retraining (global or scoped to one clinic)."""
     try:
-        eligible_count = await count_eligible_feedback()
+        ck = normalize_clinic_key(clinic_id)
+        eligible_count = await count_eligible_feedback(clinic_id=ck)
         is_eligible = eligible_count >= TRAINING_THRESHOLD
         
+        policy = None
+        if ck is not None:
+            try:
+                policy = ct_store.get_clinic_feedback_pool(ck)
+            except Exception:
+                policy = None
         return {
             "eligible_feedback_count": eligible_count,
             "training_threshold": TRAINING_THRESHOLD,
             "is_eligible_for_training": is_eligible,
             "training_window_days": TRAINING_WINDOW_DAYS,
-            "next_check_date": datetime.now() + timedelta(days=1)
+            "clinic_id": ck,
+            "training_scope": "global" if ck is None else "clinic",
+            "clinic_feedback_pool_policy": policy,
+            "next_check_date": datetime.now() + timedelta(days=1),
         }
     except Exception as e:
         logger.error(f"Failed to check eligibility: {e}")
         raise HTTPException(status_code=500, detail="Failed to check eligibility")
 
 @router.get("/training/history")
-async def get_training_history(limit: int = 10, offset: int = 0):
-    """Get training job history from actual training jobs"""
+async def get_training_history(
+    limit: int = 10, offset: int = 0, clinic_id: Optional[str] = Query(None)
+):
+    """Get training job history from actual training jobs (optional per-clinic filter)."""
     try:
-        rows = ct_store.list_training_jobs(limit=limit, offset=offset)
+        ck = normalize_clinic_key(clinic_id)
+        rows = ct_store.list_training_jobs(limit=limit, offset=offset, clinic_id=ck)
         training_runs = []
         for job in rows:
+            cid = job.get("clinic_id")
             training_runs.append({
                 "training_id": job.get("training_id"),
                 "status": job.get("status"),
@@ -1232,12 +1613,15 @@ async def get_training_history(limit: int = 10, offset: int = 0):
                 "previous_model_version": job.get("previous_model_version"),
                 "new_model_version": job.get("new_model_version"),
                 "dataset_row_count": job.get("dataset_row_count", 0),
+                "clinic_id": cid,
+                "training_scope": "clinic" if cid not in (None, "") else "global",
             })
 
         return {
-            "total_count": ct_store.count_training_jobs_total(),
+            "total_count": ct_store.count_training_jobs_total(clinic_id=ck),
             "limit": limit,
             "offset": offset,
+            "clinic_id": ck,
             "training_runs": training_runs,
         }
     except Exception as e:

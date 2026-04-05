@@ -3,18 +3,26 @@ MLOps API Endpoints for Veterinary AI System
 Provides REST endpoints for drift detection, monitoring, and MLOps management
 """
 
-import os
 import json
 import logging
+import os
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 import pandas as pd
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from ai_service.mlops_manager import MLOpsManager
-from ai_service.model_registry import list_model_versions, get_active_model, set_active_model
+from ai_service.clinic_scope import normalize_clinic_key
+from ai_service.model_registry import (
+    get_active_model,
+    get_active_model_for_clinic,
+    get_clinic_pinned_model,
+    list_model_versions,
+    set_active_model,
+)
 from ai_service.auth import verify_admin
+from ai_service.clinics_catalog import get_clinics_for_mlops
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -51,7 +59,70 @@ class ConfigUpdateRequest(BaseModel):
 class ActiveModelRequest(BaseModel):
     model_version: str = Field(..., description="Model version to activate for inference")
 
+
 # API Endpoints
+
+
+@router.get(
+    "/clinics",
+    summary="Clinics for MLOps admin (customers-service + cache, or MLOPS_CLINICS_JSON / defaults)",
+)
+async def list_clinics_for_mlops():
+    clinics, source = get_clinics_for_mlops()
+    return {"status": "success", "clinics": clinics, "source": source}
+
+
+class ClinicTrainingPolicyBody(BaseModel):
+    """Whether feedback from this clinic counts toward GLOBAL retraining or CLINIC_ONLY pool."""
+
+    feedback_pool: str = Field(..., pattern="^(GLOBAL|CLINIC_ONLY)$")
+
+
+@router.get(
+    "/clinics/{clinic_id}/training-policy",
+    summary="Get feedback pool policy (GLOBAL vs CLINIC_ONLY) for a clinic",
+)
+async def get_clinic_training_policy(clinic_id: str):
+    from ai_service.continuous_training import ct_store
+
+    ck = normalize_clinic_key(clinic_id)
+    if ck is None:
+        raise HTTPException(status_code=400, detail="Invalid clinic_id")
+    try:
+        pool = ct_store.get_clinic_feedback_pool(ck)
+        return {"status": "success", "clinic_id": ck, "feedback_pool": pool}
+    except Exception as e:
+        logger.error("Failed to get clinic training policy: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put(
+    "/clinics/{clinic_id}/training-policy",
+    summary="Set feedback pool policy for a clinic (admin)",
+)
+async def set_clinic_training_policy(
+    clinic_id: str,
+    body: ClinicTrainingPolicyBody,
+    _: bool = Depends(verify_admin),
+):
+    from ai_service.continuous_training import ct_store
+
+    ck = normalize_clinic_key(clinic_id)
+    if ck is None:
+        raise HTTPException(status_code=400, detail="Invalid clinic_id")
+    try:
+        ct_store.set_clinic_feedback_pool(ck, body.feedback_pool)
+        return {
+            "status": "success",
+            "clinic_id": ck,
+            "feedback_pool": body.feedback_pool.upper(),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error("Failed to set clinic training policy: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.post("/initialize", summary="Initialize MLOps with reference data")
 async def initialize_mlops(request: ReferenceDataRequest):
@@ -187,29 +258,49 @@ async def run_health_check():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/models", summary="List available model versions + active")
-async def list_models():
-    active = get_active_model()
-    # Fallback: if not persisted yet, use current in-process model version
-    if active is None:
-        try:
-            from ai_service import main as ai_main
-            mv = getattr(ai_main, "MODEL_VERSION", None)
-            md = getattr(ai_main, "MODEL_DIR", None)
-            if mv and md:
-                return {
-                    "status": "success",
-                    "active": mv,
-                    "active_source": "process",
-                    "versions": list_model_versions(),
-                }
-        except Exception:
-            pass
+@router.get("/models", summary="List model versions + active (global or per-clinic)")
+async def list_models(clinic_id: Optional[str] = Query(None)):
+    ck = normalize_clinic_key(clinic_id)
+    versions = list_model_versions(ck)
+    if ck is None:
+        active = get_active_model()
+        if active is None:
+            try:
+                from ai_service import main as ai_main
+
+                mv = getattr(ai_main, "MODEL_VERSION", None)
+                md = getattr(ai_main, "MODEL_DIR", None)
+                if mv and md:
+                    return {
+                        "status": "success",
+                        "scope": "global",
+                        "active": mv,
+                        "active_source": "process",
+                        "versions": versions,
+                    }
+            except Exception:
+                pass
+        return {
+            "status": "success",
+            "scope": "global",
+            "active": active.model_version if active else None,
+            "active_source": "state_file" if active else None,
+            "versions": versions,
+        }
+
+    pinned = get_clinic_pinned_model(ck)
+    effective = get_active_model_for_clinic(ck)
+    global_active = get_active_model()
+    eff_src = "clinic_pin" if pinned is not None else "global_default"
     return {
         "status": "success",
-        "active": active.model_version if active else None,
-        "active_source": "state_file" if active else None,
-        "versions": list_model_versions(),
+        "scope": "clinic",
+        "clinic_id": ck,
+        "pinned": pinned.model_version if pinned else None,
+        "effective": effective.model_version if effective else None,
+        "effective_source": eff_src,
+        "global_active": global_active.model_version if global_active else None,
+        "versions": versions,
     }
 
 
@@ -228,15 +319,16 @@ async def set_active_model_version(request: ActiveModelRequest, _: bool = Depend
 
 
 @router.get("/training/last", summary="Get last training job status")
-async def get_last_training_job():
+async def get_last_training_job(clinic_id: Optional[str] = Query(None)):
     try:
         from ai_service.continuous_training import training_jobs, ct_store  # persisted + fallback in-memory
-        from ai_service.model_registry import get_active_model
 
-        # Prefer DB (survive FastAPI restart)
+        ck = normalize_clinic_key(clinic_id)
+
         last_row = None
+        last_successful = None
         try:
-            recent_rows = ct_store.list_training_jobs(limit=20, offset=0)
+            recent_rows = ct_store.list_training_jobs(limit=50, offset=0, clinic_id=ck)
             if recent_rows:
                 last_row = recent_rows[0]
 
@@ -245,31 +337,44 @@ async def get_last_training_job():
                 for j in (recent_rows or [])
                 if str(j.get("status", "")).lower() == "completed" and bool(j.get("is_deployed"))
             ]
-            last_successful = max(successful_jobs, key=lambda x: x.get("training_id", 0)) if successful_jobs else None
+            last_successful = (
+                max(successful_jobs, key=lambda x: x.get("training_id", 0)) if successful_jobs else None
+            )
         except Exception:
-            # If DB is not configured, fall back to in-memory.
             last_row = None
             last_successful = None
             if training_jobs:
-                last_id = max(training_jobs.keys())
-                last_row = training_jobs[last_id]
+                mem_values = list(training_jobs.values())
+                if ck is not None:
+                    mem_values = [
+                        j
+                        for j in mem_values
+                        if str(j.get("clinic_id") or "").strip() == str(ck).strip()
+                    ]
+                if mem_values:
+                    last_row = max(mem_values, key=lambda x: x.get("training_id", 0))
+                    successful_jobs = [
+                        j
+                        for j in mem_values
+                        if str(j.get("status", "")).lower() == "completed" and bool(j.get("is_deployed"))
+                    ]
+                    if successful_jobs:
+                        last_successful = max(successful_jobs, key=lambda x: x.get("training_id", 0))
 
-                successful_jobs = [
-                    j for j in training_jobs.values()
-                    if str(j.get("status")).lower() == "completed" and bool(j.get("is_deployed"))
-                ]
-                if successful_jobs:
-                    last_successful = max(successful_jobs, key=lambda x: x.get("training_id", 0))
-
-        active = get_active_model()
-        active_model_version = active.model_version if active else None
+        if ck is None:
+            active = get_active_model()
+            active_model_version = active.model_version if active else None
+        else:
+            eff = get_active_model_for_clinic(ck)
+            active_model_version = eff.model_version if eff else None
 
         return {
             "status": "success",
+            "scope": "clinic" if ck else "global",
+            "clinic_id": ck,
             "last_training": last_row,
             "last_successful_training": last_successful,
             "active_model": active_model_version,
-            # Convenience hint for UI: when latest failed, app may still serve previous successful model.
             "serving_model_source": (
                 "last_successful_training"
                 if last_successful and active_model_version == last_successful.get("new_model_version")
@@ -282,8 +387,9 @@ async def get_last_training_job():
 
 
 @router.get("/drift/summary", summary="Get drift summary + simple alert rule")
-async def get_drift_summary(days: int = 7):
+async def get_drift_summary(days: int = 7, clinic_id: Optional[str] = Query(None)):
     try:
+        ck = normalize_clinic_key(clinic_id)
         summary = mlops_manager.drift_detector.get_drift_summary(days=days)
         # Simple alert rule: if drift score indicates drift, surface it.
         drift_score = mlops_manager.training_eligibility.get("drift_score", 0.0)
@@ -294,7 +400,14 @@ async def get_drift_summary(days: int = 7):
                 "message": "Data drift detected (drift_score > 0.5)",
                 "drift_score": drift_score,
             }
-        return {"status": "success", "summary": summary, "alert": alert}
+        return {
+            "status": "success",
+            "scope": "clinic" if ck else "global",
+            "clinic_id": ck,
+            "summary": summary,
+            "alert": alert,
+            "note": "Drift preset is workspace-global; clinic_id is echoed for UI scope only.",
+        }
     except Exception as e:
         logger.error(f"Failed to get drift summary: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -495,7 +608,7 @@ async def initialize_with_sample_data():
                 'weight_kg': float(np.random.normal(25.0, 5.0)),
                 'heart_rate': float(np.random.normal(80, 10)),
                 'age_months': int(np.random.randint(1, 180)),
-                'animal_type': np.random.choice(['Dog', 'Cat', 'Bird']),
+                'animal_type': np.random.choice(['Dog', 'Cat']),
                 'gender': np.random.choice(['Male', 'Female']),
                 'vaccination_status': np.random.choice(['Yes', 'No']),
                 'target_diagnosis': np.random.choice(['Healthy', 'Flu', 'Digestive'])
