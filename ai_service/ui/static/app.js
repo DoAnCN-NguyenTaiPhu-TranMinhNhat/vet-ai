@@ -77,6 +77,20 @@ async function jsend(url, method, body) {
   return data;
 }
 
+/** Multipart POST (do not set Content-Type — browser sets boundary). */
+async function jpostMultipart(url, formData) {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { Accept: "application/json", ...authHeaders() },
+    body: formData
+  });
+  const text = await r.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (_) { data = text; }
+  if (!r.ok) throw { status: r.status, data };
+  return data;
+}
+
 async function downloadWithAuth(url, filename) {
   const r = await fetch(url, { headers: { ...authHeaders() } });
   if (!r.ok) {
@@ -382,6 +396,31 @@ async function main() {
       await loadHistory();
     } catch (e) {
       toast(`Trigger failed (${e.status || "?"}): ${JSON.stringify(e.data)}`);
+    }
+  });
+  document.getElementById("btn-bootstrap-csv")?.addEventListener("click", async () => {
+    if (!getToken()) {
+      toast("Admin token required in the navbar (same as server ADMIN_TOKEN).");
+      return;
+    }
+    const input = document.getElementById("bootstrap-csv-file");
+    if (!input?.files?.length) {
+      toast("Choose a CSV file first.");
+      return;
+    }
+    const fd = new FormData();
+    fd.append("file", input.files[0]);
+    const tcid = getSelectedClinicKey();
+    if (tcid != null) fd.append("clinic_id", tcid);
+    fd.append("training_mode", "local");
+    try {
+      const r = await jpostMultipart("/continuous-training/training/bootstrap-csv", fd);
+      toast(`Bootstrap training #${r.training_id} started (${r.row_count} rows, scope=${r.training_scope || "?"})`);
+      await refreshTraining();
+      await loadHistory();
+    } catch (e) {
+      const d = e.data?.detail ?? e.data ?? e;
+      toast(`Bootstrap failed (${e.status || "?"}): ${typeof d === "string" ? d : JSON.stringify(d)}`);
     }
   });
   document.getElementById("btn-load-history").addEventListener("click", async () => {

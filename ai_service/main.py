@@ -1,5 +1,6 @@
 import os
 import logging
+import traceback
 from typing import Any
 
 import joblib
@@ -47,34 +48,37 @@ logging.getLogger().addFilter(_RequestIdLogFilter())
 # Import continuous training endpoints
 try:
     from ai_service.continuous_training import router as ct_router
-except ImportError:
+except Exception:
     # Fallback for direct execution/testing
     try:
         from continuous_training import router as ct_router
-    except ImportError:
-        print("Warning: continuous_training module not found")
+    except Exception:
+        print("Warning: failed to import continuous_training router")
+        traceback.print_exc()
         ct_router = None
 
 # Import MLOps endpoints
 try:
     from ai_service.mlops_api import router as mlops_router
-except ImportError:
+except Exception:
     # Fallback for direct execution/testing
     try:
         from mlops_api import router as mlops_router
-    except ImportError:
-        print("Warning: mlops_api module not found")
+    except Exception:
+        print("Warning: failed to import mlops_api router")
+        traceback.print_exc()
         mlops_router = None
 
 # Import MLOps v2 endpoints (Champion-Challenger)
 try:
     from ai_service.mlops_api_v2 import router as mlops_v2_router
-except ImportError:
+except Exception:
     # Fallback for direct execution/testing
     try:
         from mlops_api_v2 import router as mlops_v2_router
-    except ImportError:
-        print("Warning: mlops_api_v2 module not found")
+    except Exception:
+        print("Warning: failed to import mlops_api_v2 router")
+        traceback.print_exc()
         mlops_v2_router = None
 
 

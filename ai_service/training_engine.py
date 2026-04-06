@@ -3,9 +3,11 @@ Real ML Training implementation
 Handles actual model training with data collection, preprocessing, and model evaluation
 """
 
+import io
 import os
 import json
 import pickle
+import uuid
 import joblib
 import logging
 import pandas as pd
@@ -1162,6 +1164,157 @@ class ModelTrainer:
 def _normalize_label_array(y) -> np.ndarray:
     """Strip whitespace for stable comparison between CSV labels and model outputs."""
     return np.array([str(v).strip() for v in np.asarray(y).ravel()], dtype=object)
+
+
+# CSV cold-start bootstrap (same schema as vet-ml golden dataset).
+CSV_BOOTSTRAP_REQUIRED_COLUMNS = [
+    "pet_id",
+    "animal_type",
+    "gender",
+    "age_months",
+    "weight_kg",
+    "temperature",
+    "heart_rate",
+    "current_season",
+    "vaccination_status",
+    "medical_history",
+    "symptoms_list",
+    "symptom_duration",
+    "target_diagnosis",
+]
+
+CSV_BOOTSTRAP_TEMPLATE_HEADER = (
+    "pet_id,animal_type,gender,age_months,weight_kg,temperature,heart_rate,"
+    "current_season,vaccination_status,medical_history,symptoms_list,symptom_duration,target_diagnosis\n"
+)
+
+
+def parse_bootstrap_csv(
+    raw: bytes,
+    *,
+    label_col: str = "target_diagnosis",
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Validate a UTF-8 CSV and build in-memory feedback + prediction_log dicts for execute_training.
+
+    Schema matches e.g. vet-ml/data/vet-ai-project/veterinary_full_data_10000.csv.
+    Returns (feedback_rows, prediction_rows) with aligned prediction_id per pair.
+    """
+    if not raw or not str(raw).strip():
+        raise ValueError("Empty CSV file")
+
+    max_bytes = int(os.getenv("CSV_BOOTSTRAP_MAX_BYTES", str(25 * 1024 * 1024)))
+    if len(raw) > max_bytes:
+        raise ValueError(f"File too large (max {max_bytes} bytes)")
+
+    min_rows = int(os.getenv("CSV_BOOTSTRAP_MIN_ROWS", "10"))
+    max_rows = int(os.getenv("CSV_BOOTSTRAP_MAX_ROWS", "50000"))
+
+    try:
+        df = pd.read_csv(io.BytesIO(raw))
+    except Exception as e:
+        raise ValueError(f"Invalid CSV: {e}") from e
+
+    df.columns = [str(c).strip() for c in df.columns]
+    missing = [c for c in CSV_BOOTSTRAP_REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns: {missing}. Required: {CSV_BOOTSTRAP_REQUIRED_COLUMNS}")
+
+    # Drop rows without label
+    df = df[df[label_col].notna() & (df[label_col].astype(str).str.strip() != "")]
+    if len(df) < min_rows:
+        raise ValueError(f"Need at least {min_rows} rows with non-empty {label_col}; got {len(df)}")
+
+    if len(df) > max_rows:
+        raise ValueError(f"Too many rows (max {max_rows}); got {len(df)}")
+
+    def _req_str(val: Any, col: str) -> str:
+        if val is None or (isinstance(val, float) and np.isnan(val)):
+            raise ValueError(f"Missing or invalid text in column {col}")
+        s = str(val).strip()
+        if not s or s.lower() == "nan":
+            raise ValueError(f"Missing or invalid text in column {col}")
+        return s
+
+    feedback_list: List[Dict[str, Any]] = []
+    pred_list: List[Dict[str, Any]] = []
+
+    for _, row in df.iterrows():
+        label = str(row[label_col]).strip()
+        if not label or label.lower() == "nan":
+            continue
+
+        try:
+            age_m = int(row["age_months"]) if row["age_months"] is not None else None
+            sym_dur = int(row["symptom_duration"]) if row["symptom_duration"] is not None else None
+            hr = int(row["heart_rate"]) if row["heart_rate"] is not None else None
+            w = float(row["weight_kg"]) if row["weight_kg"] is not None else None
+            temp = float(row["temperature"]) if row["temperature"] is not None else None
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"Invalid numeric field in row: {e}") from e
+
+        if age_m is None or sym_dur is None or hr is None or w is None or temp is None:
+            raise ValueError("age_months, symptom_duration, heart_rate, weight_kg, temperature are required per row")
+
+        mh = row["medical_history"]
+        if mh is None or (isinstance(mh, float) and np.isnan(mh)):
+            mh = "Unknown"
+        else:
+            mh = str(mh).strip() or "Unknown"
+
+        symptoms = row["symptoms_list"]
+        if symptoms is None or (isinstance(symptoms, float) and np.isnan(symptoms)):
+            symptoms = ""
+        else:
+            symptoms = str(symptoms)
+
+        pet_cell = row["pet_id"]
+        pet_id = "bootstrap" if pet_cell is None or str(pet_cell).strip() == "" else str(pet_cell).strip()
+
+        pred_input = {
+            "animal_type": _req_str(row["animal_type"], "animal_type"),
+            "gender": _req_str(row["gender"], "gender"),
+            "age_months": age_m,
+            "weight_kg": w,
+            "temperature": temp,
+            "heart_rate": hr,
+            "current_season": _req_str(row["current_season"], "current_season"),
+            "vaccination_status": _req_str(row["vaccination_status"], "vaccination_status"),
+            "medical_history": mh,
+            "symptoms_list": symptoms,
+            "symptom_duration": sym_dur,
+        }
+
+        pid = uuid.uuid4()
+        pred_list.append(
+            {
+                "id": pid,
+                "visit_id": None,
+                "pet_id": pet_id,
+                "prediction_input": pred_input,
+                "prediction_output": {"diagnosis": label, "confidence": 1.0, "top_k": []},
+                "model_version": "bootstrap_csv",
+                "confidence_score": 1.0,
+                "top_k_predictions": [],
+            }
+        )
+        feedback_list.append(
+            {
+                "prediction_id": pid,
+                "final_diagnosis": label,
+                "is_correct": True,
+                "ai_diagnosis": label,
+                "confidence_rating": None,
+                "is_training_eligible": True,
+                "data_quality_score": 1.0,
+            }
+        )
+
+    if len(feedback_list) < min_rows:
+        raise ValueError(f"After cleaning, fewer than {min_rows} rows remain")
+
+    logger.info("Bootstrap CSV parsed: %d training pairs", len(feedback_list))
+    return feedback_list, pred_list
 
 
 def _annotate_small_sample_metrics(training_metrics: Dict[str, Any]) -> None:

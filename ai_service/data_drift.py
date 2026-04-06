@@ -10,8 +10,6 @@ from datetime import datetime
 from typing import Dict, List, Any, Optional
 import pandas as pd
 import numpy as np
-from evidently import Report
-from evidently.presets import DataDriftPreset
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -61,6 +59,10 @@ class DataDriftDetector:
             }
         
         try:
+            # Import lazily so MLOps routes still load even if Evidently optional deps are broken.
+            from evidently import Report
+            from evidently.presets import DataDriftPreset
+
             # Create data drift report using preset
             drift_report = Report(metrics=[
                 DataDriftPreset(),
@@ -115,6 +117,10 @@ class DataDriftDetector:
             raise ValueError("Reference data not set. Call set_reference_data() first.")
         
         try:
+            # Import lazily so startup does not fail on optional drift stack issues.
+            from evidently import Report
+            from evidently.presets import DataDriftPreset
+
             # Create target drift report using DataDriftPreset for target column
             target_drift_report = Report(metrics=[
                 DataDriftPreset(),

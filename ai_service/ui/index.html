@@ -34,7 +34,6 @@
     <main class="container py-4">
       <p class="text-muted small mb-3" id="clinic-context-banner">
         Viewing: <strong id="clinic-context-label">global (shared)</strong>.
-        <span class="d-none d-md-inline">Change clinic in the navbar; the URL updates so you can copy a per-clinic link.</span>
       </p>
       <div class="row g-3">
         <div class="col-12 col-lg-6">
@@ -44,9 +43,7 @@
               <button class="btn btn-sm btn-outline-primary" id="btn-refresh" type="button">Refresh</button>
             </div>
             <div class="card-body">
-              <div class="text-muted small mb-2" id="scope-hint">
-                Managing the global default model used when no per-clinic override exists.
-              </div>
+              <div class="text-muted small mb-2" id="scope-hint">Global model.</div>
               <div class="d-flex flex-wrap gap-2 align-items-center">
                 <div>
                   <div class="text-muted small" id="active-label">Active</div>
@@ -54,12 +51,11 @@
                 </div>
                 <div class="vr mx-2"></div>
                 <div class="flex-grow-1">
-                  <label class="form-label small text-muted mb-1" id="switch-model-label">Switch active model (diagnosis + base for fine-tune)</label>
+                  <label class="form-label small text-muted mb-1" id="switch-model-label">Switch active model</label>
                   <div class="input-group">
                     <select class="form-select" id="model-select"></select>
                     <button class="btn btn-primary" id="btn-set-active">Set active</button>
                   </div>
-                  <div class="form-text">This reloads inference artifacts immediately.</div>
                 </div>
               </div>
               <pre class="mt-3 mb-0 bg-body-tertiary p-2 rounded small" id="model-info"></pre>
@@ -89,11 +85,6 @@
 
               <div class="mt-3">
                 <label class="form-label small text-muted mb-1">Trigger training</label>
-                <div class="form-text mb-1">
-                  Scope follows the <strong>Clinic</strong> selector: Postgres logs for that clinic only, artifacts under
-                  <code>models/clinics/&lt;slug&gt;/</code>, a dedicated MLflow experiment, and the trained model is pinned when the job finishes.
-                  <strong>Global</strong> aggregates all clinics (shared experiment and default model directory).
-                </div>
                 <div class="input-group">
                   <select class="form-select" id="trigger-type">
                     <option value="manual" selected>manual</option>
@@ -102,7 +93,19 @@
                   </select>
                   <button class="btn btn-success" id="btn-trigger">Trigger</button>
                 </div>
-                <div class="form-text">If insufficient feedback, the API will return 400.</div>
+              </div>
+
+              <div class="mt-3 border-top pt-3">
+                <div class="fw-semibold">Bootstrap from CSV (cold start)</div>
+                <input type="file" class="form-control form-control-sm mb-2" id="bootstrap-csv-file" accept=".csv,text/csv" />
+                <div class="d-flex flex-wrap gap-2 align-items-center">
+                  <a
+                    class="btn btn-outline-secondary btn-sm"
+                    href="/continuous-training/training/bootstrap-csv/template"
+                    download="vet_bootstrap_training_template.csv"
+                  >Download CSV template</a>
+                  <button class="btn btn-primary btn-sm" id="btn-bootstrap-csv" type="button">Train from CSV</button>
+                </div>
               </div>
 
               <div class="mt-3">
@@ -151,8 +154,6 @@
                   <button class="btn btn-outline-primary btn-sm" id="btn-load-policy">Load policy</button>
                   <button class="btn btn-primary btn-sm" id="btn-save-policy">Save policy</button>
                 </div>
-                <div class="form-text">Policy resets on service restart unless you persist env vars later.</div>
-                <div class="form-text text-warning"><strong>Save policy</strong> requires the Admin token in the top navbar (must match server <code>ADMIN_TOKEN</code>).</div>
               </div>
             </div>
           </div>
@@ -170,11 +171,6 @@
           </div>
         </div>
 
-        <div class="col-12">
-          <div class="alert alert-secondary small mb-0">
-            Tip: For infra dashboards/alerts, use Grafana at <code>http://localhost:3030</code> and Prometheus at <code>http://localhost:9091</code>.
-          </div>
-        </div>
       </div>
     </main>
 

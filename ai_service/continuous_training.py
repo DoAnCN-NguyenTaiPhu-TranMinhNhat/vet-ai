@@ -7,8 +7,8 @@ from datetime import datetime, timedelta
 from io import StringIO
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field, ConfigDict, field_validator
-from fastapi import HTTPException, BackgroundTasks, APIRouter, Depends, Query
-from fastapi.responses import StreamingResponse
+from fastapi import HTTPException, BackgroundTasks, APIRouter, Depends, Query, File, Form, UploadFile
+from fastapi.responses import StreamingResponse, Response
 import asyncio
 import logging
 import os
@@ -36,9 +36,17 @@ except ImportError:
 
 # Import training engine
 try:
-    from ai_service.training_engine import execute_training
+    from ai_service.training_engine import (
+        CSV_BOOTSTRAP_TEMPLATE_HEADER,
+        execute_training,
+        parse_bootstrap_csv,
+    )
 except ImportError:
-    from training_engine import execute_training
+    from training_engine import (  # type: ignore
+        CSV_BOOTSTRAP_TEMPLATE_HEADER,
+        execute_training,
+        parse_bootstrap_csv,
+    )
 
 from ai_service.clinic_scope import normalize_clinic_key
 
@@ -1200,6 +1208,119 @@ async def execute_actual_training(training_id: int, training_mode: str):
             })
         _refresh_training_metrics()
 
+
+async def execute_bootstrap_training(
+    training_id: int,
+    feedback_rows: List[Dict[str, Any]],
+    prediction_rows: List[Dict[str, Any]],
+    clinic_key: Optional[str],
+    training_mode: str,
+) -> None:
+    """
+    Run training from in-memory CSV-derived rows; do not clear Postgres feedback on success.
+    """
+    try:
+        effective_mode = _effective_training_mode(training_mode)
+        if effective_mode != "local":
+            raise ValueError(
+                "CSV bootstrap training runs in-process only (training_mode=local). "
+                "eks_hybrid is not supported for uploaded files."
+            )
+        logger.info(
+            "Bootstrap CSV training job %s (clinic_id=%s, rows=%s)",
+            training_id,
+            clinic_key,
+            len(feedback_rows),
+        )
+        result = execute_training(
+            feedback_rows,
+            prediction_rows,
+            "local",
+            clinic_id=clinic_key,
+        )
+
+        if result.get("status") == "completed":
+            tm = result.get("training_metrics") or {}
+            model_version = result.get("model_version")
+
+            ct_store.update_training_job_completed(
+                training_id,
+                model_version=model_version,
+                training_metrics=tm,
+                is_deployed=True,
+            )
+
+            if training_id in training_jobs:
+                training_jobs[training_id].update(
+                    {
+                        "status": "completed",
+                        "end_time": datetime.now(),
+                        "new_model_version": model_version,
+                        "training_accuracy": tm.get("training_accuracy"),
+                        "validation_accuracy": tm.get("validation_accuracy"),
+                        "f1_score": tm.get("validation_f1"),
+                        "is_deployed": True,
+                        "small_sample_warning": tm.get("small_sample_warning"),
+                        "metrics_note": tm.get("metrics_note"),
+                    }
+                )
+
+            try:
+                if model_version:
+                    if clinic_key is not None:
+                        from ai_service.model_registry import set_clinic_active_model
+                        from ai_service.main import clear_artifact_cache
+
+                        set_clinic_active_model(clinic_key, model_version)
+                        clear_artifact_cache()
+                        logger.info(
+                            "Clinic %s pinned to %s after bootstrap job %s",
+                            clinic_key,
+                            model_version,
+                            training_id,
+                        )
+                    else:
+                        from ai_service.main import set_active_model_and_reload
+
+                        set_active_model_and_reload(model_version)
+                        logger.info(
+                            "Global active model set to %s after bootstrap job %s",
+                            model_version,
+                            training_id,
+                        )
+            except Exception as e:
+                logger.warning("Failed to set active model after bootstrap training: %s", e)
+
+            logger.info("Bootstrap training %s completed successfully (Postgres feedback unchanged).", training_id)
+            _refresh_training_metrics()
+        else:
+            error_msg = result.get("error", "Unknown error")
+            ct_store.update_training_job_failed(training_id, error_message=error_msg)
+            if training_id in training_jobs:
+                training_jobs[training_id].update(
+                    {
+                        "status": "failed",
+                        "error_message": error_msg,
+                    }
+                )
+            _refresh_training_metrics()
+
+    except Exception as e:
+        logger.error("Bootstrap training execution failed for %s: %s", training_id, e)
+        try:
+            ct_store.update_training_job_failed(training_id, error_message=str(e))
+        except Exception:
+            pass
+        if training_id in training_jobs:
+            training_jobs[training_id].update(
+                {
+                    "status": "failed",
+                    "error_message": str(e),
+                }
+            )
+        _refresh_training_metrics()
+
+
 async def run_eks_training(training_id: int) -> Dict[str, Any]:
     """Run training on EKS with node group scaling"""
     try:
@@ -1559,6 +1680,109 @@ async def trigger_training_endpoint(
     except Exception as e:
         logger.error(f"Failed to trigger training: {e}")
         raise HTTPException(status_code=500, detail="Failed to trigger training")
+
+
+@router.get(
+    "/training/bootstrap-csv/template",
+    summary="CSV template (header row) for bootstrap training",
+)
+async def bootstrap_csv_template_endpoint():
+    """Public template — same columns as vet-ml golden dataset."""
+    return Response(
+        content=CSV_BOOTSTRAP_TEMPLATE_HEADER.encode("utf-8"),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="vet_bootstrap_training_template.csv"',
+        },
+    )
+
+
+@router.post(
+    "/training/bootstrap-csv",
+    status_code=201,
+    summary="Cold-start train from uploaded CSV (admin)",
+)
+async def bootstrap_csv_training_endpoint(
+    file: UploadFile = File(..., description="UTF-8 CSV; schema see /training/bootstrap-csv/template"),
+    clinic_id: Optional[str] = Form(
+        None,
+        description="Omit or empty for global model; UUID string to pin model for one clinic after train.",
+    ),
+    training_mode: str = Form("local"),
+    _: bool = Depends(verify_admin),
+):
+    """
+    Parse CSV in memory (does not insert into ai_feedback / ai_prediction_logs).
+    On success, promotes global or per-clinic active model like a normal job; Postgres feedback is not cleared.
+    """
+    try:
+        raw = await file.read()
+        if not raw:
+            raise HTTPException(status_code=400, detail="Empty file")
+
+        try:
+            fb_rows, pred_rows = parse_bootstrap_csv(raw)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+        ck = normalize_clinic_key(clinic_id)
+        tm = (training_mode or "local").strip() or "local"
+
+        dataset_rows = build_training_dataset_snapshot(fb_rows, pred_rows)
+        training_id = ct_store.create_training_job(
+            status="running",
+            total_predictions=ct_store.count_predictions(clinic_id=ck),
+            eligible_feedback_count=len(fb_rows),
+            previous_model_version="v2.0",
+            trigger_type="bootstrap_csv",
+            training_mode=tm,
+            eks_node_group=None,
+            dataset_row_count=len(dataset_rows),
+            clinic_id=ck,
+        )
+
+        training_datasets[training_id] = dataset_rows
+        training_jobs[training_id] = {
+            "training_id": training_id,
+            "status": "running",
+            "start_time": datetime.now(),
+            "end_time": None,
+            "total_predictions": ct_store.count_predictions(clinic_id=ck),
+            "eligible_feedback_count": len(fb_rows),
+            "previous_model_version": "v2.0",
+            "new_model_version": None,
+            "training_accuracy": None,
+            "validation_accuracy": None,
+            "f1_score": None,
+            "is_deployed": False,
+            "error_message": None,
+            "trigger_type": "bootstrap_csv",
+            "training_mode": tm,
+            "dataset_row_count": len(dataset_rows),
+            "small_sample_warning": None,
+            "metrics_note": None,
+            "clinic_id": ck,
+        }
+
+        asyncio.create_task(
+            execute_bootstrap_training(training_id, fb_rows, pred_rows, ck, tm)
+        )
+        _refresh_training_metrics()
+
+        return {
+            "training_id": training_id,
+            "status": "triggered",
+            "trigger_type": "bootstrap_csv",
+            "row_count": len(fb_rows),
+            "clinic_id": ck,
+            "training_scope": "global" if ck is None else "clinic",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("bootstrap-csv failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to start bootstrap CSV training")
+
 
 @router.get("/training/eligibility")
 async def check_training_eligibility(clinic_id: Optional[str] = Query(None)):

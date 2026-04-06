@@ -10,8 +10,10 @@ RUN apt-get update && apt-get install -y \
 # Copy requirements first for better caching
 COPY requirements.txt .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python dependencies (FastAPI File/Form needs python-multipart, not the PyPI package "multipart")
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip uninstall -y multipart 2>/dev/null || true \
+    && pip install --no-cache-dir "python-multipart>=0.0.20"
 
 # Copy application code
 COPY ai_service/ ./ai_service/
