@@ -112,13 +112,39 @@ def get_active_model() -> Optional[ActiveModel]:
         return None
 
 
+def _verify_inference_artifacts(model_dir: str) -> None:
+    """Ensure RandomForest + preprocessors load; fail before switching active model."""
+    import joblib
+
+    required = ("model.pkl", "tab_preprocess.pkl", "symptoms_mlb.pkl")
+    for name in required:
+        p = os.path.join(model_dir, name)
+        if not os.path.isfile(p):
+            raise ValueError(f"Missing artifact {name} under {model_dir}")
+    try:
+        joblib.load(os.path.join(model_dir, "model.pkl"))
+    except Exception as e:
+        raise ValueError(f"model.pkl cannot be loaded from {model_dir}: {e}") from e
+
+
 def set_active_model(model_version: str) -> ActiveModel:
     mv = str(model_version).strip()
     if not mv:
         raise ValueError("model_version is required")
+
+    try:
+        from ai_service.model_s3_artifact import ensure_model_directory_from_s3
+
+        ok, err = ensure_model_directory_from_s3(mv, None)
+        if not ok:
+            raise FileNotFoundError(err or f"Model {mv} not found locally and could not be restored from S3")
+    except ImportError:
+        pass
+
     model_dir = resolve_model_dir(mv, None)
     if not os.path.isdir(model_dir):
         raise FileNotFoundError(f"Model directory not found: {model_dir}")
+    _verify_inference_artifacts(model_dir)
 
     os.makedirs(_STATE_DIR, exist_ok=True)
     tmp = _ACTIVE_MODEL_FILE + ".tmp"
@@ -222,9 +248,20 @@ def set_clinic_active_model(clinic_id: Union[str, int], model_version: str) -> A
     mv = str(model_version).strip()
     if not mv:
         raise ValueError("model_version is required")
+
+    try:
+        from ai_service.model_s3_artifact import ensure_model_directory_from_s3
+
+        ok, err = ensure_model_directory_from_s3(mv, ck)
+        if not ok:
+            raise FileNotFoundError(err or f"Model {mv} not found for clinic and could not be restored from S3")
+    except ImportError:
+        pass
+
     model_dir = resolve_model_dir(mv, ck)
     if not os.path.isdir(model_dir):
         raise FileNotFoundError(f"Model directory not found: {model_dir}")
+    _verify_inference_artifacts(model_dir)
 
     out = _clinic_active_path(ck)
     os.makedirs(os.path.dirname(out), exist_ok=True)

@@ -338,6 +338,16 @@ async function loadDrift() {
   setPre("drift-summary", d);
 }
 
+async function loadRegistryStatusV2() {
+  const d = await jget("/mlops/v2/registry/status");
+  setPre("registry-status", d);
+}
+
+async function loadArtifactStorage() {
+  const d = await jget("/mlops/artifact-storage");
+  setPre("artifact-storage", d);
+}
+
 async function main() {
   const tokenEl = document.getElementById("admin-token");
   if (tokenEl) {
@@ -477,6 +487,16 @@ async function main() {
   });
   document.getElementById("btn-drift").addEventListener("click", async () => {
     try { await loadDrift(); } catch (e) { toast(`Drift failed (${e.status || "?"})`); }
+  });
+  document.getElementById("btn-registry-status")?.addEventListener("click", async () => {
+    try { await loadRegistryStatusV2(); } catch (e) {
+      toast(`Registry status failed (${e.status || "?"}): ${JSON.stringify(e.data)}`);
+    }
+  });
+  document.getElementById("btn-artifact-storage")?.addEventListener("click", async () => {
+    try { await loadArtifactStorage(); } catch (e) {
+      toast(`Artifact storage failed (${e.status || "?"}): ${JSON.stringify(e.data)}`);
+    }
   });
 
   try {

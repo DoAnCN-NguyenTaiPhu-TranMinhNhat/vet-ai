@@ -161,6 +161,36 @@
 
         <div class="col-12">
           <div class="card shadow-sm">
+            <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+              <div class="fw-semibold">Champion / challenger (staging registry)</div>
+              <button class="btn btn-sm btn-outline-primary" id="btn-registry-status" type="button">Load status</button>
+            </div>
+            <div class="card-body">
+              <p class="text-muted small mb-2">
+                Trạng thái từ <code>/mlops/v2/registry/status</code> (thư mục staging/production/archived).
+              </p>
+              <pre class="mb-0 bg-body-tertiary p-2 rounded small" id="registry-status">-</pre>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-12">
+          <div class="card shadow-sm">
+            <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+              <div class="fw-semibold">Model artifact storage (S3)</div>
+              <button class="btn btn-sm btn-outline-primary" id="btn-artifact-storage" type="button">Load</button>
+            </div>
+            <div class="card-body">
+              <p class="text-muted small mb-2">
+                Cấu hình <code>VETAI_MODEL_ARTIFACT_S3_BUCKET</code> / prefix — backup sau train.
+              </p>
+              <pre class="mb-0 bg-body-tertiary p-2 rounded small" id="artifact-storage">-</pre>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-12">
+          <div class="card shadow-sm">
             <div class="card-header fw-semibold">Drift</div>
             <div class="card-body">
               <div class="d-flex gap-2">

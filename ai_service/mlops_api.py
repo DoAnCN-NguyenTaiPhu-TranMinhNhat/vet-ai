@@ -511,6 +511,25 @@ async def get_config():
         logger.error(f"Error getting config: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@router.get("/artifact-storage", summary="S3 model artifact backup status (Pha B)")
+async def get_artifact_storage_status():
+    """Whether trained model dirs are uploaded to S3 and the bucket/prefix in use."""
+    try:
+        from ai_service.model_s3_artifact import s3_bucket, s3_prefix_base
+
+        b = s3_bucket()
+        return {
+            "status": "success",
+            "enabled": bool(b),
+            "bucket": b,
+            "prefix_base": s3_prefix_base(),
+        }
+    except Exception as e:
+        logger.error("artifact-storage status failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/export", summary="Export MLOps data")
 async def export_mlops_data(background_tasks: BackgroundTasks):
     """

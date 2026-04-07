@@ -1056,8 +1056,9 @@ class ModelTrainer:
                      model_version: str,
                      X_val: sparse.csr_matrix = None,
                      y_val: pd.Series = None,
-                     clinic_key: Optional[str] = None):
-        """Log training to MLflow (tags clinic_id; separate experiment when clinic-scoped)."""
+                     clinic_key: Optional[str] = None,
+                     training_id: Optional[int] = None):
+        """Log training to MLflow (tags clinic_id; optional training_id; separate experiment when clinic-scoped)."""
         # Retry connection when actually logging (MLflow may not have been ready at init)
         if not self._ensure_mlflow_connected():
             reason = self._mlflow_last_error or "unknown"
@@ -1083,6 +1084,9 @@ class ModelTrainer:
                 try:
                     mlflow.set_tag("clinic_id", ck if ck is not None else "global")
                     mlflow.set_tag("mlflow_experiment", exp_name)
+                    if training_id is not None:
+                        mlflow.set_tag("training_id", str(training_id))
+                        mlflow.log_param("training_id", int(training_id))
                     mlflow.log_params(training_metrics.get('model_params', {}))
                     default_split_ratio = float(os.getenv("DEFAULT_SPLIT_RATIO", "0.2"))
                     default_cv_folds = int(os.getenv("DEFAULT_CV_FOLDS", "5"))
@@ -1337,6 +1341,7 @@ def execute_training(
     prediction_logs: List[Dict],
     training_mode: str = "local",
     clinic_id: Optional[Any] = None,
+    training_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Execute training pipeline with dynamic parameters."""
     clinic_key = normalize_clinic_key(clinic_id)
@@ -1602,8 +1607,21 @@ def execute_training(
         # Save model
         model_path = trainer.save_model(model, training_metrics, model_version, clinic_key=clinic_key)
 
+        try:
+            from ai_service.model_s3_artifact import upload_model_directory
+
+            upload_model_directory(model_path, model_version, clinic_key=clinic_key)
+        except Exception as e:
+            logger.warning("S3 artifact upload after training failed (non-fatal): %s", e)
+
         # Log to MLflow
-        trainer.log_to_mlflow(model, training_metrics, model_version, clinic_key=clinic_key)
+        trainer.log_to_mlflow(
+            model,
+            training_metrics,
+            model_version,
+            clinic_key=clinic_key,
+            training_id=training_id,
+        )
         
         result = {
             'status': 'completed',
@@ -1612,6 +1630,7 @@ def execute_training(
             'training_metrics': training_metrics,
             'preprocessing_info': preprocessing_info,
             'training_mode': training_mode,
+            'training_id': training_id,
             'dynamic_params': {
                 'quality_threshold': training_metrics.get('test_split_ratio'),
                 'split_ratio': training_metrics.get('test_split_ratio'),

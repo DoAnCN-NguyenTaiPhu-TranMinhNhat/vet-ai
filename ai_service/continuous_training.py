@@ -1124,7 +1124,13 @@ async def execute_actual_training(training_id: int, training_mode: str):
             result = await run_eks_training(training_id)
         else:
             # Same sklearn/MLflow pipeline as local — runs inside FastAPI pod (EKS or docker-compose)
-            result = execute_training(current_feedback, current_predictions, "local", clinic_id=clinic_key)
+            result = execute_training(
+                current_feedback,
+                current_predictions,
+                "local",
+                clinic_id=clinic_key,
+                training_id=training_id,
+            )
 
         if result.get("status") == "completed":
             tm = result.get("training_metrics") or {}
@@ -1237,6 +1243,7 @@ async def execute_bootstrap_training(
             prediction_rows,
             "local",
             clinic_id=clinic_key,
+            training_id=training_id,
         )
 
         if result.get("status") == "completed":
