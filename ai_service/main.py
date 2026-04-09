@@ -1,8 +1,10 @@
 import os
 import logging
 import traceback
+from contextlib import asynccontextmanager
 from typing import Any
 
+import asyncio
 import joblib
 import numpy as np
 import pandas as pd
@@ -28,6 +30,7 @@ from prometheus_client import Gauge, Info
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
+from ai_service.metrics import observe_inference, timing
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -137,10 +140,58 @@ class PredictRequest(BaseModel):
         return s
 
 
+@asynccontextmanager
+async def _app_lifespan(app: FastAPI):
+    """Đồng bộ gauge feedback/training từ DB ngay khi boot để /metrics có dữ liệu không cần chờ train."""
+    refresh_fn = None
+    if ct_router is not None:
+        # Hỗ trợ cả 2 cách chạy module (ai_service.* hoặc import trực tiếp continuous_training).
+        try:
+            from ai_service.continuous_training import _refresh_training_metrics as refresh_fn  # type: ignore
+        except Exception:
+            try:
+                from continuous_training import _refresh_training_metrics as refresh_fn  # type: ignore
+            except Exception:
+                refresh_fn = None
+
+    stop_event = asyncio.Event()
+    task: asyncio.Task | None = None
+
+    async def _refresh_loop() -> None:
+        # Refresh định kỳ để tránh trường hợp DB chưa sẵn sàng lúc startup.
+        # Khi DB lên sau, gauge sẽ tự cập nhật mà không cần train.
+        while not stop_event.is_set():
+            if refresh_fn is not None:
+                try:
+                    refresh_fn()
+                except Exception as e:
+                    logger.warning("Refresh training metrics failed: %s", e)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=15.0)
+            except asyncio.TimeoutError:
+                pass
+
+    if refresh_fn is not None:
+        try:
+            refresh_fn()
+        except Exception as e:
+            logger.warning("Không thể refresh training metrics lúc startup: %s", e)
+        task = asyncio.create_task(_refresh_loop())
+    yield
+    stop_event.set()
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except Exception:
+            pass
+
+
 app = FastAPI(
     title="Veterinary Diagnosis AI",
     version="2.0.0",
-    description="Veterinary AI Diagnosis System with Champion-Challenger MLOps"
+    description="Veterinary AI Diagnosis System with Champion-Challenger MLOps",
+    lifespan=_app_lifespan,
 )
 
 _UI_DIR = Path(__file__).parent / "ui"
@@ -407,23 +458,29 @@ async def predict(req: PredictRequest) -> dict[str, Any]:
 
     X_final = sparse.hstack([X_tab_p, sparse.csr_matrix(X_sym)]).tocsr()
 
-    pred = model.predict(X_final)[0]
-
     confidence = None
     top_k = None
 
-    if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(X_final)[0]
-        classes = model.classes_
-        best_idx = int(np.argmax(proba))
-        confidence = float(proba[best_idx])
+    with timing() as t:
+        pred = model.predict(X_final)[0]
 
-        k = min(3, len(classes))
-        top_idx = np.argsort(proba)[::-1][:k]
-        top_k = [
-            {"label": str(classes[i]), "prob": float(proba[i])}
-            for i in top_idx
-        ]
+        if hasattr(model, "predict_proba"):
+            proba = model.predict_proba(X_final)[0]
+            classes = model.classes_
+            best_idx = int(np.argmax(proba))
+            confidence = float(proba[best_idx])
+
+            k = min(3, len(classes))
+            top_idx = np.argsort(proba)[::-1][:k]
+            top_k = [
+                {"label": str(classes[i]), "prob": float(proba[i])}
+                for i in top_idx
+            ]
+
+    try:
+        observe_inference(clinic_log, ok=True, latency_seconds=t.elapsed, confidence=confidence)
+    except Exception:
+        logger.exception("Failed to record inference metrics")
 
     prediction_id = uuid.uuid4()
     pet_key = (payload.get("pet_id") or "").strip() or "00000000-0000-0000-0000-000000000000"

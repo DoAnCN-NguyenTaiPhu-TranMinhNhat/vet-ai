@@ -6,7 +6,7 @@ Handles prediction logging and training trigger logic
 from datetime import datetime, timedelta
 from io import StringIO
 from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from pydantic import AliasChoices, BaseModel, Field, ConfigDict, field_validator
 from fastapi import HTTPException, BackgroundTasks, APIRouter, Depends, Query, File, Form, UploadFile
 from fastapi.responses import StreamingResponse, Response
 import asyncio
@@ -403,6 +403,15 @@ class CTPostgresStore:
                 cur.execute(sql, params)
                 return int(cur.fetchone()["c"])
 
+    def count_feedback_by_correct(self, is_correct: bool) -> int:
+        """Count all feedback rows by correctness (business dashboard), regardless of training_pool."""
+        self._ensure_schema()
+        sql = "SELECT COUNT(*)::BIGINT AS c FROM ai_feedback WHERE is_correct = %s"
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (bool(is_correct),))
+                return int(cur.fetchone()["c"])
+
     def fetch_predictions(self, clinic_id: Optional[str] = None) -> List[Dict[str, Any]]:
         self._ensure_schema()
         base = """
@@ -764,9 +773,15 @@ class PredictionLog(BaseModel):
     clinic_id: Optional[str] = None
 
 class DoctorFeedback(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     prediction_id: uuid.UUID
     final_diagnosis: str
-    is_correct: bool
+    is_correct: bool = Field(
+        ...,
+        validation_alias=AliasChoices("is_correct", "isCorrect"),
+        description="True nếu bác sĩ đồng ý với gợi ý AI; client có thể gửi isCorrect (camelCase).",
+    )
     # AI-suggested label (used to apply negative training signal on reject)
     ai_diagnosis: Optional[str] = None
     confidence_rating: Optional[int] = Field(ge=0, le=5, default=None)
@@ -902,6 +917,12 @@ async def save_feedback(feedback: DoctorFeedback) -> bool:
     }
     ct_store.insert_feedback(feedback_data_item)
     _feedback_saved_total.inc()
+    try:
+        from ai_service.metrics import inc_feedback
+
+        inc_feedback(pred_clinic, feedback.is_correct)
+    except Exception:
+        logger.exception("Failed to record feedback metrics")
     _refresh_training_metrics()
 
     logger.info("Feedback saved successfully.")
@@ -921,6 +942,8 @@ logger.info("Production-ready continuous training system initialized")
 _predictions_logged_total = Counter("vetai_predictions_logged_total", "Total predictions logged for continuous training")
 _feedback_saved_total = Counter("vetai_feedback_saved_total", "Total feedback entries saved")
 _eligible_feedback_gauge = Gauge("vetai_feedback_eligible_count", "Eligible feedback count for training")
+_feedback_accept_gauge = Gauge("vetai_feedback_accept_current", "Current total accept feedback in DB")
+_feedback_reject_gauge = Gauge("vetai_feedback_reject_current", "Current total reject feedback in DB")
 _training_jobs_gauge = Gauge("vetai_training_jobs", "Training jobs by status", ["status"])
 _training_last_success_timestamp = Gauge("vetai_training_last_success_timestamp_seconds", "Last successful training time (unix seconds)")
 
@@ -929,6 +952,8 @@ def _refresh_training_metrics() -> None:
     try:
         eligible = ct_store.count_feedback(eligible_only=True, days=TRAINING_WINDOW_DAYS)
         _eligible_feedback_gauge.set(float(eligible))
+        _feedback_accept_gauge.set(float(ct_store.count_feedback_by_correct(True)))
+        _feedback_reject_gauge.set(float(ct_store.count_feedback_by_correct(False)))
 
         counts = ct_store.count_training_jobs_by_status()
         for st in ["pending", "running", "completed", "failed"]:
@@ -942,7 +967,8 @@ def _refresh_training_metrics() -> None:
         if completed:
             last = max(completed, key=lambda j: j.get("end_time"))
             _training_last_success_timestamp.set(float(last["end_time"].timestamp()))
-    except Exception:
+    except Exception as e:
+        logger.warning("refresh training metrics failed: %s", e)
         return
 
 async def count_eligible_feedback(days: Optional[int] = None, clinic_id: Optional[str] = None) -> int:
@@ -1058,6 +1084,12 @@ async def trigger_training_job(request: TrainingTriggerRequest) -> int:
         dataset_row_count=dataset_row_count,
         clinic_id=ck,
     )
+    try:
+        from ai_service.metrics import inc_training_job
+
+        inc_training_job("running")
+    except Exception:
+        logger.exception("Failed to record training job metrics")
 
     # In-memory snapshot only for dataset download UI.
     training_datasets[training_id] = dataset_rows
@@ -1094,6 +1126,18 @@ async def trigger_training_job(request: TrainingTriggerRequest) -> int:
 async def execute_actual_training(training_id: int, training_mode: str):
     """Execute actual ML training"""
     try:
+        from ai_service.metrics import (
+            inc_model_reload,
+            inc_training_job,
+            observe_training_duration,
+            timing,
+        )
+
+        with timing() as train_timer:
+            try:
+                inc_training_job("running")
+            except Exception:
+                pass
         clinic_key: Optional[str] = None
         try:
             row = ct_store.get_training_job(training_id)
@@ -1133,6 +1177,14 @@ async def execute_actual_training(training_id: int, training_mode: str):
             )
 
         if result.get("status") == "completed":
+            try:
+                observe_training_duration(train_timer.elapsed)
+            except Exception:
+                pass
+            try:
+                inc_training_job("completed")
+            except Exception:
+                pass
             tm = result.get("training_metrics") or {}
             model_version = result.get("model_version")
 
@@ -1167,6 +1219,10 @@ async def execute_actual_training(training_id: int, training_mode: str):
 
                         set_clinic_active_model(clinic_key, model_version)
                         clear_artifact_cache()
+                        try:
+                            inc_model_reload("clinic", "success")
+                        except Exception:
+                            pass
                         logger.info(
                             "Clinic %s active model updated to %s after training job %s",
                             clinic_key,
@@ -1177,12 +1233,20 @@ async def execute_actual_training(training_id: int, training_mode: str):
                         from ai_service.main import set_active_model_and_reload
 
                         set_active_model_and_reload(model_version)
+                        try:
+                            inc_model_reload("global", "success")
+                        except Exception:
+                            pass
                         logger.info(
                             "Active model updated to %s after training job %s",
                             model_version,
                             training_id,
                         )
             except Exception as e:
+                try:
+                    inc_model_reload("clinic" if clinic_key is not None else "global", "error")
+                except Exception:
+                    pass
                 logger.warning("Failed to set active model after training: %s", e)
 
             # Reset feedback rows after successful training to prevent immediate retraining on same batch.
@@ -1193,6 +1257,14 @@ async def execute_actual_training(training_id: int, training_mode: str):
             _refresh_training_metrics()
         else:
             error_msg = result.get("error", "Unknown error")
+            try:
+                observe_training_duration(train_timer.elapsed)
+            except Exception:
+                pass
+            try:
+                inc_training_job("failed")
+            except Exception:
+                pass
             ct_store.update_training_job_failed(training_id, error_message=error_msg)
             if training_id in training_jobs:
                 training_jobs[training_id].update({
