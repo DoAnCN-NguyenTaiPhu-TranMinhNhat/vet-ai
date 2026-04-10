@@ -1057,8 +1057,9 @@ class ModelTrainer:
                      X_val: sparse.csr_matrix = None,
                      y_val: pd.Series = None,
                      clinic_key: Optional[str] = None,
-                     training_id: Optional[int] = None):
-        """Log training to MLflow (tags clinic_id; optional training_id; separate experiment when clinic-scoped)."""
+                     training_id: Optional[int] = None,
+                     training_mode: str = "local"):
+        """Log training to MLflow (tags chuẩn vetai_* + legacy clinic_id/training_id)."""
         # Retry connection when actually logging (MLflow may not have been ready at init)
         if not self._ensure_mlflow_connected():
             reason = self._mlflow_last_error or "unknown"
@@ -1080,13 +1081,39 @@ class ModelTrainer:
         try:
             with mlflow.start_run(run_name=run_name) as run:
                 run_id = run.info.run_id
+                ck_tag = ck if ck is not None else "global"
+                try:
+                    dw_raw = training_metrics.get("dataset_window_days")
+                    dw_int = int(dw_raw) if dw_raw is not None else int(os.getenv("TRAINING_WINDOW_DAYS", "30"))
+                except (TypeError, ValueError):
+                    dw_int = int(os.getenv("TRAINING_WINDOW_DAYS", "30"))
+                pk = str(training_metrics.get("pipeline_kind") or "continuous_training").strip() or "continuous_training"
+                model_source = f"{pk}/{str(training_mode).strip() or 'local'}"
                 # Log each step; do not re-raise so the run stays non-FAILED if one step fails
                 try:
-                    mlflow.set_tag("clinic_id", ck if ck is not None else "global")
+                    # Chuẩn hóa tag (vetai_*) để search/đối chiếu với registry
+                    mlflow.set_tag("vetai_clinic_id", ck_tag)
+                    mlflow.set_tag("vetai_dataset_window_days", str(dw_int))
+                    mlflow.set_tag("vetai_model_source", model_source)
+                    mlflow.set_tag("vetai_model_version", model_version)
+                    if training_id is not None:
+                        mlflow.set_tag("vetai_training_id", str(training_id))
+                    else:
+                        mlflow.set_tag("vetai_training_id", "")
+                    # Legacy / tương thích dashboard cũ
+                    mlflow.set_tag("clinic_id", ck_tag)
                     mlflow.set_tag("mlflow_experiment", exp_name)
+                    mlflow.set_tag("dataset_window_days", str(dw_int))
+                    mlflow.set_tag("model_source", model_source)
+                    mlflow.set_tag("model_version", model_version)
                     if training_id is not None:
                         mlflow.set_tag("training_id", str(training_id))
                         mlflow.log_param("training_id", int(training_id))
+                    mlflow.log_param("dataset_window_days", dw_int)
+                    mlflow.log_param("model_source", model_source)
+                    mlflow.log_param("model_version", model_version)
+                    mlflow.log_param("pipeline_kind", pk)
+                    mlflow.log_param("training_mode", str(training_mode))
                     mlflow.log_params(training_metrics.get('model_params', {}))
                     default_split_ratio = float(os.getenv("DEFAULT_SPLIT_RATIO", "0.2"))
                     default_cv_folds = int(os.getenv("DEFAULT_CV_FOLDS", "5"))
@@ -1096,8 +1123,16 @@ class ModelTrainer:
                 except Exception as e:
                     logger.warning("MLflow log params failed: %s", e)
                 try:
-                    metrics_to_log = {k: v for k, v in training_metrics.items()
-                                     if isinstance(v, (int, float)) and k != 'model_params'}
+                    _skip_mlflow_metric_keys = {
+                        "dataset_window_days",
+                    }
+                    metrics_to_log = {
+                        k: v
+                        for k, v in training_metrics.items()
+                        if isinstance(v, (int, float))
+                        and k != "model_params"
+                        and k not in _skip_mlflow_metric_keys
+                    }
                     mlflow.log_metrics(metrics_to_log)
                 except Exception as e:
                     logger.warning("MLflow log metrics failed: %s", e)
@@ -1342,9 +1377,20 @@ def execute_training(
     training_mode: str = "local",
     clinic_id: Optional[Any] = None,
     training_id: Optional[int] = None,
+    *,
+    dataset_window_days: Optional[int] = None,
+    pipeline_kind: str = "continuous_training",
 ) -> Dict[str, Any]:
     """Execute training pipeline with dynamic parameters."""
     clinic_key = normalize_clinic_key(clinic_id)
+    try:
+        dw_days = (
+            int(dataset_window_days)
+            if dataset_window_days is not None
+            else int(os.getenv("TRAINING_WINDOW_DAYS", "30"))
+        )
+    except (TypeError, ValueError):
+        dw_days = 30
     logger.info("Starting %s training pipeline (clinic_id=%s)", training_mode, clinic_key)
 
     try:
@@ -1614,6 +1660,10 @@ def execute_training(
         except Exception as e:
             logger.warning("S3 artifact upload after training failed (non-fatal): %s", e)
 
+        training_metrics["training_mode"] = training_mode
+        training_metrics["dataset_window_days"] = dw_days
+        training_metrics["pipeline_kind"] = pipeline_kind
+
         # Log to MLflow
         trainer.log_to_mlflow(
             model,
@@ -1621,6 +1671,7 @@ def execute_training(
             model_version,
             clinic_key=clinic_key,
             training_id=training_id,
+            training_mode=training_mode,
         )
         
         result = {
@@ -1631,6 +1682,8 @@ def execute_training(
             'preprocessing_info': preprocessing_info,
             'training_mode': training_mode,
             'training_id': training_id,
+            'dataset_window_days': dw_days,
+            'pipeline_kind': pipeline_kind,
             'dynamic_params': {
                 'quality_threshold': training_metrics.get('test_split_ratio'),
                 'split_ratio': training_metrics.get('test_split_ratio'),

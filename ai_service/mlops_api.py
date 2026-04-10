@@ -386,6 +386,23 @@ async def get_last_training_job(clinic_id: Optional[str] = Query(None)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get(
+    "/mlflow/latest-vs-active",
+    summary="Đối chiếu run MLflow mới nhất với model đang active (global hoặc theo clinic)",
+)
+async def mlflow_latest_vs_active(clinic_id: Optional[str] = Query(None)):
+    """
+    Dựa trên tag chuẩn `vetai_model_version` / `vetai_clinic_id` do training_engine ghi khi log MLflow.
+    """
+    try:
+        from ai_service.mlflow_alignment import compare_latest_run_to_active
+
+        return compare_latest_run_to_active(clinic_id=clinic_id)
+    except Exception as e:
+        logger.error("mlflow latest-vs-active failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/drift/summary", summary="Get drift summary + simple alert rule")
 async def get_drift_summary(days: int = 7, clinic_id: Optional[str] = Query(None)):
     try:

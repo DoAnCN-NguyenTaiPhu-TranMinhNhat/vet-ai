@@ -125,7 +125,12 @@ def run_local_training(args):
             return
     
     # Execute training
-    result = execute_training(feedback_data, prediction_logs, "local")
+    result = execute_training(
+        feedback_data,
+        prediction_logs,
+        "local",
+        pipeline_kind="cli_local",
+    )
     
     # Print results
     print("\n" + "="*60)

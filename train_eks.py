@@ -219,7 +219,18 @@ def main():
         
         # Execute training
         logger.info(f"Executing training with {len(feedback_data)} samples")
-        result = execute_training(feedback_data, prediction_logs, "eks_hybrid")
+        try:
+            tw = int(os.getenv("TRAINING_WINDOW_DAYS", "30"))
+        except (TypeError, ValueError):
+            tw = 30
+        result = execute_training(
+            feedback_data,
+            prediction_logs,
+            "eks_hybrid",
+            training_id=int(training_id) if str(training_id).strip().isdigit() else None,
+            dataset_window_days=tw,
+            pipeline_kind="eks_hybrid_job",
+        )
         
         # Persist status/matrics into PostgreSQL (Pha A)
         dsn = os.getenv("DATABASE_URL")

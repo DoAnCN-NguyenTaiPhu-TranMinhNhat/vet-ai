@@ -252,6 +252,32 @@ async function refreshTraining() {
   } else {
     setText("last-job", `#${lj.training_id} ${lj.status} → ${lj.new_model_version || "-"}`);
   }
+
+  const alignEl = document.getElementById("mlflow-align");
+  if (alignEl) {
+    try {
+      const mv = await jget("/mlops/mlflow/latest-vs-active" + q);
+      const lr = mv.latest_run;
+      const latestVer = lr && lr.inferred_model_version ? lr.inferred_model_version : "—";
+      const activeVer = mv.active_model_version != null ? mv.active_model_version : "—";
+      let line;
+      if (mv.versions_match === true) {
+        line = `Matched: active = MLflow = ${activeVer}`;
+      } else if (mv.versions_match === false) {
+        line = `Mismatch: active=${activeVer} | latest MLflow=${latestVer}`;
+      } else if (mv.status === "no_experiment" || mv.status === "no_runs") {
+        line = `${mv.status}: ${mv.note || "—"}`;
+      } else if (mv.status === "mlflow_error") {
+        line = `MLflow error: ${mv.note || "—"}`;
+      } else {
+        line = mv.note || `active=${activeVer} | MLflow=${latestVer} | run=${lr ? lr.run_id : "—"}`;
+      }
+      alignEl.textContent = line;
+    } catch (e) {
+      alignEl.textContent =
+        "Cannot read /mlops/mlflow/latest-vs-active (MLflow is down or network failed).";
+    }
+  }
 }
 
 async function loadHistory() {
@@ -348,6 +374,16 @@ async function loadArtifactStorage() {
   setPre("artifact-storage", d);
 }
 
+async function refreshAll() {
+  await refreshModel();
+  await refreshTraining();
+  await loadHistory();
+  await loadPolicy();
+  await loadDrift();
+  await loadRegistryStatusV2();
+  await loadArtifactStorage();
+}
+
 async function main() {
   const tokenEl = document.getElementById("admin-token");
   if (tokenEl) {
@@ -360,15 +396,18 @@ async function main() {
     tokenEl.addEventListener("change", persistToken);
   }
   document.getElementById("btn-refresh").addEventListener("click", async () => {
-    try { await refreshModel(); await refreshTraining(); } catch (e) { toast(`Refresh failed (${e.status || "?"})`); }
+    try {
+      await refreshAll();
+    } catch (e) {
+      toast(`Refresh failed (${e.status || "?"})`);
+    }
   });
   document.getElementById("clinic-scope").addEventListener("change", async () => {
     historyPage = 1;
     syncClinicToUrlAndStorage(getSelectedClinicKey());
     updateClinicContextBanner();
     try {
-      await refreshModel();
-      await refreshTraining();
+      await refreshAll();
     } catch (e) {
       toast(`Refresh failed (${e.status || "?"})`);
     }
@@ -433,9 +472,6 @@ async function main() {
       toast(`Bootstrap failed (${e.status || "?"}): ${typeof d === "string" ? d : JSON.stringify(d)}`);
     }
   });
-  document.getElementById("btn-load-history").addEventListener("click", async () => {
-    try { await loadHistory(); } catch (e) { toast(`History failed (${e.status || "?"})`); }
-  });
   document.getElementById("history-pagination").addEventListener("click", async (ev) => {
     const btn = ev.target.closest(".history-page-btn");
     if (!btn) return;
@@ -473,9 +509,6 @@ async function main() {
       }
     }
   });
-  document.getElementById("btn-load-policy").addEventListener("click", async () => {
-    try { await loadPolicy(); } catch (e) { toast(`Load policy failed (${e.status || "?"})`); }
-  });
   document.getElementById("btn-save-policy").addEventListener("click", async () => {
     try {
       await savePolicy();
@@ -485,25 +518,10 @@ async function main() {
       toast(`Save policy failed (${e.status || "?"}): ${msg}`);
     }
   });
-  document.getElementById("btn-drift").addEventListener("click", async () => {
-    try { await loadDrift(); } catch (e) { toast(`Drift failed (${e.status || "?"})`); }
-  });
-  document.getElementById("btn-registry-status")?.addEventListener("click", async () => {
-    try { await loadRegistryStatusV2(); } catch (e) {
-      toast(`Registry status failed (${e.status || "?"}): ${JSON.stringify(e.data)}`);
-    }
-  });
-  document.getElementById("btn-artifact-storage")?.addEventListener("click", async () => {
-    try { await loadArtifactStorage(); } catch (e) {
-      toast(`Artifact storage failed (${e.status || "?"}): ${JSON.stringify(e.data)}`);
-    }
-  });
 
   try {
     await loadClinicOptions();
-    await refreshModel();
-    await refreshTraining();
-    await loadPolicy();
+    await refreshAll();
   } catch (e) {
     toast(`Initial load failed (${e.status || "?"})`);
   }

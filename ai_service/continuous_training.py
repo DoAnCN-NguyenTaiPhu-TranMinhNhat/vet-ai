@@ -6,7 +6,7 @@ Handles prediction logging and training trigger logic
 from datetime import datetime, timedelta
 from io import StringIO
 from typing import Optional, List, Dict, Any
-from pydantic import AliasChoices, BaseModel, Field, ConfigDict, field_validator
+from pydantic import AliasChoices, BaseModel, Field, ConfigDict, field_validator, model_validator
 from fastapi import HTTPException, BackgroundTasks, APIRouter, Depends, Query, File, Form, UploadFile
 from fastapi.responses import StreamingResponse, Response
 import asyncio
@@ -248,6 +248,31 @@ class CTPostgresStore:
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_ai_feedback_training_pool ON ai_feedback(training_pool)"
                 )
+                # Hardening: one feedback row per prediction_id (latest wins). Clean legacy duplicates first.
+                cur.execute(
+                    """
+                    DELETE FROM ai_feedback a
+                    USING ai_feedback b
+                    WHERE a.prediction_id = b.prediction_id
+                      AND a.id < b.id
+                    """
+                )
+                cur.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_constraint
+                        WHERE conname = 'ai_feedback_prediction_id_uniq'
+                    ) AS has_feedback_prediction_uniq
+                    """
+                )
+                if not bool(cur.fetchone()["has_feedback_prediction_uniq"]):
+                    cur.execute(
+                        """
+                        ALTER TABLE ai_feedback
+                        ADD CONSTRAINT ai_feedback_prediction_id_uniq UNIQUE (prediction_id)
+                        """
+                    )
             conn.commit()
         self._initialized = True
 
@@ -292,6 +317,17 @@ class CTPostgresStore:
             (prediction_id, final_diagnosis, is_correct, ai_diagnosis, confidence_rating, comments, veterinarian_id, is_training_eligible, data_quality_score, training_pool)
         VALUES
             (%(prediction_id)s, %(final_diagnosis)s, %(is_correct)s, %(ai_diagnosis)s, %(confidence_rating)s, %(comments)s, %(veterinarian_id)s, %(is_training_eligible)s, %(data_quality_score)s, %(training_pool)s)
+        ON CONFLICT (prediction_id) DO UPDATE SET
+            final_diagnosis = EXCLUDED.final_diagnosis,
+            is_correct = EXCLUDED.is_correct,
+            ai_diagnosis = EXCLUDED.ai_diagnosis,
+            confidence_rating = EXCLUDED.confidence_rating,
+            comments = EXCLUDED.comments,
+            veterinarian_id = EXCLUDED.veterinarian_id,
+            is_training_eligible = EXCLUDED.is_training_eligible,
+            data_quality_score = EXCLUDED.data_quality_score,
+            training_pool = EXCLUDED.training_pool,
+            created_at = NOW()
         """
         fb = dict(payload)
         if isinstance(fb.get("prediction_id"), uuid.UUID):
@@ -301,6 +337,42 @@ class CTPostgresStore:
                 cur.execute(sql, fb)
             conn.commit()
         return True
+
+    def get_predicted_diagnosis_for_feedback(self, prediction_id: Any) -> Optional[str]:
+        """Best-effort lấy nhãn AI từ prediction_output để validate accept/reject khi client không gửi ai_diagnosis."""
+        self._ensure_schema()
+        pid = str(prediction_id).strip()
+        if not pid:
+            return None
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT prediction_output, top_k_predictions FROM ai_prediction_logs WHERE id = %s",
+                    (pid,),
+                )
+                row = cur.fetchone()
+        if not row:
+            return None
+        po = row.get("prediction_output") or {}
+        if isinstance(po, dict):
+            d = po.get("diagnosis")
+            if d is not None and str(d).strip():
+                return str(d).strip()
+            tk = po.get("top_k")
+            if isinstance(tk, list) and tk:
+                first = tk[0]
+                if isinstance(first, dict):
+                    lbl = first.get("label")
+                    if lbl is not None and str(lbl).strip():
+                        return str(lbl).strip()
+        topk = row.get("top_k_predictions")
+        if isinstance(topk, list) and topk:
+            first = topk[0]
+            if isinstance(first, dict):
+                lbl = first.get("label")
+                if lbl is not None and str(lbl).strip():
+                    return str(lbl).strip()
+        return None
 
     def get_clinic_id_for_prediction(self, prediction_id: Any) -> Optional[str]:
         """Return clinic_id stored on the prediction log row (UUID string), if any."""
@@ -792,6 +864,27 @@ class DoctorFeedback(BaseModel):
     # Optional override; otherwise derived from clinic_training_policy + prediction clinic_id.
     training_pool: Optional[str] = Field(default=None, pattern="^(GLOBAL|CLINIC_ONLY)$")
 
+    @field_validator("final_diagnosis", "ai_diagnosis", mode="before")
+    @classmethod
+    def _normalize_diag_text(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s if s else None
+
+    @model_validator(mode="after")
+    def _validate_feedback_consistency(self) -> "DoctorFeedback":
+        if not self.final_diagnosis:
+            raise ValueError("final_diagnosis is required")
+        # Khi client gửi kèm ai_diagnosis, validate nhất quán accept/reject ngay tại schema.
+        if self.ai_diagnosis:
+            same = self.final_diagnosis.lower() == self.ai_diagnosis.lower()
+            if self.is_correct and not same:
+                raise ValueError("is_correct=true requires final_diagnosis == ai_diagnosis")
+            if (not self.is_correct) and same:
+                raise ValueError("is_correct=false requires final_diagnosis != ai_diagnosis")
+        return self
+
 class TrainingTriggerRequest(BaseModel):
     trigger_type: str = Field(pattern="^(scheduled|manual|automatic)$")
     trigger_reason: Optional[str] = None
@@ -894,6 +987,13 @@ async def log_prediction(prediction: PredictionLog) -> uuid.UUID:
 async def save_feedback(feedback: DoctorFeedback) -> bool:
     """Save doctor feedback to PostgreSQL storage."""
     logger.info(f"Saving feedback for prediction {feedback.prediction_id}")
+    ai_diag_effective = feedback.ai_diagnosis or ct_store.get_predicted_diagnosis_for_feedback(feedback.prediction_id)
+    if ai_diag_effective:
+        same = str(feedback.final_diagnosis).strip().lower() == str(ai_diag_effective).strip().lower()
+        if feedback.is_correct and not same:
+            raise ValueError("Invalid feedback: is_correct=true but final_diagnosis differs from AI diagnosis")
+        if (not feedback.is_correct) and same:
+            raise ValueError("Invalid feedback: is_correct=false but final_diagnosis equals AI diagnosis")
 
     pred_clinic = ct_store.get_clinic_id_for_prediction(feedback.prediction_id)
     pool = resolve_training_pool_for_feedback(pred_clinic, feedback.training_pool)
@@ -907,7 +1007,7 @@ async def save_feedback(feedback: DoctorFeedback) -> bool:
         "prediction_id": feedback.prediction_id,
         "final_diagnosis": feedback.final_diagnosis,
         "is_correct": feedback.is_correct,
-        "ai_diagnosis": feedback.ai_diagnosis,
+        "ai_diagnosis": ai_diag_effective,
         "confidence_rating": feedback.confidence_rating,
         "comments": feedback.comments,
         "veterinarian_id": feedback.veterinarian_id,
@@ -1174,6 +1274,8 @@ async def execute_actual_training(training_id: int, training_mode: str):
                 "local",
                 clinic_id=clinic_key,
                 training_id=training_id,
+                dataset_window_days=TRAINING_WINDOW_DAYS,
+                pipeline_kind="continuous_training",
             )
 
         if result.get("status") == "completed":
@@ -1316,6 +1418,8 @@ async def execute_bootstrap_training(
             "local",
             clinic_id=clinic_key,
             training_id=training_id,
+            dataset_window_days=TRAINING_WINDOW_DAYS,
+            pipeline_kind="bootstrap_csv",
         )
 
         if result.get("status") == "completed":
@@ -1699,6 +1803,10 @@ async def save_feedback_endpoint(feedback: DoctorFeedback):
             "should_trigger_training": should_trigger,
             "clinic_id": ck,
         }
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to save feedback: {e}")
         raise HTTPException(status_code=500, detail="Failed to save feedback")
