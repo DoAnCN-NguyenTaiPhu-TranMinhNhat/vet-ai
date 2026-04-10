@@ -296,6 +296,16 @@ async function loadHistory() {
       : run.status === "failed"
         ? `<span class="badge text-bg-danger">${run.status}</span>`
         : `<span class="badge text-bg-secondary">${run.status || "-"}</span>`;
+    const guardrailBadge =
+      run.promote_guardrail_passed === true
+        ? `<span class="badge text-bg-success">passed</span>`
+        : run.promote_guardrail_passed === false
+          ? `<span class="badge text-bg-warning">blocked</span>`
+          : `<span class="badge text-bg-secondary">n/a</span>`;
+    const guardrailReason =
+      run.promote_guardrail_reason && String(run.promote_guardrail_reason).trim()
+        ? String(run.promote_guardrail_reason)
+        : "—";
     const clinicCell =
       run.clinic_id != null && run.clinic_id !== ""
         ? run.clinic_id
@@ -309,6 +319,8 @@ async function loadHistory() {
       <td>${run.validation_accuracy ?? "-"}</td>
       <td>${run.f1_score ?? "-"}</td>
       <td>${run.dataset_row_count ?? 0}</td>
+      <td>${guardrailBadge}</td>
+      <td class="small">${guardrailReason}</td>
       <td>
         <button class="btn btn-sm btn-outline-secondary btn-status" data-id="${run.training_id}">Status</button>
         <button class="btn btn-sm btn-outline-primary btn-download-data" data-id="${run.training_id}">Download data</button>
@@ -317,7 +329,7 @@ async function loadHistory() {
     tbody.appendChild(tr);
   });
   if (!h.training_runs || h.training_runs.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="9" class="text-muted">No runs</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="11" class="text-muted">No runs</td></tr>`;
   }
 
   const total = Number(h.total_count || 0);

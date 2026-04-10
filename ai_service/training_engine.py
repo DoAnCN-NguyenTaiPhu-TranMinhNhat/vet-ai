@@ -8,13 +8,14 @@ import os
 import json
 import pickle
 import uuid
+import hashlib
 import joblib
 import logging
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional, Any
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import train_test_split, cross_val_score, RepeatedStratifiedKFold
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, classification_report, f1_score
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
@@ -785,6 +786,7 @@ class ModelTrainer:
         sample_weights: np.ndarray = None,
         base_model: Optional[RandomForestClassifier] = None,
         finetune_add_trees: int = 20,
+        split_random_state: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Train model.
@@ -800,7 +802,11 @@ class ModelTrainer:
         
         # Split data with adaptive ratio
         # Use stratification only if we have enough samples per class
-        random_state = int(os.getenv("RANDOM_STATE", "42"))
+        random_state = (
+            int(split_random_state)
+            if split_random_state is not None
+            else int(os.getenv("RANDOM_STATE", "42"))
+        )
         
         # Check if stratification is possible
         class_counts = y.value_counts()
@@ -909,16 +915,37 @@ class ModelTrainer:
         # Adaptive cross-validation
         cv_folds = self.get_adaptive_cv_folds(y_train)
         logger.info(f"Using adaptive cross-validation folds: {cv_folds}")
-        
+
         if cv_folds >= 2:
-            # Note: fit_params not supported in cross_val_score, sample weights handled during training
-            cv_scores = cross_val_score(model, X_train, y_train, cv=cv_folds, scoring='accuracy')
-            cv_mean_accuracy = cv_scores.mean()
-            cv_std_accuracy = cv_scores.std()
+            # Prefer repeated stratified CV for more stable metrics across small / noisy feedback batches.
+            cv_strategy = os.getenv("TRAINING_CV_STRATEGY", "repeated_stratified").strip().lower()
+            cv_repeats = int(os.getenv("TRAINING_CV_REPEATS", "3"))
+            if can_stratify and cv_strategy == "repeated_stratified":
+                cv_splitter = RepeatedStratifiedKFold(
+                    n_splits=cv_folds,
+                    n_repeats=max(1, cv_repeats),
+                    random_state=random_state,
+                )
+                cv_strategy_used = "repeated_stratified"
+            else:
+                cv_splitter = cv_folds
+                cv_strategy_used = "kfold"
+
+            # Note: fit_params not supported in cross_val_score, sample weights handled during training.
+            cv_acc_scores = cross_val_score(model, X_train, y_train, cv=cv_splitter, scoring='accuracy')
+            cv_f1_scores = cross_val_score(model, X_train, y_train, cv=cv_splitter, scoring='f1_weighted')
+            cv_mean_accuracy = float(cv_acc_scores.mean())
+            cv_std_accuracy = float(cv_acc_scores.std())
+            cv_mean_f1_weighted = float(cv_f1_scores.mean())
+            cv_std_f1_weighted = float(cv_f1_scores.std())
         else:
             # Skip CV if not enough samples per class
             cv_mean_accuracy = train_accuracy
             cv_std_accuracy = 0.0
+            cv_mean_f1_weighted = val_f1
+            cv_std_f1_weighted = 0.0
+            cv_strategy_used = "skipped"
+            cv_repeats = 0
             logger.warning("Skipping cross-validation due to insufficient samples per class")
         
         training_metrics = {
@@ -927,13 +954,18 @@ class ModelTrainer:
             'validation_f1': val_f1,
             'cv_mean_accuracy': cv_mean_accuracy,
             'cv_std_accuracy': cv_std_accuracy,
+            'cv_mean_f1_weighted': cv_mean_f1_weighted,
+            'cv_std_f1_weighted': cv_std_f1_weighted,
             'training_time_seconds': training_time,
             'n_samples': X.shape[0],
             'n_features': X.shape[1],
             'n_classes': len(model.classes_),
             'model_params': model_params,
             'test_split_ratio': test_size,
-            'cv_folds': cv_folds
+            'cv_folds': cv_folds,
+            'cv_strategy': cv_strategy_used,
+            'cv_repeats': int(cv_repeats) if cv_strategy_used == "repeated_stratified" else 0,
+            'split_random_state': int(random_state),
         }
         
         logger.info(f"Training completed: val_accuracy={val_accuracy:.3f}, val_f1={val_f1:.3f}")
@@ -1371,6 +1403,29 @@ def _annotate_small_sample_metrics(training_metrics: Dict[str, Any]) -> None:
         )
 
 
+def _derive_split_random_state(
+    *,
+    training_id: Optional[int],
+    eligible_feedback_data: List[Dict[str, Any]],
+) -> int:
+    """
+    Derive split seed from base RANDOM_STATE + training_id + feedback content signature.
+    This avoids same metrics caused only by fixed split seed, while remaining reproducible for the same job payload.
+    """
+    base_seed = int(os.getenv("RANDOM_STATE", "42"))
+    h = hashlib.sha256()
+    h.update(str(base_seed).encode("utf-8"))
+    h.update(str(training_id if training_id is not None else "no-training-id").encode("utf-8"))
+    for row in eligible_feedback_data or []:
+        pid = row.get("prediction_id")
+        if pid is not None:
+            h.update(str(pid).encode("utf-8"))
+        h.update(str(row.get("final_diagnosis", "")).strip().lower().encode("utf-8"))
+        h.update(b"|")
+    # sklearn accepts 32-bit signed random_state
+    return int.from_bytes(h.digest()[:4], "big") & 0x7FFFFFFF
+
+
 def execute_training(
     feedback_data: List[Dict],
     prediction_logs: List[Dict],
@@ -1400,6 +1455,10 @@ def execute_training(
         ]
         if not eligible_feedback_data:
             raise ValueError("No eligible feedback data to train on")
+        split_seed = _derive_split_random_state(
+            training_id=training_id,
+            eligible_feedback_data=eligible_feedback_data,
+        )
         trainer = ModelTrainer()        
         X, y, sample_weights = trainer.collect_training_data(eligible_feedback_data, prediction_logs)
 
@@ -1424,7 +1483,12 @@ def execute_training(
             add_trees = int(os.getenv("FINETUNE_ADD_TREES", "20"))
             try:
                 model, training_metrics = trainer.train_model(
-                    X_processed, y, sample_weights, base_model=base_model, finetune_add_trees=add_trees
+                    X_processed,
+                    y,
+                    sample_weights,
+                    base_model=base_model,
+                    finetune_add_trees=add_trees,
+                    split_random_state=split_seed,
                 )
                 training_metrics["finetune"] = True
                 training_metrics["finetune_fallback"] = False
@@ -1433,7 +1497,11 @@ def execute_training(
                 # Fallback to full retrain using the *same* fixed preprocessors (encoders reused).
                 logger.warning("Warm-start fine-tune failed (%s). Falling back to retrain.", e)
                 model, training_metrics = trainer.train_model(
-                    X_processed, y, sample_weights, base_model=None
+                    X_processed,
+                    y,
+                    sample_weights,
+                    base_model=None,
+                    split_random_state=split_seed,
                 )
                 training_metrics["finetune"] = True
                 training_metrics["finetune_fallback"] = True
@@ -1441,7 +1509,12 @@ def execute_training(
             training_metrics["finetune_base_dir"] = base_dir
         else:
             X_processed, preprocessing_info = trainer.preprocess_features(X, fit_encoders=True)
-            model, training_metrics = trainer.train_model(X_processed, y, sample_weights)
+            model, training_metrics = trainer.train_model(
+                X_processed,
+                y,
+                sample_weights,
+                split_random_state=split_seed,
+            )
             training_metrics["finetune"] = False
 
         _annotate_small_sample_metrics(training_metrics)

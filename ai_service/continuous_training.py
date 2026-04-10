@@ -49,6 +49,7 @@ except ImportError:
     )
 
 from ai_service.clinic_scope import normalize_clinic_key
+from ai_service.model_registry import resolve_model_dir
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,14 @@ from ai_service.auth import verify_admin
 # Configuration (mutable for P2 UI)
 TRAINING_THRESHOLD = int(os.getenv("TRAINING_THRESHOLD", "10"))  # Reduced from 100 for easier testing
 TRAINING_WINDOW_DAYS = int(os.getenv("TRAINING_WINDOW_DAYS", "30"))
+PROMOTE_MIN_SAMPLES = int(os.getenv("PROMOTE_MIN_SAMPLES", "20"))
+PROMOTE_MIN_VALIDATION_F1_DELTA = float(os.getenv("PROMOTE_MIN_VALIDATION_F1_DELTA", "0.0"))
+PROMOTE_REQUIRE_BASELINE_METRIC = os.getenv("PROMOTE_REQUIRE_BASELINE_METRIC", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "y",
+)
 EKS_CLUSTER_NAME = os.getenv("EKS_CLUSTER_NAME", "vet-ai-dev")
 EKS_REGION = os.getenv("EKS_REGION", "us-east-1")
 TRAINING_NODE_GROUP = os.getenv("TRAINING_NODE_GROUP", "training-nodes")
@@ -175,6 +184,15 @@ class CTPostgresStore:
                 cur.execute(ddl)
                 cur.execute(
                     "ALTER TABLE ai_training_jobs ADD COLUMN IF NOT EXISTS clinic_id BIGINT NULL"
+                )
+                cur.execute(
+                    "ALTER TABLE ai_training_jobs ADD COLUMN IF NOT EXISTS promote_guardrail_passed BOOLEAN NULL"
+                )
+                cur.execute(
+                    "ALTER TABLE ai_training_jobs ADD COLUMN IF NOT EXISTS promote_guardrail_reason TEXT NULL"
+                )
+                cur.execute(
+                    "ALTER TABLE ai_training_jobs ADD COLUMN IF NOT EXISTS audit_snapshot JSONB NULL"
                 )
                 cur.execute(
                     """
@@ -640,6 +658,9 @@ class CTPostgresStore:
         model_version: Optional[str],
         training_metrics: Dict[str, Any],
         is_deployed: bool = False,
+        promote_guardrail_passed: Optional[bool] = None,
+        promote_guardrail_reason: Optional[str] = None,
+        audit_snapshot: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Update training job with completion result."""
         self._ensure_schema()
@@ -657,6 +678,9 @@ class CTPostgresStore:
             error_message = NULL,
             small_sample_warning = %(small_sample_warning)s,
             metrics_note = %(metrics_note)s,
+            promote_guardrail_passed = %(promote_guardrail_passed)s,
+            promote_guardrail_reason = %(promote_guardrail_reason)s,
+            audit_snapshot = %(audit_snapshot)s,
             updated_at = NOW()
         WHERE training_id = %(training_id)s
         """
@@ -669,6 +693,11 @@ class CTPostgresStore:
             "is_deployed": bool(is_deployed),
             "small_sample_warning": tm.get("small_sample_warning"),
             "metrics_note": tm.get("metrics_note"),
+            "promote_guardrail_passed": promote_guardrail_passed,
+            "promote_guardrail_reason": (
+                str(promote_guardrail_reason)[:4000] if promote_guardrail_reason is not None else None
+            ),
+            "audit_snapshot": Json(audit_snapshot or {}),
         }
         with self._conn() as conn:
             with conn.cursor() as cur:
@@ -723,6 +752,9 @@ class CTPostgresStore:
             dataset_row_count,
             small_sample_warning,
             metrics_note,
+            promote_guardrail_passed,
+            promote_guardrail_reason,
+            audit_snapshot,
             clinic_id
         FROM ai_training_jobs
         WHERE training_id = %(training_id)s
@@ -765,6 +797,9 @@ class CTPostgresStore:
             dataset_row_count,
             small_sample_warning,
             metrics_note,
+            promote_guardrail_passed,
+            promote_guardrail_reason,
+            audit_snapshot,
             clinic_id
         FROM ai_training_jobs
         {where}
@@ -921,6 +956,9 @@ class TrainingStatus(BaseModel):
     error_message: Optional[str]
     small_sample_warning: Optional[bool] = None
     metrics_note: Optional[str] = None
+    promote_guardrail_passed: Optional[bool] = None
+    promote_guardrail_reason: Optional[str] = None
+    audit_snapshot: Optional[Dict[str, Any]] = None
 
 
 class TrainingPolicyUpdate(BaseModel):
@@ -1070,6 +1108,98 @@ def _refresh_training_metrics() -> None:
     except Exception as e:
         logger.warning("refresh training metrics failed: %s", e)
         return
+
+
+def _safe_float(v: Any) -> Optional[float]:
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_validation_f1_for_version(model_version: Optional[str], clinic_key: Optional[str]) -> Optional[float]:
+    if not model_version:
+        return None
+    try:
+        model_dir = resolve_model_dir(model_version, clinic_key)
+        metrics_path = os.path.join(model_dir, "metrics.json")
+        if not os.path.exists(metrics_path):
+            return None
+        with open(metrics_path, "r", encoding="utf-8") as f:
+            metrics = json.load(f) or {}
+        return _safe_float(metrics.get("validation_f1"))
+    except Exception:
+        return None
+
+
+def _build_feedback_audit_snapshot(
+    feedback_rows: List[Dict[str, Any]],
+    *,
+    training_window_days: int,
+    clinic_key: Optional[str],
+) -> Dict[str, Any]:
+    accept = 0
+    reject = 0
+    for row in feedback_rows or []:
+        if row.get("is_correct") is True:
+            accept += 1
+        elif row.get("is_correct") is False:
+            reject += 1
+    total = int(len(feedback_rows or []))
+    return {
+        "scope": "clinic" if clinic_key is not None else "global",
+        "clinic_id": clinic_key,
+        "training_window_days": int(training_window_days),
+        "eligible_feedback_total": total,
+        "feedback_accept_count": int(accept),
+        "feedback_reject_count": int(reject),
+        "feedback_accept_ratio": (float(accept) / float(total)) if total > 0 else 0.0,
+    }
+
+
+def _evaluate_promote_guardrail(
+    *,
+    training_metrics: Dict[str, Any],
+    previous_model_version: Optional[str],
+    clinic_key: Optional[str],
+) -> tuple[bool, str, Dict[str, Any]]:
+    tm = training_metrics or {}
+    n_samples = int(tm.get("n_samples") or 0)
+    new_f1 = _safe_float(tm.get("validation_f1"))
+    base_f1 = _read_validation_f1_for_version(previous_model_version, clinic_key)
+
+    checks: List[str] = []
+    if n_samples < PROMOTE_MIN_SAMPLES:
+        checks.append(f"n_samples={n_samples} < PROMOTE_MIN_SAMPLES={PROMOTE_MIN_SAMPLES}")
+
+    f1_delta: Optional[float] = None
+    if new_f1 is None:
+        checks.append("validation_f1 is missing")
+    elif base_f1 is not None:
+        f1_delta = float(new_f1 - base_f1)
+        if f1_delta < PROMOTE_MIN_VALIDATION_F1_DELTA:
+            checks.append(
+                f"validation_f1_delta={f1_delta:.4f} < PROMOTE_MIN_VALIDATION_F1_DELTA={PROMOTE_MIN_VALIDATION_F1_DELTA:.4f}"
+            )
+    elif PROMOTE_REQUIRE_BASELINE_METRIC:
+        checks.append("baseline validation_f1 is missing")
+
+    passed = len(checks) == 0
+    reason = "passed" if passed else "; ".join(checks)
+    details = {
+        "passed": passed,
+        "reason": reason,
+        "n_samples": n_samples,
+        "new_validation_f1": new_f1,
+        "baseline_validation_f1": base_f1,
+        "validation_f1_delta": f1_delta,
+        "promote_min_samples": PROMOTE_MIN_SAMPLES,
+        "promote_min_validation_f1_delta": PROMOTE_MIN_VALIDATION_F1_DELTA,
+        "promote_require_baseline_metric": PROMOTE_REQUIRE_BASELINE_METRIC,
+    }
+    return passed, reason, details
 
 async def count_eligible_feedback(days: Optional[int] = None, clinic_id: Optional[str] = None) -> int:
     """Count eligible feedback in the last N days (optionally for one clinic's prediction logs)."""
@@ -1267,8 +1397,9 @@ async def execute_actual_training(training_id: int, training_mode: str):
             # Optional: dedicated node group + Job (needs ALLOW_EKS_HYBRID_TRAINING=true and full infra)
             result = await run_eks_training(training_id)
         else:
-            # Same sklearn/MLflow pipeline as local — runs inside FastAPI pod (EKS or docker-compose)
-            result = execute_training(
+            # Run CPU-bound training in a worker thread so FastAPI can still serve /predict concurrently.
+            result = await asyncio.to_thread(
+                execute_training,
                 current_feedback,
                 current_predictions,
                 "local",
@@ -1289,13 +1420,41 @@ async def execute_actual_training(training_id: int, training_mode: str):
                 pass
             tm = result.get("training_metrics") or {}
             model_version = result.get("model_version")
+            previous_model_version: Optional[str] = None
+            try:
+                if clinic_key is not None:
+                    from ai_service.model_registry import get_active_model_for_clinic
+
+                    prev_active = get_active_model_for_clinic(clinic_key)
+                else:
+                    from ai_service.model_registry import get_active_model
+
+                    prev_active = get_active_model()
+                previous_model_version = prev_active.model_version if prev_active else None
+            except Exception:
+                previous_model_version = None
+
+            audit_snapshot = _build_feedback_audit_snapshot(
+                current_feedback,
+                training_window_days=TRAINING_WINDOW_DAYS,
+                clinic_key=clinic_key,
+            )
+            guardrail_passed, guardrail_reason, guardrail_details = _evaluate_promote_guardrail(
+                training_metrics=tm,
+                previous_model_version=previous_model_version,
+                clinic_key=clinic_key,
+            )
+            audit_snapshot["promote_guardrail"] = guardrail_details
 
             # Persist completion status for UI & restart safety.
             ct_store.update_training_job_completed(
                 training_id,
                 model_version=model_version,
                 training_metrics=tm,
-                is_deployed=True,
+                is_deployed=guardrail_passed,
+                promote_guardrail_passed=guardrail_passed,
+                promote_guardrail_reason=guardrail_reason,
+                audit_snapshot=audit_snapshot,
             )
 
             if training_id in training_jobs:
@@ -1307,14 +1466,17 @@ async def execute_actual_training(training_id: int, training_mode: str):
                     "training_accuracy": tm.get("training_accuracy"),
                     "validation_accuracy": tm.get("validation_accuracy"),
                     "f1_score": tm.get("validation_f1"),
-                    "is_deployed": True,
+                    "is_deployed": guardrail_passed,
                     "small_sample_warning": tm.get("small_sample_warning"),
                     "metrics_note": tm.get("metrics_note"),
+                    "promote_guardrail_passed": guardrail_passed,
+                    "promote_guardrail_reason": guardrail_reason,
+                    "audit_snapshot": audit_snapshot,
                 })
 
             # Promote new model: global default or per-clinic pin when clinic_id was set on the job.
             try:
-                if model_version:
+                if model_version and guardrail_passed:
                     if clinic_key is not None:
                         from ai_service.model_registry import set_clinic_active_model
                         from ai_service.main import clear_artifact_cache
@@ -1344,6 +1506,12 @@ async def execute_actual_training(training_id: int, training_mode: str):
                             model_version,
                             training_id,
                         )
+                elif model_version:
+                    logger.warning(
+                        "Skip promote for training job %s due to guardrail: %s",
+                        training_id,
+                        guardrail_reason,
+                    )
             except Exception as e:
                 try:
                     inc_model_reload("clinic" if clinic_key is not None else "global", "error")
@@ -1412,7 +1580,9 @@ async def execute_bootstrap_training(
             clinic_key,
             len(feedback_rows),
         )
-        result = execute_training(
+        # Bootstrap train is also CPU-bound; offload to thread to avoid blocking inference endpoints.
+        result = await asyncio.to_thread(
+            execute_training,
             feedback_rows,
             prediction_rows,
             "local",
@@ -1425,12 +1595,40 @@ async def execute_bootstrap_training(
         if result.get("status") == "completed":
             tm = result.get("training_metrics") or {}
             model_version = result.get("model_version")
+            previous_model_version: Optional[str] = None
+            try:
+                if clinic_key is not None:
+                    from ai_service.model_registry import get_active_model_for_clinic
+
+                    prev_active = get_active_model_for_clinic(clinic_key)
+                else:
+                    from ai_service.model_registry import get_active_model
+
+                    prev_active = get_active_model()
+                previous_model_version = prev_active.model_version if prev_active else None
+            except Exception:
+                previous_model_version = None
+
+            audit_snapshot = _build_feedback_audit_snapshot(
+                feedback_rows,
+                training_window_days=TRAINING_WINDOW_DAYS,
+                clinic_key=clinic_key,
+            )
+            guardrail_passed, guardrail_reason, guardrail_details = _evaluate_promote_guardrail(
+                training_metrics=tm,
+                previous_model_version=previous_model_version,
+                clinic_key=clinic_key,
+            )
+            audit_snapshot["promote_guardrail"] = guardrail_details
 
             ct_store.update_training_job_completed(
                 training_id,
                 model_version=model_version,
                 training_metrics=tm,
-                is_deployed=True,
+                is_deployed=guardrail_passed,
+                promote_guardrail_passed=guardrail_passed,
+                promote_guardrail_reason=guardrail_reason,
+                audit_snapshot=audit_snapshot,
             )
 
             if training_id in training_jobs:
@@ -1442,14 +1640,17 @@ async def execute_bootstrap_training(
                         "training_accuracy": tm.get("training_accuracy"),
                         "validation_accuracy": tm.get("validation_accuracy"),
                         "f1_score": tm.get("validation_f1"),
-                        "is_deployed": True,
+                        "is_deployed": guardrail_passed,
                         "small_sample_warning": tm.get("small_sample_warning"),
                         "metrics_note": tm.get("metrics_note"),
+                        "promote_guardrail_passed": guardrail_passed,
+                        "promote_guardrail_reason": guardrail_reason,
+                        "audit_snapshot": audit_snapshot,
                     }
                 )
 
             try:
-                if model_version:
+                if model_version and guardrail_passed:
                     if clinic_key is not None:
                         from ai_service.model_registry import set_clinic_active_model
                         from ai_service.main import clear_artifact_cache
@@ -1471,6 +1672,12 @@ async def execute_bootstrap_training(
                             model_version,
                             training_id,
                         )
+                elif model_version:
+                    logger.warning(
+                        "Skip promote for bootstrap training job %s due to guardrail: %s",
+                        training_id,
+                        guardrail_reason,
+                    )
             except Exception as e:
                 logger.warning("Failed to set active model after bootstrap training: %s", e)
 
