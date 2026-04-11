@@ -570,7 +570,7 @@ class CTPostgresStore:
         return {"predictions": p, "feedback": f}
 
     def clear_feedback(self, clinic_id: Optional[str] = None) -> int:
-        """After global training: delete GLOBAL pool only. After clinic training: delete CLINIC_ONLY for that clinic."""
+        """Hard-delete feedback (admin reset). Same scope as consume_feedback_after_training."""
         self._ensure_schema()
         with self._conn() as conn:
             with conn.cursor() as cur:
@@ -582,6 +582,34 @@ class CTPostgresStore:
                         DELETE FROM ai_feedback f
                         USING ai_prediction_logs p
                         WHERE f.prediction_id = p.id AND p.clinic_id = %s AND f.training_pool = 'CLINIC_ONLY'
+                        """,
+                        (clinic_id,),
+                    )
+                n = cur.rowcount
+            conn.commit()
+        return int(n)
+
+    def consume_feedback_after_training(self, clinic_id: Optional[str] = None) -> int:
+        """After successful training: mark feedback ineligible so it is not re-used, but keep rows for metrics/audit."""
+        self._ensure_schema()
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                if clinic_id is None:
+                    cur.execute(
+                        """
+                        UPDATE ai_feedback
+                        SET is_training_eligible = FALSE
+                        WHERE training_pool = 'GLOBAL' AND is_training_eligible = TRUE
+                        """
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE ai_feedback f
+                        SET is_training_eligible = FALSE
+                        FROM ai_prediction_logs p
+                        WHERE f.prediction_id = p.id AND p.clinic_id = %s AND f.training_pool = 'CLINIC_ONLY'
+                          AND f.is_training_eligible = TRUE
                         """,
                         (clinic_id,),
                     )
@@ -910,14 +938,20 @@ class DoctorFeedback(BaseModel):
     @model_validator(mode="after")
     def _validate_feedback_consistency(self) -> "DoctorFeedback":
         if not self.final_diagnosis:
-            raise ValueError("final_diagnosis is required")
+            raise ValueError("final_diagnosis is required.")
         # Khi client gửi kèm ai_diagnosis, validate nhất quán accept/reject ngay tại schema.
         if self.ai_diagnosis:
             same = self.final_diagnosis.lower() == self.ai_diagnosis.lower()
             if self.is_correct and not same:
-                raise ValueError("is_correct=true requires final_diagnosis == ai_diagnosis")
+                raise ValueError(
+                    "Invalid accept: final_diagnosis must equal ai_diagnosis. "
+                    "Send is_correct=false with a different diagnosis if you disagree."
+                )
             if (not self.is_correct) and same:
-                raise ValueError("is_correct=false requires final_diagnosis != ai_diagnosis")
+                raise ValueError(
+                    "Invalid reject: final_diagnosis equals ai_diagnosis. "
+                    "Choose a different diagnosis or set is_correct=true if you agree with the AI."
+                )
         return self
 
 class TrainingTriggerRequest(BaseModel):
@@ -1029,9 +1063,15 @@ async def save_feedback(feedback: DoctorFeedback) -> bool:
     if ai_diag_effective:
         same = str(feedback.final_diagnosis).strip().lower() == str(ai_diag_effective).strip().lower()
         if feedback.is_correct and not same:
-            raise ValueError("Invalid feedback: is_correct=true but final_diagnosis differs from AI diagnosis")
+            raise ValueError(
+                "Invalid accept: final_diagnosis differs from the stored AI diagnosis. "
+                "Use reject if you disagree with the AI."
+            )
         if (not feedback.is_correct) and same:
-            raise ValueError("Invalid feedback: is_correct=false but final_diagnosis equals AI diagnosis")
+            raise ValueError(
+                "Invalid reject: final_diagnosis equals the AI diagnosis. "
+                "Choose a different diagnosis or accept if you agree with the AI."
+            )
 
     pred_clinic = ct_store.get_clinic_id_for_prediction(feedback.prediction_id)
     pool = resolve_training_pool_for_feedback(pred_clinic, feedback.training_pool)
@@ -1080,8 +1120,12 @@ logger.info("Production-ready continuous training system initialized")
 _predictions_logged_total = Counter("vetai_predictions_logged_total", "Total predictions logged for continuous training")
 _feedback_saved_total = Counter("vetai_feedback_saved_total", "Total feedback entries saved")
 _eligible_feedback_gauge = Gauge("vetai_feedback_eligible_count", "Eligible feedback count for training")
-_feedback_accept_gauge = Gauge("vetai_feedback_accept_current", "Current total accept feedback in DB")
-_feedback_reject_gauge = Gauge("vetai_feedback_reject_current", "Current total reject feedback in DB")
+_feedback_accept_gauge = Gauge(
+    "vetai_feedback_accept_current", "Total accept feedback rows in DB (includes consumed / ineligible)"
+)
+_feedback_reject_gauge = Gauge(
+    "vetai_feedback_reject_current", "Total reject feedback rows in DB (includes consumed / ineligible)"
+)
 _training_jobs_gauge = Gauge("vetai_training_jobs", "Training jobs by status", ["status"])
 _training_last_success_timestamp = Gauge("vetai_training_last_success_timestamp_seconds", "Last successful training time (unix seconds)")
 
@@ -1519,9 +1563,9 @@ async def execute_actual_training(training_id: int, training_mode: str):
                     pass
                 logger.warning("Failed to set active model after training: %s", e)
 
-            # Reset feedback rows after successful training to prevent immediate retraining on same batch.
-            cleared = ct_store.clear_feedback(clinic_id=clinic_key)
-            logger.info("Feedback data reset after training completion. Cleared count: %s", cleared)
+            # Mark feedback ineligible after successful training (same batch is not re-fed); keep rows for dashboards.
+            consumed = ct_store.consume_feedback_after_training(clinic_id=clinic_key)
+            logger.info("Feedback marked consumed after training completion. Updated rows: %s", consumed)
 
             logger.info(f"Training {training_id} completed successfully!")
             _refresh_training_metrics()
