@@ -69,6 +69,19 @@ pip install "python-multipart>=0.0.20"
 
 ## Configuration (environment variables)
 
+### Environment files in this repository
+
+| File | Purpose | Loaded automatically? |
+|------|---------|---------------------|
+| **`.env.example`** | **Committed template.** Safe defaults and comments. Copy this to start. | No — documentation only |
+| **`.env.local`** | **Personal dev** (gitignored). Your real `DATABASE_URL`, `ADMIN_TOKEN`, ports for **uvicorn on the host**. | No — Python does not load dotenv unless you use `python-dotenv` or export manually |
+| **`.env.training`** | **Optional tuning** for `training_engine.py` (tree sizes, split ratios, quality thresholds). | No — use `set -a; source .env.training; set +a` or `--env-file` when running training jobs / workers |
+| **`.env.production`** | **Reference** for container/K8s-style URLs (`postgres`, `mlflow` hostnames). Align with **`vet-infra/.env`** in deployment. | No — same as above |
+
+In Docker, **`vet-microservices`** Compose usually injects variables via **`../vet-infra/.env`** for the `vet-ai` service — not from these files unless you wire them yourself.
+
+Start from **`.env.example`** in this repo (Option A = host, Option B = Docker DNS). Copy to **`.env.local`** or merge into **`vet-infra/.env`** when using `vet-microservices` Compose.
+
 Below are the most important variables. Training and ML code honor many more (split ratios, gates, fine-tuning) — see `ai_service/training_engine.py` and `ai_service/continuous_training.py`.
 
 | Variable | Purpose |
