@@ -1403,6 +1403,22 @@ def _annotate_small_sample_metrics(training_metrics: Dict[str, Any]) -> None:
         )
 
 
+def _annotate_accept_only_feedback_metrics(
+    eligible_feedback: List[Dict[str, Any]],
+    training_metrics: Dict[str, Any],
+) -> None:
+    """When every row is accept, we never add reject/contrastive training rows — val metrics can look optimistic."""
+    n_reject = sum(1 for f in (eligible_feedback or []) if f.get("is_correct") is False)
+    if n_reject > 0:
+        return
+    note = (
+        "All feedback has is_correct=true: no reject/contrastive rows are added to the training set; "
+        "holdout accuracy/F1 can look very high versus production with mixed accepts and rejects."
+    )
+    prev = training_metrics.get("metrics_note")
+    training_metrics["metrics_note"] = f"{prev} {note}".strip() if prev else note
+
+
 def _derive_split_random_state(
     *,
     training_id: Optional[int],
@@ -1518,6 +1534,7 @@ def execute_training(
             training_metrics["finetune"] = False
 
         _annotate_small_sample_metrics(training_metrics)
+        _annotate_accept_only_feedback_metrics(eligible_feedback_data, training_metrics)
         if clinic_key is not None:
             training_metrics["clinic_id"] = clinic_key
         

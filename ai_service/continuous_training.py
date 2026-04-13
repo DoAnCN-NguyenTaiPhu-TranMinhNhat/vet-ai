@@ -981,6 +981,9 @@ class TrainingStatus(BaseModel):
     end_time: Optional[datetime]
     total_predictions: int
     eligible_feedback_count: int
+    # bootstrap_csv: eligible_feedback_count = CSV rows; total_predictions = Postgres predictions at job start.
+    trigger_type: Optional[str] = None
+    dataset_row_count: Optional[int] = None
     previous_model_version: Optional[str]
     new_model_version: Optional[str]
     training_accuracy: Optional[float]
@@ -1483,6 +1486,10 @@ async def execute_actual_training(training_id: int, training_mode: str):
                 training_window_days=TRAINING_WINDOW_DAYS,
                 clinic_key=clinic_key,
             )
+            audit_snapshot["dataset_source"] = "postgres"
+            audit_snapshot["training_compute"] = (
+                "eks_batch_job" if effective_mode == "eks_hybrid" else "fastapi_in_process"
+            )
             guardrail_passed, guardrail_reason, guardrail_details = _evaluate_promote_guardrail(
                 training_metrics=tm,
                 previous_model_version=previous_model_version,
@@ -1658,6 +1665,10 @@ async def execute_bootstrap_training(
                 training_window_days=TRAINING_WINDOW_DAYS,
                 clinic_key=clinic_key,
             )
+            job_meta = ct_store.get_training_job(training_id) or {}
+            audit_snapshot["dataset_kind"] = "bootstrap_csv_upload"
+            audit_snapshot["bootstrap_csv_rows"] = int(len(feedback_rows))
+            audit_snapshot["postgres_predictions_in_scope"] = int(job_meta.get("total_predictions") or 0)
             guardrail_passed, guardrail_reason, guardrail_details = _evaluate_promote_guardrail(
                 training_metrics=tm,
                 previous_model_version=previous_model_version,
@@ -1829,7 +1840,13 @@ async def run_training_job_on_eks(training_id: int) -> Dict[str, Any]:
         # Load kubernetes config
         config.load_kube_config()
         k8s_client = client.CoreV1Api()
-        
+
+        job_row = ct_store.get_training_job(training_id) or {}
+        clinic_id_env = ""
+        raw_job_clinic = job_row.get("clinic_id")
+        if raw_job_clinic is not None and str(raw_job_clinic).strip():
+            clinic_id_env = str(raw_job_clinic).strip()
+
         # Create training job manifest
         job_manifest = {
             "apiVersion": "batch/v1",
@@ -1848,6 +1865,7 @@ async def run_training_job_on_eks(training_id: int) -> Dict[str, Any]:
                                 {"name": "TRAINING_ID", "value": str(training_id)},
                                 {"name": "DATA_SOURCE", "value": "postgres"},
                                 {"name": "DATABASE_URL", "value": os.getenv("DATABASE_URL", "")},
+                                {"name": "TRAINING_CLINIC_ID", "value": clinic_id_env},
                                 {"name": "TRAINING_WINDOW_DAYS", "value": str(TRAINING_WINDOW_DAYS)},
                                 {"name": "MLFLOW_TRACKING_URI", "value": os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")},
                                 {"name": "TRAINING_MIN_UNIQUE_CLASSES", "value": os.getenv("TRAINING_MIN_UNIQUE_CLASSES", "2")},
@@ -1974,6 +1992,8 @@ async def get_training_status(training_id: int) -> Optional[TrainingStatus]:
             end_time=job_data.get("end_time"),
             total_predictions=job_data.get("total_predictions", 0),
             eligible_feedback_count=job_data.get("eligible_feedback_count", 0),
+            trigger_type=job_data.get("trigger_type"),
+            dataset_row_count=job_data.get("dataset_row_count"),
             previous_model_version=job_data.get("previous_model_version"),
             new_model_version=job_data.get("new_model_version"),
             training_accuracy=job_data.get("training_accuracy"),
@@ -1983,6 +2003,9 @@ async def get_training_status(training_id: int) -> Optional[TrainingStatus]:
             error_message=job_data.get("error_message"),
             small_sample_warning=job_data.get("small_sample_warning"),
             metrics_note=job_data.get("metrics_note"),
+            promote_guardrail_passed=job_data.get("promote_guardrail_passed"),
+            promote_guardrail_reason=job_data.get("promote_guardrail_reason"),
+            audit_snapshot=job_data.get("audit_snapshot"),
         )
 
     # Return default pending status for unknown jobs
@@ -1993,6 +2016,8 @@ async def get_training_status(training_id: int) -> Optional[TrainingStatus]:
         end_time=None,
         total_predictions=ct_store.count_predictions(),
         eligible_feedback_count=ct_store.count_feedback(eligible_only=True, days=TRAINING_WINDOW_DAYS),
+        trigger_type=None,
+        dataset_row_count=None,
         previous_model_version="v2.0",
         new_model_version=None,
         training_accuracy=None,
@@ -2167,6 +2192,7 @@ async def bootstrap_csv_training_endpoint(
         tm = (training_mode or "local").strip() or "local"
 
         dataset_rows = build_training_dataset_snapshot(fb_rows, pred_rows)
+        # eligible_feedback_count here stores len(CSV), not ct_store.count_feedback (Postgres unchanged).
         training_id = ct_store.create_training_job(
             status="running",
             total_predictions=ct_store.count_predictions(clinic_id=ck),

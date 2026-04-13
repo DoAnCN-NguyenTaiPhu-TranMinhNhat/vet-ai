@@ -63,65 +63,115 @@ def load_training_data_from_files() -> tuple:
         raise
 
 
+def _training_clinic_id_from_env() -> str | None:
+    """Same scope as FastAPI continuous_training: None = global pool; UUID = clinic CLINIC_ONLY."""
+    raw = os.getenv("TRAINING_CLINIC_ID", "").strip()
+    return raw if raw else None
+
+
 def load_training_data_from_postgres() -> tuple:
-    """Load training data directly from PostgreSQL (Pha A)."""
+    """Load training data from PostgreSQL — same filters as CTPostgresStore (not whole-table dump)."""
     dsn = os.getenv("DATABASE_URL")
     if not dsn or not str(dsn).strip():
         raise RuntimeError("DATABASE_URL is not configured for training worker")
 
     days = int(os.getenv("TRAINING_WINDOW_DAYS", "30"))
+    clinic_id = _training_clinic_id_from_env()
     conn = psycopg2.connect(dsn, cursor_factory=RealDictCursor)
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    prediction_id,
-                    final_diagnosis,
-                    is_correct,
-                    ai_diagnosis,
-                    confidence_rating,
-                    comments,
-                    veterinarian_id,
-                    is_training_eligible,
-                    data_quality_score,
-                    created_at AS timestamp
-                FROM ai_feedback
-                WHERE is_training_eligible = TRUE
-                  AND created_at >= NOW() - (%s || ' days')::INTERVAL
-                ORDER BY created_at ASC
-                """,
-                (days,),
-            )
-            feedback_data = cur.fetchall()
+        fb_cols = """
+                f.prediction_id AS prediction_id,
+                f.final_diagnosis,
+                f.is_correct,
+                f.ai_diagnosis,
+                f.confidence_rating,
+                f.comments,
+                f.veterinarian_id,
+                f.is_training_eligible,
+                f.data_quality_score,
+                f.created_at AS timestamp
+        """
+        if clinic_id is None:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT {fb_cols}
+                    FROM ai_feedback f
+                    WHERE f.training_pool = 'GLOBAL'
+                      AND f.is_training_eligible = TRUE
+                      AND f.created_at >= NOW() - (%s || ' days')::INTERVAL
+                    ORDER BY f.created_at ASC
+                    """,
+                    (days,),
+                )
+                feedback_data = cur.fetchall()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        id,
+                        visit_id,
+                        pet_id,
+                        prediction_input,
+                        prediction_output,
+                        model_version,
+                        confidence_score,
+                        top_k_predictions,
+                        veterinarian_id,
+                        clinic_id,
+                        created_at
+                    FROM ai_prediction_logs
+                    ORDER BY created_at ASC
+                    """
+                )
+                prediction_logs = cur.fetchall()
+        else:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT {fb_cols}
+                    FROM ai_feedback f
+                    INNER JOIN ai_prediction_logs p ON f.prediction_id = p.id
+                    WHERE p.clinic_id = %s
+                      AND f.training_pool = 'CLINIC_ONLY'
+                      AND f.is_training_eligible = TRUE
+                      AND f.created_at >= NOW() - (%s || ' days')::INTERVAL
+                    ORDER BY f.created_at ASC
+                    """,
+                    (clinic_id, days),
+                )
+                feedback_data = cur.fetchall()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        id,
+                        visit_id,
+                        pet_id,
+                        prediction_input,
+                        prediction_output,
+                        model_version,
+                        confidence_score,
+                        top_k_predictions,
+                        veterinarian_id,
+                        clinic_id,
+                        created_at
+                    FROM ai_prediction_logs
+                    WHERE clinic_id = %s
+                    ORDER BY created_at ASC
+                    """,
+                    (clinic_id,),
+                )
+                prediction_logs = cur.fetchall()
 
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    id,
-                    visit_id,
-                    pet_id,
-                    prediction_input,
-                    prediction_output,
-                    model_version,
-                    confidence_score,
-                    top_k_predictions,
-                    veterinarian_id,
-                    clinic_id,
-                    created_at
-                FROM ai_prediction_logs
-                ORDER BY created_at ASC
-                """
-            )
-            prediction_logs = cur.fetchall()
-
+        scope = f"clinic_id={clinic_id}" if clinic_id else "global_pool=GLOBAL"
         logger.info(
-            "Loaded %d eligible feedback and %d predictions from PostgreSQL",
+            "Loaded %d eligible feedback and %d predictions from PostgreSQL (%s, window_days=%s)",
             len(feedback_data),
             len(prediction_logs),
+            scope,
+            days,
         )
-        # RealDictCursor already returns dict-like rows
         return [dict(r) for r in feedback_data], [dict(r) for r in prediction_logs]
     finally:
         conn.close()
@@ -188,11 +238,6 @@ def _update_training_job_failed(conn, training_id: int, *, error_message: str) -
     conn.commit()
 
 
-def _clear_feedback_postgres(conn) -> None:
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM ai_feedback")
-    conn.commit()
-
 def main():
     """Main training execution function"""
     training_id = os.getenv('TRAINING_ID', 'unknown')
@@ -212,21 +257,24 @@ def main():
             feedback_data, prediction_logs = load_training_data_from_files()
         else:
             feedback_data, prediction_logs = load_training_data_from_postgres()
-        
-        # Validate data
-        if not feedback_data or not prediction_logs:
-            raise ValueError("No training data available")
-        
+
+        if not feedback_data:
+            raise ValueError("No eligible feedback rows for this training scope (check TRAINING_CLINIC_ID / pool).")
+        if not prediction_logs:
+            raise ValueError("No prediction logs for this training scope")
+
         # Execute training
         logger.info(f"Executing training with {len(feedback_data)} samples")
         try:
             tw = int(os.getenv("TRAINING_WINDOW_DAYS", "30"))
         except (TypeError, ValueError):
             tw = 30
+        clinic_for_train = _training_clinic_id_from_env()
         result = execute_training(
             feedback_data,
             prediction_logs,
             "eks_hybrid",
+            clinic_id=clinic_for_train,
             training_id=int(training_id) if str(training_id).strip().isdigit() else None,
             dataset_window_days=tw,
             pipeline_kind="eks_hybrid_job",
@@ -247,7 +295,7 @@ def main():
                         model_version=model_version,
                         training_metrics=tm,
                     )
-                    _clear_feedback_postgres(conn)
+                    # Do not DELETE/MARK feedback here — FastAPI orchestrator applies consume_feedback_after_training.
                 else:
                     _update_training_job_failed(
                         conn,
