@@ -73,14 +73,12 @@ pip install "python-multipart>=0.0.20"
 
 | File | Purpose | Loaded automatically? |
 |------|---------|---------------------|
-| **`.env.example`** | **Committed template.** Safe defaults and comments. Copy this to start. | No — documentation only |
-| **`.env.local`** | **Personal dev** (gitignored). Your real `DATABASE_URL`, `ADMIN_TOKEN`, ports for **uvicorn on the host**. | No — Python does not load dotenv unless you use `python-dotenv` or export manually |
-| **`.env.training`** | **Optional tuning** for `training_engine.py` (tree sizes, split ratios, quality thresholds). | No — use `set -a; source .env.training; set +a` or `--env-file` when running training jobs / workers |
-| **`.env.production`** | **Reference** for container/K8s-style URLs (`postgres`, `mlflow` hostnames). Align with **`vet-infra/.env`** in deployment. | No — same as above |
+| **`.env.exemple`** | **Committed template.** Full variable set and defaults. | No — template only |
+| **`.env.local`** | **Local runtime file** (gitignored). Use this for local `uvicorn` / scripts. | No — load with `source` or inject in your shell |
 
 In Docker, **`vet-microservices`** Compose usually injects variables via **`../vet-infra/.env`** for the `vet-ai` service — not from these files unless you wire them yourself.
 
-Start from **`.env.example`** in this repo (Option A = host, Option B = Docker DNS). Copy to **`.env.local`** or merge into **`vet-infra/.env`** when using `vet-microservices` Compose.
+Start from **`.env.exemple`** in this repo. Copy values into **`.env.local`** for local runs, or merge needed keys into **`vet-infra/.env`** when using `vet-microservices` Compose.
 
 Below are the most important variables. Training and ML code honor many more (split ratios, gates, fine-tuning) — see `ai_service/training_engine.py` and `ai_service/continuous_training.py`.
 
@@ -95,24 +93,6 @@ Below are the most important variables. Training and ML code honor many more (sp
 | `ALLOW_EKS_HYBRID_TRAINING` | Set to `true` to run training as a separate K8s job from the API (advanced). |
 
 JWT / external LLM keys are **not** required for core Vet-AI behavior; those belong to optional Java **GenAI chat** features in `vet-microservices`, not this service.
-
----
-
-## Running locally
-
-From the repository root (so imports resolve):
-
-```bash
-export DATABASE_URL="postgresql://user:pass@localhost:5432/yourdb"
-export ADMIN_TOKEN="your-secret-token"
-export MLFLOW_TRACKING_URI="http://localhost:5000"
-
-uvicorn ai_service.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-- Health: `GET http://localhost:8000/health`
-- Docs: `GET http://localhost:8000/docs`
-- Metrics: `GET http://localhost:8000/metrics`
 
 ---
 
