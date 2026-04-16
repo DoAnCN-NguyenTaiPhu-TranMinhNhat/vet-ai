@@ -12,10 +12,32 @@ Vet-AI exposes a REST API consumed by the Spring **genai-service** (and similar 
 |--------|-------------|
 | Inference | `POST /predict` — symptoms and visit features → ranked diagnoses |
 | Feedback | `POST /continuous-training/feedback` — accept/reject + final diagnosis for training |
-| Training | In-process or **EKS/K8s** job (`train_eks.py`) — see `Dockerfile.training` |
+| Training | In-process or **EKS/K8s** job (`scripts/train_eks.py`) — see `docker/Dockerfile.training` |
 | Registry | Active model pins, MLflow runs, optional champion/challenger under `/mlops/v2` |
 
 OpenAPI docs: **`GET /docs`** (Swagger UI) when the app is running.
+
+---
+
+## Repository layout
+
+```text
+vet-ai/
+├── ai_service/               # FastAPI app + MLOps modules
+├── docker/                   # Compose manifests (dev/prod)
+├── docs/                     # Architecture, deployment, local dev docs
+├── env/                      # Environment templates
+├── scripts/                  # Training and helper scripts
+├── monitoring/               # Monitoring assets
+├── docker/
+│   ├── Dockerfile.api
+│   └── Dockerfile.training
+└── pyproject.toml
+```
+
+- Dev compose: `docker/compose.dev.yml`
+- Prod compose: `docker/compose.prod.yml`
+- Env template: `env/.env.example`
 
 ---
 
@@ -51,10 +73,10 @@ DACN/
 
 ## Requirements
 
-- **Python 3.11** (see `Dockerfile`)
+- **Python 3.11** (see `docker/Dockerfile.api`)
 - **PostgreSQL** for continuous training / feedback (same DB can be shared with MLflow in dev; production often uses separate DB/schema)
 - **MLflow** server (optional but recommended for experiment tracking)
-- **Docker** or **Podman** (optional) — images: `Dockerfile`, `Dockerfile.training`
+- **Docker** or **Podman** (optional) — images: `docker/Dockerfile.api`, `docker/Dockerfile.training`
 
 Install dependencies:
 
@@ -73,12 +95,12 @@ pip install "python-multipart>=0.0.20"
 
 | File | Purpose | Loaded automatically? |
 |------|---------|---------------------|
-| **`.env.exemple`** | **Committed template.** Full variable set and defaults. | No — template only |
+| **`env/.env.example`** | **Committed template.** Full variable set and defaults. | No — template only |
 | **`.env.local`** | **Local runtime file** (gitignored). Use this for local `uvicorn` / scripts. | No — load with `source` or inject in your shell |
 
 In Docker, **`vet-microservices`** Compose usually injects variables via **`../vet-infra/.env`** for the `vet-ai` service — not from these files unless you wire them yourself.
 
-Start from **`.env.exemple`** in this repo. Copy values into **`.env.local`** for local runs, or merge needed keys into **`vet-infra/.env`** when using `vet-microservices` Compose.
+Start from **`env/.env.example`** in this repo. Copy values into **`.env.local`** for local runs, or merge needed keys into **`vet-infra/.env`** when using `vet-microservices` Compose.
 
 Below are the most important variables. Training and ML code honor many more (split ratios, gates, fine-tuning) — see `ai_service/training_engine.py` and `ai_service/continuous_training.py`.
 
@@ -98,10 +120,10 @@ JWT / external LLM keys are **not** required for core Vet-AI behavior; those bel
 
 ## Docker
 
-**API image** (`Dockerfile`):
+**API image** (`docker/Dockerfile.api`):
 
 ```bash
-docker build -t vet-ai:latest .
+docker build -t vet-ai:latest -f docker/Dockerfile.api .
 docker run --rm -p 8000:8000 \
   -e DATABASE_URL=postgresql://... \
   -e ADMIN_TOKEN=... \
@@ -109,7 +131,7 @@ docker run --rm -p 8000:8000 \
   vet-ai:latest
 ```
 
-**Training worker image** (`Dockerfile.training`) — used for CPU-heavy jobs; entrypoint scripts include `train_eks.py` / local training helpers.
+**Training worker image** (`docker/Dockerfile.training`) — used for CPU-heavy jobs; entrypoint scripts include `scripts/train_eks.py` / local training helpers.
 
 In **vet-microservices**, `docker-compose.yml` usually builds this repo as service `vet-ai` and sets env from `../vet-infra/.env`. See that repository’s README for ports and dependencies.
 
@@ -148,8 +170,8 @@ Authorization: Bearer <ADMIN_TOKEN>
 ## Training modes
 
 1. **In-process** — triggered via API (`/continuous-training/training/trigger`) inside the same FastAPI process (or thread pool), suitable for dev/small workloads.
-2. **EKS / Kubernetes Job** — when `ALLOW_EKS_HYBRID_TRAINING` and infrastructure are enabled; see `continuous_training.py` (`run_eks_training`) and `train_eks.py` for the worker.
-3. **Standalone script** — `train_eks.py` can run inside `Dockerfile.training` with `DATA_SOURCE=postgres` and `DATABASE_URL`.
+2. **EKS / Kubernetes Job** — when `ALLOW_EKS_HYBRID_TRAINING` and infrastructure are enabled; see `continuous_training.py` (`run_eks_training`) and `scripts/train_eks.py` for the worker.
+3. **Standalone script** — `scripts/train_eks.py` can run inside `docker/Dockerfile.training` with `DATA_SOURCE=postgres` and `DATABASE_URL`.
 
 After successful training, feedback rows are **marked consumed** (ineligible for immediate retrain) rather than deleted, so dashboards based on DB counts stay consistent.
 

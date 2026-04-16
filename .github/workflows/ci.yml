@@ -20,14 +20,14 @@ jobs:
           python-version: "3.11"
           cache: "pip"
           cache-dependency-path: |
-            ai_service/requirements.txt
+            requirements.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          echo "--- ai_service/requirements.txt ---"
-          cat ai_service/requirements.txt
-          python -m pip install -r ai_service/requirements.txt
+          echo "--- requirements.txt ---"
+          cat requirements.txt
+          python -m pip install -r requirements.txt
           # Defensive: ensure test deps exist even if requirements install/caching is incomplete
           python -m pip install pytest httpx
 
@@ -49,6 +49,4 @@ jobs:
           ls -la
           echo "--- ai_service/tests directory ---"
           ls -la tests || true
-          echo "--- pytest.ini ---"
-          cat pytest.ini || true
           python -m pytest -q tests

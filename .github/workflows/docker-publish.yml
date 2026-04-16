@@ -38,23 +38,22 @@ jobs:
 
       - name: Install dependencies
         run: |
-          cd ai_service
           pip install -r requirements.txt
 
       - name: Debug ai_service directory
         run: |
           echo "--- Repository root ---"
           ls -la
-          echo "--- ai_service folder ---"
-          ls -la ai_service/ || true
-          echo "--- Check Dockerfile existence ---"
-          test -f Dockerfile && echo "Dockerfile exists" || echo "Dockerfile NOT found"
+          echo "--- docker folder ---"
+          ls -la docker/ || true
+          echo "--- Check Dockerfile.api existence ---"
+          test -f docker/Dockerfile.api && echo "docker/Dockerfile.api exists" || echo "docker/Dockerfile.api NOT found"
 
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ./docker/Dockerfile.api
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

@@ -1,0 +1,36 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    make \
+    libopenblas-dev \
+    liblapack-dev \
+    gfortran \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+COPY requirements-training.txt .
+
+RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements-training.txt
+
+COPY ai_service/ ./ai_service/
+COPY scripts/train_eks.py ./
+COPY scripts/train_local.py ./
+
+RUN useradd --create-home --shell /bin/bash training \
+    && chown -R training:training /app
+USER training
+
+ENV PYTHONPATH=/app
+ENV MLFLOW_TRACKING_URI=${MLFLOW_TRACKING_URI:-http://mlflow:5000}
+ENV DATA_SOURCE=${DATA_SOURCE:-api}
+
+HEALTHCHECK --interval=60s --timeout=10s --start-period=40s --retries=3 \
+    CMD python -c "import sys; sys.exit(0)" || exit 1
+
+CMD ["python", "train_eks.py"]

@@ -22,7 +22,7 @@ def _configure_model_dir() -> None:
         model_dir = root / "models" / "v2"
     
     os.environ.setdefault("MODEL_DIR", str(model_dir))
-    # Avoid PermissionError when importing main → mlops_api_v2 (no /app on dev/CI runners)
+    # Avoid PermissionError for default registry path on dev/CI runners.
     os.environ.setdefault(
         "VETAI_CHAMPION_REGISTRY_PATH",
         os.path.join(tempfile.gettempdir(), "vetai-champion-registry"),
@@ -31,8 +31,8 @@ def _configure_model_dir() -> None:
 
 @pytest.fixture()
 def client() -> TestClient:
-    # Import app using absolute package path
-    from ai_service.main import app
+    # Import app from new package layout
+    from ai_service.app.main import app
 
     with TestClient(app) as c:
         yield c
