@@ -18,12 +18,14 @@ from typing import Dict, List, Tuple, Optional, Any
 try:
     from sklearn.model_selection import train_test_split, cross_val_score, RepeatedStratifiedKFold
     from sklearn.ensemble import RandomForestClassifier
+    from sklearn.calibration import CalibratedClassifierCV
     from sklearn.metrics import accuracy_score, classification_report, f1_score
     from sklearn.preprocessing import StandardScaler, OneHotEncoder
     from sklearn.preprocessing import MultiLabelBinarizer
 except ImportError:  # pragma: no cover - optional in minimal runtime
     train_test_split = cross_val_score = RepeatedStratifiedKFold = None
     RandomForestClassifier = None
+    CalibratedClassifierCV = None
     accuracy_score = classification_report = f1_score = None
     StandardScaler = OneHotEncoder = MultiLabelBinarizer = None
 from scipy import sparse
@@ -42,6 +44,47 @@ from ai_service.app.infrastructure.storage.model_store import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_feedback_timestamp(feedback: Dict, prediction: Any) -> Optional[pd.Timestamp]:
+    """Best-effort timestamp for time-aware validation (feedback time preferred)."""
+    raw = None
+    if isinstance(feedback, dict):
+        raw = feedback.get("created_at") or feedback.get("timestamp")
+    if raw is None and prediction is not None:
+        if isinstance(prediction, dict):
+            raw = prediction.get("created_at")
+        else:
+            raw = getattr(prediction, "created_at", None)
+    if raw is None:
+        return None
+    try:
+        if hasattr(raw, "timestamp"):
+            return pd.Timestamp(raw)
+        ts = pd.Timestamp(raw)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        return ts
+    except Exception:
+        return None
+
+
+def _multiclass_brier(y_true: np.ndarray, proba: np.ndarray, classes: np.ndarray) -> float:
+    """Multiclass Brier score: mean squared error between one-hot y and predicted probabilities."""
+    try:
+        cls_idx = {str(c): i for i, c in enumerate(np.asarray(classes).ravel())}
+        n = len(y_true)
+        k = len(classes)
+        y_ohe = np.zeros((n, k), dtype=float)
+        for i, lab in enumerate(np.asarray(y_true).ravel()):
+            j = cls_idx.get(str(lab))
+            if j is None:
+                continue
+            y_ohe[i, j] = 1.0
+        return float(np.mean(np.sum((y_ohe - proba) ** 2, axis=1)))
+    except Exception:
+        return float("nan")
+
 
 class ModelTrainer:
     """Real ML model training implementation"""
@@ -73,6 +116,7 @@ class ModelTrainer:
         self.mlflow_experiment_name = os.getenv("MLFLOW_EXPERIMENT_NAME", "vet-ai-continuous-training")
         self._mlflow_last_error: Optional[str] = None
         self._baseline_class_weight: Optional[Dict[str, float]] = None
+        self.calibrated_classifier: Any = None
         
         # Initialize MLflow
         try:
@@ -388,8 +432,12 @@ class ModelTrainer:
         return X, y
 
     def collect_training_data(self, feedback_data: List[Dict], 
-                            prediction_logs: List[Dict]) -> Tuple[pd.DataFrame, pd.Series, np.ndarray]:
-        """Collect and prepare training data from feedback and predictions"""
+                            prediction_logs: List[Dict]) -> Tuple[pd.DataFrame, pd.Series, np.ndarray, np.ndarray]:
+        """Collect and prepare training data from feedback and predictions.
+
+        Returns ``sample_timestamps`` as ``datetime64[ns]`` (UTC) for time-aware validation;
+        synthetic timestamps are used for core-memory / class-completion rows.
+        """
         logger.info(f"Collecting training data from {len(feedback_data)} feedback entries")
         
         training_records = []
@@ -471,25 +519,30 @@ class ModelTrainer:
             # On reject (is_correct=false): penalize the AI-suggested label (ai_label) so next time it should decrease.
             # - If final_label == ai_label: only penalize that label (no extra boost).
             # - If final_label != ai_label: boost doctor's final_label and penalize ai_label with symmetric delta.
+            row_ts = _parse_feedback_timestamp(feedback, prediction)
             if is_correct:
                 training_records.append({**features,
                                           'final_diagnosis': final_label,
-                                          'data_quality_score': pos_weight})
+                                          'data_quality_score': pos_weight,
+                                          'sample_timestamp': row_ts})
             else:
                 if ai_label is not None and final_label == ai_label:
                     training_records.append({**features,
                                               'final_diagnosis': final_label,
-                                              'data_quality_score': neg_weight})
+                                              'data_quality_score': neg_weight,
+                                              'sample_timestamp': row_ts})
                 else:
                     # Reinforce doctor's final label with the same magnitude used for accept boost
                     training_records.append({**features,
                                               'final_diagnosis': final_label,
-                                              'data_quality_score': pos_weight})
+                                              'data_quality_score': pos_weight,
+                                              'sample_timestamp': row_ts})
                     # Penalize AI label (if available)
                     if ai_label is not None and str(ai_label).strip() != "":
                         training_records.append({**features,
                                                   'final_diagnosis': ai_label,
-                                                  'data_quality_score': neg_weight})
+                                                  'data_quality_score': neg_weight,
+                                                  'sample_timestamp': row_ts})
         
         if not training_records:
             raise ValueError("No valid training records found")
@@ -556,6 +609,8 @@ class ModelTrainer:
                     baseline_core["final_diagnosis"] = baseline_core[baseline_label_col].astype(str)
                     baseline_core["data_quality_score"] = core_memory_quality_score
                     baseline_core = baseline_core.drop(columns=[baseline_label_col])
+                    # Older-than-feedback rows so time-aware split keeps feedback in the validation tail when possible
+                    baseline_core["sample_timestamp"] = pd.Timestamp("1970-01-01", tz="UTC")
 
                     # Align column order with feedback df
                     df = pd.concat([df, baseline_core[df.columns]], ignore_index=True)
@@ -639,6 +694,7 @@ class ModelTrainer:
                                 "symptoms_list": row.get("symptoms_list", ""),
                                 "final_diagnosis": lbl,
                                 "data_quality_score": class_completion_quality_score,
+                                "sample_timestamp": pd.Timestamp("1970-01-02", tz="UTC"),
                             })
 
                     if reference_rows:
@@ -660,12 +716,21 @@ class ModelTrainer:
 
         # Recompute sample weights AFTER filtering + class completion (keep alignment)
         sample_weights = df["data_quality_score"].astype(float).to_numpy().ravel()
-        
-        X = df.drop(['final_diagnosis', 'data_quality_score'], axis=1)
+
+        ts_series = pd.to_datetime(df["sample_timestamp"], utc=True, errors="coerce")
+        if ts_series.isna().any():
+            base = pd.Timestamp.now(tz="UTC").normalize()
+            n_na = int(ts_series.isna().sum())
+            fill = [base + pd.Timedelta(seconds=i) for i in range(n_na)]
+            ts_series = ts_series.copy()
+            ts_series.loc[ts_series.isna()] = fill
+        sample_timestamps = ts_series.to_numpy(dtype="datetime64[ns]")
+
+        X = df.drop(['final_diagnosis', 'data_quality_score', 'sample_timestamp'], axis=1)
         y = df['final_diagnosis']
-        
+
         logger.info(f"Prepared {len(X)} training samples after quality filtering")
-        return X, y, sample_weights
+        return X, y, sample_weights, sample_timestamps
     
     def preprocess_features(self, X: pd.DataFrame, fit_encoders: bool = True) -> Tuple[sparse.csr_matrix, Dict]:
         """Preprocess features with automatic feature type detection"""
@@ -801,6 +866,7 @@ class ModelTrainer:
         base_model: Optional[RandomForestClassifier] = None,
         finetune_add_trees: int = 20,
         split_random_state: Optional[int] = None,
+        sample_timestamps: Optional[np.ndarray] = None,
     ) -> Dict[str, Any]:
         """
         Train model.
@@ -808,52 +874,100 @@ class ModelTrainer:
         - Else: train new model from scratch.
         """
         logger.info(f"Starting model training with {X.shape[0]} samples")
-        
-        # Get adaptive split ratio
-        n_samples = X.shape[0]  # Use shape[0] instead of len() for sparse matrices
-        test_size = self.get_adaptive_split_ratio(n_samples)
+        self.calibrated_classifier = None
+
+        n_samples_all = X.shape[0]
+        test_size = self.get_adaptive_split_ratio(n_samples_all)
         logger.info(f"Using adaptive test split ratio: {test_size}")
-        
-        # Split data with adaptive ratio
-        # Use stratification only if we have enough samples per class
+
         random_state = (
             int(split_random_state)
             if split_random_state is not None
             else int(os.getenv("RANDOM_STATE", "42"))
         )
-        
-        # Check if stratification is possible
-        class_counts = y.value_counts()
-        min_samples_per_class = class_counts.min()
-        can_stratify = min_samples_per_class >= 2 and len(class_counts) >= 2
-        
-        # Ensure 1-D sample weights (sklearn expects shape (n_samples,))
+
         if sample_weights is not None:
             sample_weights = np.asarray(sample_weights, dtype=float).ravel()
 
-        if can_stratify:
-            try:
-                X_train, X_val, y_train, y_val, weights_train, weights_val = train_test_split(
-                    X, y, sample_weights, test_size=test_size, random_state=random_state, stratify=y
-                )
-                logger.info("Used stratified train/test split")
-            except ValueError as e:
-                # sklearn may throw when test_size is too small to cover all classes under stratify
-                # e.g. "The test_size = 4 should be greater or equal to the number of classes = 9"
-                err = str(e).lower()
-                if ("stratify" in err) or ("test_size" in err) or ("number of classes" in err):
-                    logger.warning("Cannot stratify due to insufficient samples, using random split")
-                    X_train, X_val, y_train, y_val, weights_train, weights_val = train_test_split(
-                        X, y, sample_weights, test_size=test_size, random_state=random_state
+        if sample_timestamps is not None and len(sample_timestamps) != n_samples_all:
+            sample_timestamps = None
+
+        validation_mode = os.getenv("VALIDATION_MODE", "random").strip().lower()
+        time_min = int(os.getenv("TIME_AWARE_MIN_SAMPLES", "30"))
+        validation_note = ""
+
+        ts_arr: Optional[np.ndarray] = None
+        if sample_timestamps is not None:
+            ts_arr = np.asarray(sample_timestamps)
+
+        def _random_train_val_split():
+            class_counts = y.value_counts()
+            min_samples_per_class = class_counts.min()
+            can_stratify = min_samples_per_class >= 2 and len(class_counts) >= 2
+            if can_stratify:
+                try:
+                    return train_test_split(
+                        X, y, sample_weights, test_size=test_size, random_state=random_state, stratify=y
                     )
-                else:
+                except ValueError as e:
+                    err = str(e).lower()
+                    if ("stratify" in err) or ("test_size" in err) or ("number of classes" in err):
+                        logger.warning("Cannot stratify due to insufficient samples, using random split")
+                        return train_test_split(
+                            X, y, sample_weights, test_size=test_size, random_state=random_state
+                        )
                     raise
-        else:
-            logger.warning(f"Cannot stratify: only {min_samples_per_class} samples in smallest class, using random split")
-            X_train, X_val, y_train, y_val, weights_train, weights_val = train_test_split(
-                X, y, sample_weights, test_size=test_size, random_state=random_state
+            logger.warning(
+                "Cannot stratify: only %s samples in smallest class, using random split",
+                min_samples_per_class,
             )
-        
+            return train_test_split(X, y, sample_weights, test_size=test_size, random_state=random_state)
+
+        split_used = "random"
+        time_split_ok = False
+        if (
+            validation_mode == "time_aware"
+            and ts_arr is not None
+            and n_samples_all >= time_min
+        ):
+            try:
+                order = np.argsort(ts_arr, kind="mergesort")
+                n_test = max(1, int(round(n_samples_all * test_size)))
+                n_test = min(n_test, n_samples_all - 1)
+                train_idx = order[:-n_test]
+                val_idx = order[-n_test:]
+                y_np = np.asarray(y)
+                n_classes_full = len(np.unique(y_np))
+                n_classes_val = len(np.unique(y_np[val_idx]))
+                if (
+                    len(train_idx) >= 1
+                    and len(val_idx) >= 1
+                    and (n_classes_full < 2 or n_classes_val >= 2)
+                ):
+                    w_tr = sample_weights[train_idx] if sample_weights is not None else None
+                    w_va = sample_weights[val_idx] if sample_weights is not None else None
+                    X_train = X[train_idx]
+                    X_val = X[val_idx]
+                    y_train = y.iloc[train_idx]
+                    y_val = y.iloc[val_idx]
+                    weights_train, weights_val = w_tr, w_va
+                    split_used = "time_aware"
+                    validation_note = "chronological holdout (most recent fraction in validation)"
+                    time_split_ok = True
+            except Exception as e:
+                logger.warning("time_aware split failed: %s", e)
+
+        if not time_split_ok:
+            if validation_mode == "time_aware":
+                validation_note = (
+                    "time_aware requested but unavailable (samples/timestamps/coverage); using random split"
+                )
+            X_train, X_val, y_train, y_val, weights_train, weights_val = _random_train_val_split()
+
+        class_counts_train = y_train.value_counts()
+        min_samples_per_class_train = class_counts_train.min()
+        can_stratify = min_samples_per_class_train >= 2 and len(class_counts_train) >= 2
+
         # Dataset-derived class balancing via sample_weight (stable)
         warm_starting = base_model is not None
         baseline_cw: Optional[Dict[str, float]] = self._get_baseline_class_weight()
@@ -917,14 +1031,72 @@ class ModelTrainer:
         start_time = datetime.now()
         model.fit(X_train, y_train, sample_weight=weights_train)
         training_time = (datetime.now() - start_time).total_seconds()
-        
-        # Evaluate
+
+        eval_model: Any = model
+        cal_method = os.getenv("CALIBRATION_METHOD", "none").strip().lower()
+        cal_min = int(os.getenv("CALIBRATION_MIN_SAMPLES", "50"))
+        calibration_brier_before: Optional[float] = None
+        calibration_brier_after: Optional[float] = None
+        calibrator: Any = None
+
+        if (
+            CalibratedClassifierCV is not None
+            and cal_method in ("isotonic", "sigmoid")
+            and X_val.shape[0] >= cal_min
+        ):
+            try:
+                proba_before = model.predict_proba(X_val)
+                calibration_brier_before = _multiclass_brier(
+                    np.asarray(y_val), proba_before, model.classes_
+                )
+                calibrator = CalibratedClassifierCV(model, method=cal_method, cv="prefit")
+                calibrator.fit(X_val, y_val)
+                proba_after = calibrator.predict_proba(X_val)
+                calibration_brier_after = _multiclass_brier(
+                    np.asarray(y_val), proba_after, model.classes_
+                )
+                self.calibrated_classifier = calibrator
+                eval_model = calibrator
+            except Exception as e:
+                logger.warning("Calibration skipped: %s", e)
+                self.calibrated_classifier = None
+                eval_model = model
         train_pred = model.predict(X_train)
-        val_pred = model.predict(X_val)
-        
+        val_pred = eval_model.predict(X_val)
+
         train_accuracy = accuracy_score(y_train, train_pred)
         val_accuracy = accuracy_score(y_val, val_pred)
-        val_f1 = f1_score(y_val, val_pred, average='weighted')
+        try:
+            val_f1 = float(f1_score(y_val, val_pred, average="weighted", zero_division=0))
+        except TypeError:
+            val_f1 = float(f1_score(y_val, val_pred, average="weighted"))
+
+        proba_val = eval_model.predict_proba(X_val)
+        maxp = np.max(proba_val, axis=1)
+        pred_argmax = np.argmax(proba_val, axis=1)
+        classes_arr = eval_model.classes_
+        y_pred_labels = np.asarray(classes_arr[pred_argmax], dtype=object)
+        y_val_np = np.asarray(y_val).ravel()
+        try:
+            maj = pd.Series(y_train).mode().iloc[0]
+        except Exception:
+            maj = pd.Series(y_train).iloc[0]
+        best_t = 0.5
+        try:
+            best_f1w = float(
+                f1_score(y_val_np, y_pred_labels, average="weighted", zero_division=0)
+            )
+        except TypeError:
+            best_f1w = float(f1_score(y_val_np, y_pred_labels, average="weighted"))
+        for t in np.linspace(0.05, 0.95, 91):
+            y_pred_t = np.where(maxp >= t, y_pred_labels, maj)
+            try:
+                fw = float(f1_score(y_val_np, y_pred_t, average="weighted", zero_division=0))
+            except TypeError:
+                fw = float(f1_score(y_val_np, y_pred_t, average="weighted"))
+            if fw > best_f1w:
+                best_f1w = fw
+                best_t = float(t)
         
         # Adaptive cross-validation
         cv_folds = self.get_adaptive_cv_folds(y_train)
@@ -980,9 +1152,24 @@ class ModelTrainer:
             'cv_strategy': cv_strategy_used,
             'cv_repeats': int(cv_repeats) if cv_strategy_used == "repeated_stratified" else 0,
             'split_random_state': int(random_state),
+            'validation_mode_used': split_used,
+            'validation_note': validation_note,
+            'confidence_threshold_f1': float(best_t),
+            'confidence_threshold_f1_score': float(best_f1w),
+            'calibration_method': (
+                cal_method if self.calibrated_classifier is not None else "none"
+            ),
+            'calibration_brier_before': calibration_brier_before,
+            'calibration_brier_after': calibration_brier_after,
+            'calibration_samples': int(X_val.shape[0]) if self.calibrated_classifier is not None else 0,
         }
-        
-        logger.info(f"Training completed: val_accuracy={val_accuracy:.3f}, val_f1={val_f1:.3f}")
+
+        logger.info(
+            "Training completed: val_accuracy=%.3f, val_f1=%.3f, split=%s",
+            val_accuracy,
+            val_f1,
+            split_used,
+        )
         
         return model, training_metrics
     
@@ -1018,6 +1205,11 @@ class ModelTrainer:
                 mlb_path = os.path.join(version_dir, "symptoms_mlb.pkl")
                 joblib.dump(self.symptoms_mlb, mlb_path)
                 logger.info(f"Symptoms ML encoder saved to {mlb_path}")
+
+            if getattr(self, "calibrated_classifier", None) is not None:
+                cal_path = os.path.join(version_dir, "calibrated_classifier.pkl")
+                joblib.dump(self.calibrated_classifier, cal_path)
+                logger.info("Calibrated classifier saved to %s", cal_path)
             
             # Save training metadata
             # Convert numpy types to native Python types for JSON serialization
@@ -1321,10 +1513,23 @@ def parse_bootstrap_csv(
             raise ValueError(f"Missing or invalid text in column {col}")
         return s
 
+    def _parse_bool(v: Any) -> Optional[bool]:
+        if v is None:
+            return None
+        if isinstance(v, (bool, np.bool_)):
+            return bool(v)
+        s = str(v).strip().lower()
+        if s in ("true", "1", "yes", "y", "accept", "accepted"):
+            return True
+        if s in ("false", "0", "no", "n", "reject", "rejected"):
+            return False
+        return None
+
     feedback_list: List[Dict[str, Any]] = []
     pred_list: List[Dict[str, Any]] = []
 
-    for _, row in df.iterrows():
+    base_ts = pd.Timestamp.now(tz="UTC").normalize()
+    for row_idx, (_, row) in enumerate(df.iterrows()):  # noqa: B007
         label = str(row[label_col]).strip()
         if not label or label.lower() == "nan":
             continue
@@ -1370,6 +1575,17 @@ def parse_bootstrap_csv(
             "symptom_duration": sym_dur,
         }
 
+        ai_diag_cell = row["ai_diagnosis"] if "ai_diagnosis" in df.columns else None
+        ai_diag = str(ai_diag_cell).strip() if ai_diag_cell is not None else ""
+        if not ai_diag or ai_diag.lower() == "nan":
+            ai_diag = label
+
+        is_correct_raw = row["is_correct"] if "is_correct" in df.columns else None
+        is_correct = _parse_bool(is_correct_raw)
+        if is_correct is None:
+            # Backward compatibility with old CSV schema: treat as accept.
+            is_correct = True
+
         pid = uuid.uuid4()
         pred_list.append(
             {
@@ -1377,7 +1593,7 @@ def parse_bootstrap_csv(
                 "visit_id": None,
                 "pet_id": pet_id,
                 "prediction_input": pred_input,
-                "prediction_output": {"diagnosis": label, "confidence": 1.0, "top_k": []},
+                "prediction_output": {"diagnosis": ai_diag, "confidence": 1.0, "top_k": []},
                 "model_version": "bootstrap_csv",
                 "confidence_score": 1.0,
                 "top_k_predictions": [],
@@ -1387,11 +1603,12 @@ def parse_bootstrap_csv(
             {
                 "prediction_id": pid,
                 "final_diagnosis": label,
-                "is_correct": True,
-                "ai_diagnosis": label,
+                "is_correct": bool(is_correct),
+                "ai_diagnosis": ai_diag,
                 "confidence_rating": None,
                 "is_training_eligible": True,
                 "data_quality_score": 1.0,
+                "created_at": (base_ts + pd.Timedelta(seconds=row_idx)).isoformat(),
             }
         )
 
@@ -1490,7 +1707,9 @@ def execute_training(
             eligible_feedback_data=eligible_feedback_data,
         )
         trainer = ModelTrainer()        
-        X, y, sample_weights = trainer.collect_training_data(eligible_feedback_data, prediction_logs)
+        X, y, sample_weights, sample_timestamps = trainer.collect_training_data(
+            eligible_feedback_data, prediction_logs
+        )
 
         # Safety guard: don't train/persist a model when feedback has too low class diversity.
         # If y contains only 1 diagnosis class, RandomForest will end up predicting that class
@@ -1519,6 +1738,7 @@ def execute_training(
                     base_model=base_model,
                     finetune_add_trees=add_trees,
                     split_random_state=split_seed,
+                    sample_timestamps=sample_timestamps,
                 )
                 training_metrics["finetune"] = True
                 training_metrics["finetune_fallback"] = False
@@ -1532,6 +1752,7 @@ def execute_training(
                     sample_weights,
                     base_model=None,
                     split_random_state=split_seed,
+                    sample_timestamps=sample_timestamps,
                 )
                 training_metrics["finetune"] = True
                 training_metrics["finetune_fallback"] = True
@@ -1544,6 +1765,7 @@ def execute_training(
                 y,
                 sample_weights,
                 split_random_state=split_seed,
+                sample_timestamps=sample_timestamps,
             )
             training_metrics["finetune"] = False
 

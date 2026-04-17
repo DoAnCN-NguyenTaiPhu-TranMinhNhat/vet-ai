@@ -64,6 +64,11 @@ TRAINING_THRESHOLD = int(os.getenv("TRAINING_THRESHOLD", "10"))  # Reduced from 
 TRAINING_WINDOW_DAYS = int(os.getenv("TRAINING_WINDOW_DAYS", "30"))
 PROMOTE_MIN_SAMPLES = int(os.getenv("PROMOTE_MIN_SAMPLES", "20"))
 PROMOTE_MIN_VALIDATION_F1_DELTA = float(os.getenv("PROMOTE_MIN_VALIDATION_F1_DELTA", "0.0"))
+PROMOTE_PRIMARY_METRIC = os.getenv("PROMOTE_PRIMARY_METRIC", "cv_mean_f1_weighted").strip()
+PROMOTE_MIN_PRIMARY_METRIC_DELTA = float(
+    os.getenv("PROMOTE_MIN_PRIMARY_METRIC_DELTA", str(PROMOTE_MIN_VALIDATION_F1_DELTA))
+)
+PROMOTE_MAX_CV_STD_F1_WEIGHTED = float(os.getenv("PROMOTE_MAX_CV_STD_F1_WEIGHTED", "999"))
 PROMOTE_REQUIRE_BASELINE_METRIC = os.getenv("PROMOTE_REQUIRE_BASELINE_METRIC", "false").lower() in (
     "1",
     "true",
@@ -1056,8 +1061,12 @@ def _safe_float(v: Any) -> Optional[float]:
         return None
 
 
-def _read_validation_f1_for_version(model_version: Optional[str], clinic_key: Optional[str]) -> Optional[float]:
-    if not model_version:
+def _read_metric_for_version(
+    model_version: Optional[str],
+    clinic_key: Optional[str],
+    metric_key: str,
+) -> Optional[float]:
+    if not model_version or not metric_key:
         return None
     try:
         model_dir = resolve_model_dir(model_version, clinic_key)
@@ -1066,7 +1075,7 @@ def _read_validation_f1_for_version(model_version: Optional[str], clinic_key: Op
             return None
         with open(metrics_path, "r", encoding="utf-8") as f:
             metrics = json.load(f) or {}
-        return _safe_float(metrics.get("validation_f1"))
+        return _safe_float(metrics.get(metric_key))
     except Exception:
         return None
 
@@ -1104,24 +1113,38 @@ def _evaluate_promote_guardrail(
 ) -> tuple[bool, str, Dict[str, Any]]:
     tm = training_metrics or {}
     n_samples = int(tm.get("n_samples") or 0)
+    metric_key = PROMOTE_PRIMARY_METRIC or "validation_f1"
+    new_primary = _safe_float(tm.get(metric_key))
+    base_primary = _read_metric_for_version(previous_model_version, clinic_key, metric_key)
     new_f1 = _safe_float(tm.get("validation_f1"))
-    base_f1 = _read_validation_f1_for_version(previous_model_version, clinic_key)
+    base_f1 = _read_metric_for_version(previous_model_version, clinic_key, "validation_f1")
 
     checks: List[str] = []
     if n_samples < PROMOTE_MIN_SAMPLES:
         checks.append(f"n_samples={n_samples} < PROMOTE_MIN_SAMPLES={PROMOTE_MIN_SAMPLES}")
 
-    f1_delta: Optional[float] = None
-    if new_f1 is None:
-        checks.append("validation_f1 is missing")
-    elif base_f1 is not None:
-        f1_delta = float(new_f1 - base_f1)
-        if f1_delta < PROMOTE_MIN_VALIDATION_F1_DELTA:
+    primary_delta: Optional[float] = None
+    if new_primary is None:
+        checks.append(f"{metric_key} is missing")
+    elif base_primary is not None:
+        primary_delta = float(new_primary - base_primary)
+        if primary_delta < PROMOTE_MIN_PRIMARY_METRIC_DELTA:
             checks.append(
-                f"validation_f1_delta={f1_delta:.4f} < PROMOTE_MIN_VALIDATION_F1_DELTA={PROMOTE_MIN_VALIDATION_F1_DELTA:.4f}"
+                f"{metric_key}_delta={primary_delta:.4f} < "
+                f"PROMOTE_MIN_PRIMARY_METRIC_DELTA={PROMOTE_MIN_PRIMARY_METRIC_DELTA:.4f}"
             )
     elif PROMOTE_REQUIRE_BASELINE_METRIC:
-        checks.append("baseline validation_f1 is missing")
+        checks.append(f"baseline {metric_key} is missing")
+
+    cv_std = _safe_float(tm.get("cv_std_f1_weighted"))
+    if (
+        cv_std is not None
+        and PROMOTE_MAX_CV_STD_F1_WEIGHTED < 100
+        and cv_std > PROMOTE_MAX_CV_STD_F1_WEIGHTED
+    ):
+        checks.append(
+            f"cv_std_f1_weighted={cv_std:.4f} > PROMOTE_MAX_CV_STD_F1_WEIGHTED={PROMOTE_MAX_CV_STD_F1_WEIGHTED:.4f}"
+        )
 
     passed = len(checks) == 0
     reason = "passed" if passed else "; ".join(checks)
@@ -1129,10 +1152,19 @@ def _evaluate_promote_guardrail(
         "passed": passed,
         "reason": reason,
         "n_samples": n_samples,
+        "promote_primary_metric": metric_key,
+        f"new_{metric_key}": new_primary,
+        f"baseline_{metric_key}": base_primary,
+        f"{metric_key}_delta": primary_delta,
         "new_validation_f1": new_f1,
         "baseline_validation_f1": base_f1,
-        "validation_f1_delta": f1_delta,
+        "validation_f1_delta": (
+            float(new_f1 - base_f1) if new_f1 is not None and base_f1 is not None else None
+        ),
+        "cv_std_f1_weighted": cv_std,
         "promote_min_samples": PROMOTE_MIN_SAMPLES,
+        "promote_min_primary_metric_delta": PROMOTE_MIN_PRIMARY_METRIC_DELTA,
+        "promote_max_cv_std_f1_weighted": PROMOTE_MAX_CV_STD_F1_WEIGHTED,
         "promote_min_validation_f1_delta": PROMOTE_MIN_VALIDATION_F1_DELTA,
         "promote_require_baseline_metric": PROMOTE_REQUIRE_BASELINE_METRIC,
     }

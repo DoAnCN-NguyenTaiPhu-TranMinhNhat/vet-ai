@@ -471,6 +471,12 @@ async function main() {
       toast(`Bootstrap failed (${e.status || "?"}): ${typeof d === "string" ? d : JSON.stringify(d)}`);
     }
   });
+  document.getElementById("btn-bootstrap-csv-clear")?.addEventListener("click", () => {
+    const input = document.getElementById("bootstrap-csv-file");
+    if (!input) return;
+    input.value = "";
+    toast("Cleared selected CSV file.");
+  });
   document.getElementById("history-pagination").addEventListener("click", async (ev) => {
     const btn = ev.target.closest(".history-page-btn");
     if (!btn) return;

@@ -23,6 +23,21 @@ PREDICTION_CONFIDENCE = Histogram(
     "Do tu tin cua AI tren tung ca",
     buckets=(0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0),
 )
+TRAINING_JOBS = Counter(
+    "vetai_training_job_events_total",
+    "So luong su kien training job theo trang thai",
+    ["status"],
+)
+MODEL_RELOADS = Counter(
+    "vetai_model_reload_total",
+    "So lan doi active model sau training",
+    ["scope", "status"],
+)
+TRAINING_DURATION = Histogram(
+    "vetai_training_duration_seconds",
+    "Thoi gian huan luyen model (giay)",
+    buckets=(1, 3, 5, 10, 20, 30, 60, 120, 300, 600),
+)
 
 
 def observe_inference(
@@ -52,3 +67,21 @@ def timing() -> Any:
             self.elapsed = time.perf_counter() - self._start
 
     return _Timer()
+
+
+def inc_training_job(status: str) -> None:
+    st = (status or "unknown").strip().lower() or "unknown"
+    TRAINING_JOBS.labels(status=st).inc()
+
+
+def inc_model_reload(scope: str, status: str) -> None:
+    sc = (scope or "global").strip().lower() or "global"
+    st = (status or "unknown").strip().lower() or "unknown"
+    MODEL_RELOADS.labels(scope=sc, status=st).inc()
+
+
+def observe_training_duration(seconds: float) -> None:
+    try:
+        TRAINING_DURATION.observe(float(seconds))
+    except Exception:
+        pass

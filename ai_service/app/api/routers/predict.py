@@ -35,7 +35,8 @@ else:
 _model: Any = None
 _tab_preprocess: Any = None
 _symptoms_mlb: Any = None
-_artifact_cache: dict[str, tuple[Any, Any, Any]] = {}
+_calibrated: Any = None
+_artifact_cache: dict[str, tuple[Any, Any, Any, Any]] = {}
 
 _active_model_info = Info("vetai_active_model", "Active model version for inference")
 _active_model_reload_total = Gauge("vetai_active_model_reload_total", "Number of active model reloads")
@@ -49,28 +50,31 @@ def clear_artifact_cache() -> None:
     _artifact_cache.clear()
 
 
-def load_artifacts_for_dir(model_dir: str, model_version: str) -> tuple[Any, Any, Any]:
+def load_artifacts_for_dir(model_dir: str, model_version: str) -> tuple[Any, Any, Any, Any]:
     key = _cache_key(model_dir)
     if key not in _artifact_cache:
+        cal_path = os.path.join(model_dir, "calibrated_classifier.pkl")
+        calibrated = joblib.load(cal_path) if os.path.exists(cal_path) else None
         _artifact_cache[key] = (
             joblib.load(os.path.join(model_dir, "model.pkl")),
             joblib.load(os.path.join(model_dir, "tab_preprocess.pkl")),
             joblib.load(os.path.join(model_dir, "symptoms_mlb.pkl")),
+            calibrated,
         )
         logger.info("Cached model artifacts: version=%s dir=%s", model_version, key)
     return _artifact_cache[key]
 
 
 def load_artifacts() -> None:
-    global _model, _tab_preprocess, _symptoms_mlb
-    _model, _tab_preprocess, _symptoms_mlb = load_artifacts_for_dir(MODEL_DIR, MODEL_VERSION)
+    global _model, _tab_preprocess, _symptoms_mlb, _calibrated
+    _model, _tab_preprocess, _symptoms_mlb, _calibrated = load_artifacts_for_dir(MODEL_DIR, MODEL_VERSION)
     _active_model_info.info({"model_version": str(MODEL_VERSION)})
 
 
 def set_active_model_and_reload(model_version: str) -> None:
     from ai_service.app.infrastructure.storage.model_store import set_active_model
 
-    global MODEL_VERSION, MODEL_DIR, _model, _tab_preprocess, _symptoms_mlb
+    global MODEL_VERSION, MODEL_DIR, _model, _tab_preprocess, _symptoms_mlb, _calibrated
     active = set_active_model(model_version)
     MODEL_VERSION = active.model_version
     MODEL_DIR = active.model_dir
@@ -78,6 +82,7 @@ def set_active_model_and_reload(model_version: str) -> None:
     _model = None
     _tab_preprocess = None
     _symptoms_mlb = None
+    _calibrated = None
     load_artifacts()
     _active_model_reload_total.inc()
 
@@ -85,12 +90,13 @@ def set_active_model_and_reload(model_version: str) -> None:
 def model_info() -> dict[str, Any]:
     if _model is None:
         return {"loaded": False, "model_dir": MODEL_DIR, "model_version": MODEL_VERSION}
-    classes = getattr(_model, "classes_", None)
+    infer = _calibrated if _calibrated is not None else _model
+    classes = getattr(infer, "classes_", None)
     return {
         "loaded": True,
         "model_dir": MODEL_DIR,
         "model_version": MODEL_VERSION,
-        "model_type": type(_model).__name__,
+        "model_type": type(infer).__name__,
         "classes": classes.tolist() if isinstance(classes, np.ndarray) else classes,
     }
 
@@ -118,7 +124,10 @@ async def predict(req: PredictRequest) -> dict[str, Any]:
         payload["clinic_id"] = req.clinic_id
 
     active = get_active_model_for_clinic(cid) or ActiveModel(str(MODEL_VERSION), MODEL_DIR)
-    model, tab_preprocess, symptoms_mlb = load_artifacts_for_dir(active.model_dir, active.model_version)
+    model, tab_preprocess, symptoms_mlb, calibrated = load_artifacts_for_dir(
+        active.model_dir, active.model_version
+    )
+    infer = calibrated if calibrated is not None else model
 
     tabular = {
         "animal_type": payload["animal_type"],
@@ -140,10 +149,10 @@ async def predict(req: PredictRequest) -> dict[str, Any]:
     confidence = None
     top_k = None
     with timing() as timer:
-        pred = model.predict(x_final)[0]
-        if hasattr(model, "predict_proba"):
-            proba = model.predict_proba(x_final)[0]
-            classes = model.classes_
+        pred = infer.predict(x_final)[0]
+        if hasattr(infer, "predict_proba"):
+            proba = infer.predict_proba(x_final)[0]
+            classes = infer.classes_
             best_idx = int(np.argmax(proba))
             confidence = float(proba[best_idx])
             top_idx = np.argsort(proba)[::-1][: min(3, len(classes))]
