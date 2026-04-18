@@ -6,235 +6,349 @@
   <title>Vet-AI MLOps Dashboard</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
   <style>
-    body { background: #f6f8fb; }
-
-    .card {
-      border: none;
-      border-radius: 18px;
+    :root {
+      --bg-page: #f6f8fb;
+      --bg-card: #ffffff;
+      --bg-subtle: #f1f3f6;
+      --text-main: #111827;
+      --text-muted: #6b7280;
+      --success: #16a34a;
+      --danger: #dc2626;
+      --running: #ea580c;
+      --radius-card: 18px;
+      --radius-sm: 12px;
+      --shadow-soft: 0 8px 28px rgba(15, 23, 42, 0.08);
     }
 
-    .shadow-soft {
-      box-shadow: 0 10px 30px rgba(0,0,0,0.06);
+    body {
+      background: var(--bg-page);
+      color: var(--text-main);
     }
 
-    .section-title {
-      font-size: 0.85rem;
-      color: #6c757d;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
+    .dashboard-navbar {
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      padding-top: 0.5rem;
+      padding-bottom: 0.5rem;
     }
 
-    .value-lg {
-      font-size: 1.4rem;
-      font-weight: 600;
+    .dashboard-navbar .navbar-brand {
+      font-weight: 700;
+      letter-spacing: 0.01em;
     }
 
-    .navbar {
-      border-bottom: 1px solid rgba(255,255,255,0.1);
+    .dashboard-navbar .brand-badge {
+      background: rgba(255, 255, 255, 0.15);
+      border-radius: 999px;
+      font-size: 0.72rem;
+      padding: 0.12rem 0.5rem;
+      vertical-align: middle;
     }
 
     .token-input {
       width: 220px;
     }
 
+    .dashboard-card {
+      background: var(--bg-card);
+      border: 0;
+      border-radius: var(--radius-card);
+      box-shadow: var(--shadow-soft);
+      height: 100%;
+    }
+
+    .dashboard-card .card-body {
+      padding: 1.1rem 1.15rem;
+    }
+
+    .section-title {
+      color: var(--text-muted);
+      font-size: 0.76rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 0.55rem;
+    }
+
+    .value-lg {
+      font-size: 1.35rem;
+      font-weight: 700;
+      line-height: 1.25;
+    }
+
     .mini-card {
-      background: #f1f3f6;
-      border-radius: 12px;
-      padding: 10px;
+      background: var(--bg-subtle);
+      border-radius: var(--radius-sm);
+      padding: 0.7rem 0.75rem;
+      min-height: 88px;
+    }
+
+    .panel-soft {
+      background: var(--bg-subtle);
+      border-radius: var(--radius-sm);
+      padding: 0.75rem;
+    }
+
+    .table-wrap {
+      background: var(--bg-subtle);
+      border-radius: var(--radius-sm);
+      padding: 0.45rem 0.55rem;
+    }
+
+    .table {
+      margin-bottom: 0;
+    }
+
+    .table > thead > tr > th {
+      border: 0;
+      color: var(--text-muted);
+      font-size: 0.76rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      white-space: nowrap;
+      padding-top: 0.55rem;
+      padding-bottom: 0.55rem;
+    }
+
+    .table > tbody > tr > td {
+      border-top: 1px solid #e7eaf0;
+      padding-top: 0.65rem;
+      padding-bottom: 0.65rem;
+      vertical-align: middle;
+    }
+
+    .pagination .page-link {
+      border-radius: 9px;
     }
 
     pre {
+      margin: 0;
       font-size: 0.78rem;
-      background: #f1f3f6 !important;
+      background: var(--bg-subtle) !important;
+      border: 0;
+      border-radius: var(--radius-sm);
+      padding: 0.75rem;
+      max-height: 320px;
+      overflow: auto;
     }
 
-    table td, table th {
-      vertical-align: middle;
+    .status-success {
+      color: var(--success);
+      font-weight: 700;
+    }
+
+    .status-failed {
+      color: var(--danger);
+      font-weight: 700;
+    }
+
+    .status-running {
+      color: var(--running);
+      font-weight: 700;
     }
   </style>
 </head>
 <body>
 
-<nav class="navbar navbar-dark bg-dark px-3">
-  <div class="d-flex flex-wrap align-items-center gap-2">
-    <span class="navbar-brand fw-semibold mb-0">
-      Vet-AI MLOps <small class="text-white-50">ml-ui</small>
-    </span>
-
-    <select class="form-select form-select-sm bg-dark text-white border-secondary" id="clinic-scope" style="min-width: 14rem">
-      <option value="">Global</option>
-    </select>
-
-    <button class="btn btn-outline-light btn-sm" id="btn-refresh">Refresh</button>
-  </div>
-
-  <div class="d-flex gap-2 align-items-center">
-    <input class="form-control form-control-sm token-input" id="admin-token" placeholder="Admin token" />
-    <a class="btn btn-outline-light btn-sm" href="/docs" target="_blank">Docs</a>
-    <a class="btn btn-outline-light btn-sm" href="/metrics" target="_blank">Metrics</a>
+<nav class="navbar navbar-dark bg-dark dashboard-navbar">
+  <div class="container-fluid d-flex flex-wrap gap-2 align-items-center">
+    <div class="d-flex flex-wrap align-items-center gap-2 me-auto">
+      <span class="navbar-brand mb-0">
+        Vet-AI MLOps
+        <span class="brand-badge text-white-50">ml-ui</span>
+      </span>
+      <label class="small text-white-50 mb-0 text-nowrap" for="clinic-scope">Scope</label>
+      <select
+        class="form-select form-select-sm bg-dark text-white border-secondary"
+        id="clinic-scope"
+        style="min-width: 14rem; max-width: 22rem"
+      >
+        <option value="">Global (shared default)</option>
+      </select>
+      <button class="btn btn-outline-light btn-sm" id="btn-refresh" type="button">Refresh</button>
+      <span class="small text-white-50" id="clinics-source" title="Clinic list source"></span>
+    </div>
+    <div class="d-flex flex-wrap gap-2 align-items-center">
+      <input class="form-control form-control-sm token-input" id="admin-token" placeholder="Admin token (Bearer)" />
+      <a class="btn btn-outline-light btn-sm" href="/docs" target="_blank" rel="noreferrer">API Docs</a>
+      <a class="btn btn-outline-light btn-sm" href="/metrics" target="_blank" rel="noreferrer">Metrics</a>
+    </div>
   </div>
 </nav>
 
 <main class="container py-4">
-
   <p class="text-muted small mb-3" id="clinic-context-banner">
-    Viewing: <strong id="clinic-context-label">global</strong>
+    Viewing: <strong id="clinic-context-label">global (shared)</strong>.
   </p>
 
   <div class="row g-4">
+    <div class="col-12 col-lg-6">
+      <div class="card dashboard-card">
+        <div class="card-body">
+          <div class="section-title">Active Model</div>
+          <div class="text-muted small mb-2" id="scope-hint">Global model.</div>
 
-    <!-- Active Model -->
-    <div class="col-lg-6">
-      <div class="card shadow-soft p-3">
-        <div class="section-title">Active Model</div>
-
-        <div class="text-muted small mb-1" id="scope-hint">Global model.</div>
-        <div class="d-flex justify-content-between align-items-center mt-2">
-          <div>
-            <div class="text-muted small" id="active-label">Current</div>
-            <div class="value-lg" id="active-model">-</div>
+          <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+            <div>
+              <div class="text-muted small" id="active-label">Current</div>
+              <div class="value-lg" id="active-model">-</div>
+            </div>
+            <button class="btn btn-primary btn-sm px-3" id="btn-set-active" type="button">Switch</button>
           </div>
 
-          <button class="btn btn-primary btn-sm" id="btn-set-active">Switch</button>
-        </div>
-
-        <div class="mt-3">
           <label class="form-label small text-muted mb-1" id="switch-model-label">Switch active model</label>
           <select class="form-select" id="model-select"></select>
-        </div>
 
-        <pre class="mt-3 p-2 rounded" id="model-info">-</pre>
+          <div class="mt-3">
+            <pre id="model-info">-</pre>
+          </div>
+        </div>
       </div>
     </div>
 
-    <!-- Training -->
-    <div class="col-lg-6">
-      <div class="card shadow-soft p-3">
-        <div class="section-title">Training</div>
-        <p class="text-muted small mt-2 mb-0" id="training-scope-label">Scope: -</p>
+    <div class="col-12 col-lg-6">
+      <div class="card dashboard-card">
+        <div class="card-body">
+          <div class="section-title">Training</div>
+          <p class="text-muted small mb-3" id="training-scope-label">Scope: -</p>
 
-        <div class="row mt-3 text-center">
-          <div class="col-6">
-            <div class="mini-card">
-              <div class="section-title">Eligibility</div>
-              <div class="value-lg" id="eligibility">-</div>
+          <div class="row g-3 text-center">
+            <div class="col-12 col-sm-6">
+              <div class="mini-card">
+                <div class="section-title mb-1">Eligibility</div>
+                <div class="value-lg" id="eligibility">-</div>
+              </div>
+            </div>
+            <div class="col-12 col-sm-6">
+              <div class="mini-card">
+                <div class="section-title mb-1">Last Job</div>
+                <div class="value-lg" id="last-job">-</div>
+              </div>
             </div>
           </div>
-          <div class="col-6">
-            <div class="mini-card">
-              <div class="section-title">Last Job</div>
-              <div class="value-lg" id="last-job">-</div>
+
+          <div class="panel-soft mt-3">
+            <div class="section-title mb-1">MLflow Alignment</div>
+            <div id="mlflow-align" class="small">-</div>
+          </div>
+
+          <div class="mt-3">
+            <label class="form-label small text-muted mb-1">Trigger training</label>
+            <div class="input-group">
+              <select class="form-select" id="trigger-type">
+                <option value="manual" selected>Manual</option>
+                <option value="automatic">Automatic</option>
+                <option value="scheduled">Scheduled</option>
+              </select>
+              <button class="btn btn-success px-3" id="btn-trigger" type="button">Trigger</button>
+            </div>
+          </div>
+
+          <div class="mt-3 pt-3 border-top">
+            <div class="section-title mb-2">Bootstrap from CSV (Cold Start)</div>
+            <input
+              type="file"
+              class="form-control form-control-sm mb-2"
+              id="bootstrap-csv-file"
+              accept=".csv,text/csv"
+            />
+            <div class="d-flex flex-wrap gap-2">
+              <a
+                class="btn btn-outline-secondary btn-sm"
+                href="/continuous-training/training/bootstrap-csv/template"
+                download="vet_bootstrap_training_template.csv"
+              >Download CSV template</a>
+              <button class="btn btn-primary btn-sm" id="btn-bootstrap-csv" type="button">Train from CSV</button>
+              <button class="btn btn-outline-danger btn-sm" id="btn-bootstrap-csv-clear" type="button">Clear</button>
             </div>
           </div>
         </div>
-
-        <div class="mini-card mt-2 text-start">
-          <div class="section-title">MLflow Alignment</div>
-          <div id="mlflow-align" class="small">-</div>
-        </div>
-
-        <div class="mt-3">
-          <div class="input-group">
-            <select class="form-select" id="trigger-type">
-              <option value="manual">Manual</option>
-              <option value="automatic">Automatic</option>
-              <option value="scheduled">Scheduled</option>
-            </select>
-            <button class="btn btn-success" id="btn-trigger">Trigger</button>
-          </div>
-        </div>
-
-        <div class="mt-3 border-top pt-3">
-          <div class="section-title mb-2">Bootstrap from CSV (cold start)</div>
-          <input
-            type="file"
-            class="form-control form-control-sm mb-2"
-            id="bootstrap-csv-file"
-            accept=".csv,text/csv"
-          />
-          <div class="d-flex flex-wrap gap-2 align-items-center">
-            <a
-              class="btn btn-outline-secondary btn-sm"
-              href="/continuous-training/training/bootstrap-csv/template"
-              download="vet_bootstrap_training_template.csv"
-            >Download CSV template</a>
-            <button class="btn btn-primary btn-sm" id="btn-bootstrap-csv" type="button">Train from CSV</button>
-            <button class="btn btn-outline-danger btn-sm" id="btn-bootstrap-csv-clear" type="button">Clear</button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Training History -->
-    <div class="col-12">
-      <div class="card shadow-soft p-3">
-        <div class="d-flex justify-content-between align-items-center">
-          <div class="section-title">Training History</div>
-          <button class="btn btn-sm btn-outline-danger" id="btn-delete-all-training-runs">
-            Delete all
-          </button>
-        </div>
-
-        <div class="table-responsive mt-3">
-          <table class="table table-borderless table-sm">
-            <thead class="text-muted">
-              <tr>
-                <th>ID</th><th>Clinic</th><th>Trigger</th><th>Status</th><th>New Version</th><th>Val Acc</th>
-                <th>F1</th>
-                <th>Data Rows</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody id="history-body">
-              <tr>
-                <td colspan="9" class="text-muted">No data</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-        <nav class="mt-2" aria-label="Training status pages">
-          <ul class="pagination pagination-sm mb-0" id="history-pagination"></ul>
-        </nav>
-      </div>
-    </div>
-
-    <!-- Registry -->
-    <div class="col-lg-6">
-      <div class="card shadow-soft p-3 h-100">
-        <div class="section-title">Registry</div>
-        <pre class="mt-3 p-2 rounded" id="registry-status">-</pre>
-        <div class="section-title mt-3">Model Artifact Storage (S3)</div>
-        <pre class="mt-2 p-2 rounded" id="artifact-storage">-</pre>
-      </div>
-    </div>
-
-    <!-- Drift -->
-    <div class="col-lg-6">
-      <div class="card shadow-soft p-3 h-100">
-        <div class="section-title">Drift</div>
-        <pre class="mt-3 p-2 rounded" id="drift-summary">-</pre>
       </div>
     </div>
 
     <div class="col-12">
-      <div class="card shadow-soft p-3">
-        <div class="section-title">Policy (in-memory)</div>
-        <div class="row g-2 mt-1">
-          <div class="col-12 col-md-6">
-            <label class="form-label small text-muted mb-1">Threshold</label>
-            <input type="number" min="1" class="form-control" id="policy-threshold" />
+      <div class="card dashboard-card">
+        <div class="card-body">
+          <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2">
+            <div class="section-title mb-0">Training History</div>
+            <button class="btn btn-outline-danger btn-sm" id="btn-delete-all-training-runs" type="button">
+              Delete all runs (current scope)
+            </button>
           </div>
-          <div class="col-12 col-md-6">
-            <label class="form-label small text-muted mb-1">Window days</label>
-            <input type="number" min="1" class="form-control" id="policy-window" />
+
+          <div class="table-wrap mt-2">
+            <div class="table-responsive">
+              <table class="table table-borderless table-sm align-middle">
+                <thead>
+                  <tr>
+                    <th>ID</th>
+                    <th>Clinic</th>
+                    <th>Trigger</th>
+                    <th>Status</th>
+                    <th>New Version</th>
+                    <th>Validation Acc</th>
+                    <th>F1</th>
+                    <th>Data Rows</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="history-body">
+                  <tr>
+                    <td colspan="9" class="text-muted">No runs</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
           </div>
-        </div>
-        <div class="d-flex gap-2 mt-2">
-          <button class="btn btn-primary btn-sm" id="btn-save-policy">Save policy</button>
+
+          <nav class="mt-3" aria-label="Training status pages">
+            <ul class="pagination pagination-sm mb-0" id="history-pagination"></ul>
+          </nav>
         </div>
       </div>
     </div>
 
+    <div class="col-12 col-lg-6">
+      <div class="card dashboard-card">
+        <div class="card-body">
+          <div class="section-title">Registry</div>
+          <pre id="registry-status">-</pre>
+
+          <div class="section-title mt-3">Model Artifact Storage (S3)</div>
+          <pre id="artifact-storage">-</pre>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-12 col-lg-6">
+      <div class="card dashboard-card">
+        <div class="card-body">
+          <div class="section-title">Drift</div>
+          <pre id="drift-summary">-</pre>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-12">
+      <div class="card dashboard-card">
+        <div class="card-body">
+          <div class="section-title">Policy (In-Memory)</div>
+          <div class="row g-3">
+            <div class="col-12 col-md-6">
+              <label class="form-label small text-muted mb-1">Threshold</label>
+              <input type="number" min="1" class="form-control" id="policy-threshold" />
+            </div>
+            <div class="col-12 col-md-6">
+              <label class="form-label small text-muted mb-1">Window Days</label>
+              <input type="number" min="1" class="form-control" id="policy-window" />
+            </div>
+          </div>
+          <div class="d-flex gap-2 mt-3">
+            <button class="btn btn-primary btn-sm" id="btn-save-policy" type="button">Save policy</button>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 </main>
 
