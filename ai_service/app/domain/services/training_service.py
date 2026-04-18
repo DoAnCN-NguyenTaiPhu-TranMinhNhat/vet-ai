@@ -14,7 +14,7 @@ import logging
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Any, AbstractSet, Dict, List, Optional, Tuple
 try:
     from sklearn.model_selection import train_test_split, cross_val_score, RepeatedStratifiedKFold
     from sklearn.ensemble import RandomForestClassifier
@@ -1682,8 +1682,13 @@ def execute_training(
     *,
     dataset_window_days: Optional[int] = None,
     pipeline_kind: str = "continuous_training",
+    feedback_id_allowlist: Optional[AbstractSet[int]] = None,
 ) -> Dict[str, Any]:
-    """Execute training pipeline with dynamic parameters."""
+    """Execute training pipeline with dynamic parameters.
+
+    When ``feedback_id_allowlist`` is set (automatic batch jobs), only feedback rows whose ``id`` is
+    in that set are used after eligibility filtering.
+    """
     clinic_key = normalize_clinic_key(clinic_id)
     try:
         dw_days = (
@@ -1700,6 +1705,13 @@ def execute_training(
         eligible_feedback_data = [
             f for f in (feedback_data or []) if f.get("is_training_eligible", True)
         ]
+        if feedback_id_allowlist is not None:
+            allowed = {int(x) for x in feedback_id_allowlist}
+            eligible_feedback_data = [
+                f
+                for f in eligible_feedback_data
+                if f.get("id") is not None and int(f["id"]) in allowed
+            ]
         if not eligible_feedback_data:
             raise ValueError("No eligible feedback data to train on")
         split_seed = _derive_split_random_state(
@@ -1973,9 +1985,18 @@ def execute_training(
         else:
             training_metrics["feedback_gate_enabled"] = False
 
-        # Generate version
+        # Generate version (global runs: suffix " - global" so UIs and disk dirs are easy to spot;
+        # clinics without a pinned model fall back to this default via model_store.)
         model_version = trainer.generate_model_version()
-        
+        if clinic_key is None:
+            base_ver = str(model_version).strip()
+            if not base_ver.endswith(" - global"):
+                model_version = f"{base_ver} - global"
+            training_metrics["training_scope"] = "global"
+        else:
+            training_metrics["training_scope"] = "clinic"
+        training_metrics["model_version"] = model_version
+
         # Save model
         model_path = trainer.save_model(model, training_metrics, model_version, clinic_key=clinic_key)
 

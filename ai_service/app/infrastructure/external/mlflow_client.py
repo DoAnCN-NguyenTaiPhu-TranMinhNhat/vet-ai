@@ -65,13 +65,13 @@ def compare_latest_run_to_active(clinic_id: Optional[str] = None) -> Dict[str, A
         exp = client.get_experiment_by_name(exp_name)
         if exp is None:
             out["status"] = "no_experiment"
-            out["note"] = f"Experiment '{exp_name}' chưa tồn tại trên MLflow (chưa có train nào ghi log)."
+            out["note"] = f"Experiment '{exp_name}' does not exist in MLflow yet (no training run has logged to it)."
             return out
 
         runs = client.search_runs(experiment_ids=[exp.experiment_id], max_results=50)
         if not runs:
             out["status"] = "no_runs"
-            out["note"] = "Chưa có run trong experiment này."
+            out["note"] = "No runs found in this experiment."
             return out
 
         latest = _pick_latest_run(runs)
@@ -100,10 +100,10 @@ def compare_latest_run_to_active(clinic_id: Optional[str] = None) -> Dict[str, A
             out["versions_match"] = run_mv == active_version
         elif not run_mv:
             out["versions_match"] = None
-            out["note"] = "Run mới nhất không có tag vetai_model_version (run cũ trước khi chuẩn hóa tag)."
+            out["note"] = "Latest run is missing tag 'vetai_model_version' (likely from older runs before tag standardization)."
         else:
             out["versions_match"] = None
-            out["note"] = "Chưa có model active trên registry cho scope này."
+            out["note"] = "No active model is set in the registry for this scope."
 
         return out
     except Exception as e:

@@ -77,6 +77,22 @@ async function jsend(url, method, body) {
   return data;
 }
 
+async function jdelete(url) {
+  const r = await fetch(url, {
+    method: "DELETE",
+    headers: { Accept: "application/json", ...authHeaders() }
+  });
+  const text = await r.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch (_) {
+    data = text;
+  }
+  if (!r.ok) throw { status: r.status, data };
+  return data;
+}
+
 /** Multipart POST (do not set Content-Type — browser sets boundary). */
 async function jpostMultipart(url, formData) {
   const r = await fetch(url, {
@@ -300,9 +316,13 @@ async function loadHistory() {
       run.clinic_id != null && run.clinic_id !== ""
         ? run.clinic_id
         : "—";
+    const triggerCell = run.trigger_type != null && String(run.trigger_type).trim() !== ""
+      ? String(run.trigger_type)
+      : "—";
     tr.innerHTML = `
       <td>${run.training_id}</td>
       <td>${clinicCell}</td>
+      <td class="small">${triggerCell}</td>
       <td>${statusBadge}</td>
       <td class="mono">${run.new_model_version || "-"}</td>
       <td>${run.validation_accuracy ?? "-"}</td>
@@ -311,12 +331,13 @@ async function loadHistory() {
       <td>
         <button class="btn btn-sm btn-outline-secondary btn-status" data-id="${run.training_id}">Status</button>
         <button class="btn btn-sm btn-outline-primary btn-download-data" data-id="${run.training_id}">Download data</button>
+        <button class="btn btn-sm btn-outline-danger btn-delete-job" data-id="${run.training_id}">Delete</button>
       </td>
     `;
     tbody.appendChild(tr);
   });
   if (!h.training_runs || h.training_runs.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="8" class="text-muted">No runs</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9" class="text-muted">No runs</td></tr>`;
   }
 
   const total = Number(h.total_count || 0);
@@ -512,6 +533,24 @@ async function main() {
       } catch (e) {
         toast(`Download failed (${e.status || "?"}): ${JSON.stringify(e.data)}`);
       }
+      return;
+    }
+    const delJob = ev.target.closest(".btn-delete-job");
+    if (delJob) {
+      if (!getToken()) {
+        toast("Admin token required to delete a training job.");
+        return;
+      }
+      const id = delJob.getAttribute("data-id");
+      if (!confirm(`Delete training run #${id} from history? This cannot be undone.`)) return;
+      try {
+        await jdelete(`/continuous-training/training/history/${encodeURIComponent(id)}`);
+        toast(`Deleted training run #${id}`);
+        await refreshTraining();
+        await loadHistory();
+      } catch (e) {
+        toast(`Delete failed (${e.status || "?"}): ${JSON.stringify(e.data)}`);
+      }
     }
   });
   document.getElementById("btn-save-policy").addEventListener("click", async () => {
@@ -521,6 +560,38 @@ async function main() {
       const d = e.data?.detail ?? e.data ?? e;
       const msg = typeof d === "string" ? d : JSON.stringify(d);
       toast(`Save policy failed (${e.status || "?"}): ${msg}`);
+    }
+  });
+
+  document.getElementById("btn-delete-all-training-runs")?.addEventListener("click", async () => {
+    if (!getToken()) {
+      toast("Admin token required.");
+      return;
+    }
+    const cid = getSelectedClinicKey();
+    const scopeLabel =
+      cid == null
+        ? "all global training runs (no clinic on the job)"
+        : `all training runs for clinic ${cid}`;
+    if (
+      !confirm(
+        `Delete ${scopeLabel}? This removes every persisted job row for the current scope only. It cannot be undone.`
+      )
+    ) {
+      return;
+    }
+    try {
+      const q =
+        cid == null
+          ? "?purge_all=true&only_global=true"
+          : `?purge_all=true&clinic_id=${encodeURIComponent(cid)}`;
+      const r = await jdelete(`/continuous-training/training/history${q}`);
+      toast(`Deleted ${r.deleted_count ?? 0} run(s) (${scopeLabel}).`);
+      historyPage = 1;
+      await refreshTraining();
+      await loadHistory();
+    } catch (e) {
+      toast(`Delete all failed (${e.status || "?"}): ${JSON.stringify(e.data)}`);
     }
   });
 

@@ -14,6 +14,7 @@ import logging
 import os
 import json
 import uuid
+import hashlib
 import time
 import subprocess
 try:
@@ -75,6 +76,14 @@ PROMOTE_REQUIRE_BASELINE_METRIC = os.getenv("PROMOTE_REQUIRE_BASELINE_METRIC", "
     "yes",
     "y",
 )
+# Batch automatic training: one job per watermark window + threshold, not every feedback save.
+BATCH_AUTO_TRAIN_ENABLED = os.getenv("BATCH_AUTO_TRAIN_ENABLED", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "y",
+)
+BATCH_SCOPE_COOLDOWN_MAX_SEC = int(os.getenv("BATCH_SCOPE_COOLDOWN_MAX_SEC", "900"))
 EKS_CLUSTER_NAME = os.getenv("EKS_CLUSTER_NAME", "vet-ai-dev")
 EKS_REGION = os.getenv("EKS_REGION", "us-east-1")
 TRAINING_NODE_GROUP = os.getenv("TRAINING_NODE_GROUP", "training-nodes")
@@ -299,6 +308,36 @@ class CTPostgresStore:
                         ADD CONSTRAINT ai_feedback_prediction_id_uniq UNIQUE (prediction_id)
                         """
                     )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ai_training_scope_state (
+                        scope_key TEXT PRIMARY KEY,
+                        last_processed_feedback_id BIGINT NOT NULL DEFAULT 0,
+                        cooldown_until TIMESTAMPTZ NULL,
+                        consecutive_failures INT NOT NULL DEFAULT 0,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute(
+                    "ALTER TABLE ai_training_jobs ADD COLUMN IF NOT EXISTS idempotency_key TEXT NULL"
+                )
+                cur.execute(
+                    "ALTER TABLE ai_training_jobs ADD COLUMN IF NOT EXISTS batch_start_feedback_id BIGINT NULL"
+                )
+                cur.execute(
+                    "ALTER TABLE ai_training_jobs ADD COLUMN IF NOT EXISTS batch_end_feedback_id BIGINT NULL"
+                )
+                cur.execute(
+                    "ALTER TABLE ai_training_jobs ADD COLUMN IF NOT EXISTS batch_feedback_ids BIGINT[] NULL"
+                )
+                cur.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_ai_training_jobs_idempotency_key
+                    ON ai_training_jobs(idempotency_key)
+                    WHERE idempotency_key IS NOT NULL
+                    """
+                )
             conn.commit()
         self._initialized = True
 
@@ -530,7 +569,13 @@ class CTPostgresStore:
         return [dict(r) for r in rows]
 
     def fetch_feedback(
-        self, eligible_only: bool = False, days: Optional[int] = None, clinic_id: Optional[str] = None
+        self,
+        eligible_only: bool = False,
+        days: Optional[int] = None,
+        clinic_id: Optional[str] = None,
+        *,
+        id_min: Optional[int] = None,
+        id_max: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         self._ensure_schema()
         cond = []
@@ -548,8 +593,14 @@ class CTPostgresStore:
         if days is not None:
             cond.append("f.created_at >= NOW() - (%s || ' days')::INTERVAL")
             params.append(int(days))
+        if id_min is not None:
+            cond.append("f.id >= %s")
+            params.append(int(id_min))
+        if id_max is not None:
+            cond.append("f.id <= %s")
+            params.append(int(id_max))
         where = "WHERE " + " AND ".join(cond)
-        select_cols = """f.prediction_id AS prediction_id, f.final_diagnosis, f.is_correct, f.ai_diagnosis,
+        select_cols = """f.id AS id, f.prediction_id AS prediction_id, f.final_diagnosis, f.is_correct, f.ai_diagnosis,
                f.confidence_rating, f.comments, f.veterinarian_id, f.is_training_eligible, f.data_quality_score,
                f.created_at AS timestamp"""
         sql = f"""
@@ -624,6 +675,331 @@ class CTPostgresStore:
                 n = cur.rowcount
             conn.commit()
         return int(n)
+
+    def _max_feedback_id_for_scope(self, clinic_key: Optional[str], pool: str) -> int:
+        pool_u = (pool or "CLINIC_ONLY").strip().upper()
+        self._ensure_schema()
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                if pool_u == "GLOBAL":
+                    cur.execute(
+                        "SELECT COALESCE(MAX(f.id), 0)::BIGINT AS m FROM ai_feedback f WHERE f.training_pool = 'GLOBAL'"
+                    )
+                else:
+                    if not clinic_key:
+                        return 0
+                    cur.execute(
+                        """
+                        SELECT COALESCE(MAX(f.id), 0)::BIGINT AS m
+                        FROM ai_feedback f
+                        INNER JOIN ai_prediction_logs p ON f.prediction_id = p.id
+                        WHERE p.clinic_id = %s AND f.training_pool = 'CLINIC_ONLY'
+                        """,
+                        (str(clinic_key).strip(),),
+                    )
+                return int(cur.fetchone()["m"])
+
+    def get_or_init_scope_state(
+        self, scope_key: str, clinic_key: Optional[str], pool: str
+    ) -> Dict[str, Any]:
+        """Load scope watermark/cooldown; insert row anchored at current MAX(feedback.id) if missing."""
+        self._ensure_schema()
+        pool_u = (pool or "CLINIC_ONLY").strip().upper()
+        mx = self._max_feedback_id_for_scope(clinic_key, pool_u)
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT scope_key, last_processed_feedback_id, cooldown_until, consecutive_failures, updated_at
+                    FROM ai_training_scope_state
+                    WHERE scope_key = %s
+                    """,
+                    (scope_key,),
+                )
+                row = cur.fetchone()
+                if row:
+                    conn.commit()
+                    return dict(row)
+                cur.execute(
+                    """
+                    INSERT INTO ai_training_scope_state (scope_key, last_processed_feedback_id)
+                    VALUES (%s, %s)
+                    ON CONFLICT (scope_key) DO NOTHING
+                    """,
+                    (scope_key, mx),
+                )
+                cur.execute(
+                    """
+                    SELECT scope_key, last_processed_feedback_id, cooldown_until, consecutive_failures, updated_at
+                    FROM ai_training_scope_state
+                    WHERE scope_key = %s
+                    """,
+                    (scope_key,),
+                )
+                row2 = cur.fetchone()
+            conn.commit()
+        return dict(row2) if row2 else {}
+
+    def is_scope_in_cooldown(self, scope_key: str) -> bool:
+        return self._scope_cooldown_active(scope_key)
+
+    def _scope_cooldown_active(self, scope_key: str) -> bool:
+        self._ensure_schema()
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM ai_training_scope_state
+                        WHERE scope_key = %s AND cooldown_until IS NOT NULL AND cooldown_until > NOW()
+                    ) AS x
+                    """,
+                    (scope_key,),
+                )
+                return bool(cur.fetchone()["x"])
+
+    def peek_eligible_feedback_ids_after_watermark(
+        self,
+        *,
+        clinic_key: Optional[str],
+        pool: str,
+        after_id: int,
+        limit: int,
+        window_days: int,
+    ) -> List[int]:
+        """Next eligible feedback ids strictly after watermark, ordered by id (batch window)."""
+        pool_u = (pool or "CLINIC_ONLY").strip().upper()
+        self._ensure_schema()
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                if pool_u == "GLOBAL":
+                    cur.execute(
+                        """
+                        SELECT f.id
+                        FROM ai_feedback f
+                        WHERE f.training_pool = 'GLOBAL'
+                          AND f.is_training_eligible = TRUE
+                          AND f.created_at >= NOW() - (%s || ' days')::INTERVAL
+                          AND f.id > %s
+                        ORDER BY f.id ASC
+                        LIMIT %s
+                        """,
+                        (int(window_days), int(after_id), int(limit)),
+                    )
+                else:
+                    if not clinic_key:
+                        return []
+                    cur.execute(
+                        """
+                        SELECT f.id
+                        FROM ai_feedback f
+                        INNER JOIN ai_prediction_logs p ON f.prediction_id = p.id
+                        WHERE p.clinic_id = %s
+                          AND f.training_pool = 'CLINIC_ONLY'
+                          AND f.is_training_eligible = TRUE
+                          AND f.created_at >= NOW() - (%s || ' days')::INTERVAL
+                          AND f.id > %s
+                        ORDER BY f.id ASC
+                        LIMIT %s
+                        """,
+                        (str(clinic_key).strip(), int(window_days), int(after_id), int(limit)),
+                    )
+                return [int(r["id"]) for r in cur.fetchall()]
+
+    def has_running_training_job_for_scope(self, clinic_key: Optional[str]) -> bool:
+        self._ensure_schema()
+        cid = str(clinic_key).strip() if clinic_key is not None else None
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1 FROM ai_training_jobs
+                    WHERE status = 'running'
+                      AND clinic_id IS NOT DISTINCT FROM %s
+                    LIMIT 1
+                    """,
+                    (cid,),
+                )
+                return cur.fetchone() is not None
+
+    def consume_feedback_ids_for_scope(
+        self, clinic_key: Optional[str], pool: str, feedback_ids: List[int]
+    ) -> int:
+        """Mark specific feedback ids ineligible after a batch train (scoped by pool/clinic)."""
+        if not feedback_ids:
+            return 0
+        pool_u = (pool or "CLINIC_ONLY").strip().upper()
+        ids = sorted({int(x) for x in feedback_ids})
+        self._ensure_schema()
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                if pool_u == "GLOBAL":
+                    cur.execute(
+                        """
+                        UPDATE ai_feedback f
+                        SET is_training_eligible = FALSE
+                        WHERE f.training_pool = 'GLOBAL'
+                          AND f.is_training_eligible = TRUE
+                          AND f.id = ANY(%s)
+                        """,
+                        (ids,),
+                    )
+                else:
+                    if not clinic_key:
+                        return 0
+                    cur.execute(
+                        """
+                        UPDATE ai_feedback f
+                        SET is_training_eligible = FALSE
+                        FROM ai_prediction_logs p
+                        WHERE f.prediction_id = p.id
+                          AND p.clinic_id = %s
+                          AND f.training_pool = 'CLINIC_ONLY'
+                          AND f.is_training_eligible = TRUE
+                          AND f.id = ANY(%s)
+                        """,
+                        (str(clinic_key).strip(), ids),
+                    )
+                n = cur.rowcount
+            conn.commit()
+        return int(n)
+
+    def record_scope_training_success(self, scope_key: str, last_processed_feedback_id: int) -> None:
+        self._ensure_schema()
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE ai_training_scope_state
+                    SET last_processed_feedback_id = %s,
+                        consecutive_failures = 0,
+                        cooldown_until = NULL,
+                        updated_at = NOW()
+                    WHERE scope_key = %s
+                    """,
+                    (int(last_processed_feedback_id), scope_key),
+                )
+            conn.commit()
+
+    def record_scope_training_failure(self, scope_key: str) -> None:
+        """Apply exponential cooldown per scope (best-effort if row missing)."""
+        self._ensure_schema()
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT consecutive_failures FROM ai_training_scope_state WHERE scope_key = %s",
+                    (scope_key,),
+                )
+                row = cur.fetchone()
+                prev = int(row["consecutive_failures"]) if row else 0
+                nfail = prev + 1
+                sec = min(BATCH_SCOPE_COOLDOWN_MAX_SEC, int(30 * (2 ** min(nfail, 5))))
+                if row:
+                    cur.execute(
+                        """
+                        UPDATE ai_training_scope_state
+                        SET consecutive_failures = %(nf)s,
+                            cooldown_until = NOW() + (%(sec)s || ' seconds')::interval,
+                            updated_at = NOW()
+                        WHERE scope_key = %(sk)s
+                        """,
+                        {"nf": nfail, "sec": sec, "sk": scope_key},
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO ai_training_scope_state (
+                            scope_key, last_processed_feedback_id, consecutive_failures, cooldown_until, updated_at
+                        )
+                        VALUES (%(sk)s, 0, %(nf)s, NOW() + (%(sec)s || ' seconds')::interval, NOW())
+                        """,
+                        {"sk": scope_key, "nf": nfail, "sec": sec},
+                    )
+            conn.commit()
+
+    def try_create_automatic_batch_training_job(
+        self,
+        *,
+        idempotency_key: str,
+        clinic_key: Optional[str],
+        pool: str,
+        batch_feedback_ids: List[int],
+        total_predictions: int,
+        dataset_row_count: int,
+        training_mode: str,
+        eks_node_group: Optional[str],
+    ) -> Optional[int]:
+        """Persist one automatic batch job; return None if idempotency_key already exists."""
+        _ = pool
+        self._ensure_schema()
+        if not batch_feedback_ids:
+            return None
+        bids = sorted({int(x) for x in batch_feedback_ids})
+        bmin, bmax = bids[0], bids[-1]
+        cid = str(clinic_key).strip() if clinic_key is not None else None
+        sql_ins = """
+        INSERT INTO ai_training_jobs (
+            status,
+            start_time,
+            total_predictions,
+            eligible_feedback_count,
+            previous_model_version,
+            trigger_type,
+            training_mode,
+            eks_node_group,
+            dataset_row_count,
+            clinic_id,
+            idempotency_key,
+            batch_start_feedback_id,
+            batch_end_feedback_id,
+            batch_feedback_ids,
+            created_at,
+            updated_at
+        ) VALUES (
+            'running',
+            NOW(),
+            %(total_predictions)s,
+            %(eligible_feedback_count)s,
+            'v2.0',
+            'automatic',
+            %(training_mode)s,
+            %(eks_node_group)s,
+            %(dataset_row_count)s,
+            %(clinic_id)s,
+            %(idempotency_key)s,
+            %(batch_start_feedback_id)s,
+            %(batch_end_feedback_id)s,
+            %(batch_feedback_ids)s,
+            NOW(),
+            NOW()
+        )
+        RETURNING training_id
+        """
+        params = {
+            "total_predictions": int(total_predictions),
+            "eligible_feedback_count": len(bids),
+            "training_mode": training_mode,
+            "eks_node_group": eks_node_group,
+            "dataset_row_count": int(dataset_row_count),
+            "clinic_id": cid,
+            "idempotency_key": idempotency_key,
+            "batch_start_feedback_id": bmin,
+            "batch_end_feedback_id": bmax,
+            "batch_feedback_ids": bids,
+        }
+        from psycopg2 import errors as pg_errors
+
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                try:
+                    cur.execute(sql_ins, params)
+                    row = cur.fetchone()
+                    tid = int(row["training_id"]) if row else None
+                except pg_errors.UniqueViolation:
+                    conn.rollback()
+                    return None
+            conn.commit()
+        return tid
 
     def create_training_job(
         self,
@@ -791,7 +1167,11 @@ class CTPostgresStore:
             promote_guardrail_passed,
             promote_guardrail_reason,
             audit_snapshot,
-            clinic_id
+            clinic_id,
+            idempotency_key,
+            batch_start_feedback_id,
+            batch_end_feedback_id,
+            batch_feedback_ids
         FROM ai_training_jobs
         WHERE training_id = %(training_id)s
         """
@@ -880,6 +1260,46 @@ class CTPostgresStore:
                         (clinic_id,),
                     )
                 return int(cur.fetchone()["c"])
+
+    def delete_training_job(self, training_id: int) -> bool:
+        """Xóa một bản ghi ai_training_jobs. Trả về True nếu có dòng bị xóa."""
+        self._ensure_schema()
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM ai_training_jobs WHERE training_id = %s RETURNING training_id",
+                    (int(training_id),),
+                )
+                deleted = cur.fetchone() is not None
+            conn.commit()
+        return bool(deleted)
+
+    def delete_training_jobs_purge(
+        self,
+        *,
+        all_rows: bool = False,
+        clinic_id: Optional[str] = None,
+        only_global: bool = False,
+    ) -> int:
+        """Xóa hàng loạt: toàn bộ bảng, chỉ job global (clinic_id NULL), hoặc theo một clinic."""
+        self._ensure_schema()
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                if all_rows:
+                    cur.execute("DELETE FROM ai_training_jobs")
+                elif only_global:
+                    cur.execute("DELETE FROM ai_training_jobs WHERE clinic_id IS NULL")
+                elif clinic_id is not None:
+                    cid = str(clinic_id).strip()
+                    cur.execute(
+                        "DELETE FROM ai_training_jobs WHERE clinic_id IS NOT DISTINCT FROM %s",
+                        (cid,),
+                    )
+                else:
+                    return 0
+                n = cur.rowcount
+            conn.commit()
+        return int(n)
 
 
 ct_store = CTPostgresStore(DATABASE_URL)
@@ -1000,6 +1420,11 @@ async def save_feedback(feedback: DoctorFeedback) -> bool:
     except Exception:
         logger.exception("Failed to record feedback metrics")
     _refresh_training_metrics()
+
+    try:
+        await schedule_automatic_batch_training_if_ready(pred_clinic, pool)
+    except Exception:
+        logger.exception("schedule_automatic_batch_training_if_ready failed")
 
     logger.info("Feedback saved successfully.")
     return True
@@ -1235,6 +1660,129 @@ def build_training_dataset_snapshot(
     return rows
 
 
+def _training_scope_key_from_pool(clinic_id: Optional[str], pool: str) -> str:
+    pool_u = (pool or "CLINIC_ONLY").strip().upper()
+    if pool_u == "GLOBAL":
+        return "global:GLOBAL"
+    ck = normalize_clinic_key(clinic_id)
+    return f"clinic:{ck or 'unknown'}:CLINIC_ONLY"
+
+
+def _scope_key_from_job_row_for_batch(job: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not job or not job.get("batch_feedback_ids"):
+        return None
+    cid = job.get("clinic_id")
+    if cid is None:
+        return _training_scope_key_from_pool(None, "GLOBAL")
+    return _training_scope_key_from_pool(normalize_clinic_key(cid), "CLINIC_ONLY")
+
+
+async def schedule_automatic_batch_training_if_ready(
+    prediction_clinic_id: Optional[str],
+    pool: str,
+) -> None:
+    """Peek watermark + queue one automatic job when T eligible rows exist (idempotent per batch)."""
+    if not BATCH_AUTO_TRAIN_ENABLED:
+        return
+    pool_u = (pool or "CLINIC_ONLY").strip().upper()
+    if pool_u == "GLOBAL":
+        clinic_key: Optional[str] = None
+    else:
+        clinic_key = normalize_clinic_key(prediction_clinic_id)
+        if not clinic_key:
+            return
+
+    scope_key = _training_scope_key_from_pool(
+        prediction_clinic_id if pool_u != "GLOBAL" else None,
+        pool_u,
+    )
+    if ct_store.is_scope_in_cooldown(scope_key):
+        return
+    if ct_store.has_running_training_job_for_scope(clinic_key):
+        return
+
+    state = ct_store.get_or_init_scope_state(scope_key, clinic_key, pool_u)
+    after_id = int(state.get("last_processed_feedback_id") or 0)
+    ids = ct_store.peek_eligible_feedback_ids_after_watermark(
+        clinic_key=clinic_key,
+        pool=pool_u,
+        after_id=after_id,
+        limit=TRAINING_THRESHOLD,
+        window_days=TRAINING_WINDOW_DAYS,
+    )
+    if len(ids) < TRAINING_THRESHOLD:
+        return
+
+    idempotency_key = hashlib.sha256(
+        json.dumps(ids, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+    total_predictions = ct_store.count_predictions(clinic_id=clinic_key)
+    all_predictions = ct_store.fetch_predictions(clinic_id=clinic_key)
+    lo, hi = min(ids), max(ids)
+    id_set = set(ids)
+    batch_feedback_items = [
+        f
+        for f in ct_store.fetch_feedback(
+            eligible_only=True,
+            days=TRAINING_WINDOW_DAYS,
+            clinic_id=clinic_key,
+            id_min=lo,
+            id_max=hi,
+        )
+        if f.get("id") in id_set
+    ]
+
+    dataset_rows = build_training_dataset_snapshot(batch_feedback_items, all_predictions)
+    dataset_row_count = len(dataset_rows)
+
+    tid = ct_store.try_create_automatic_batch_training_job(
+        idempotency_key=idempotency_key,
+        clinic_key=clinic_key,
+        pool=pool_u,
+        batch_feedback_ids=ids,
+        total_predictions=total_predictions,
+        dataset_row_count=dataset_row_count,
+        training_mode="local",
+        eks_node_group=None,
+    )
+    if tid is None:
+        return
+
+    training_datasets[tid] = dataset_rows
+    training_jobs[tid] = {
+        "training_id": tid,
+        "status": "running",
+        "start_time": datetime.now(),
+        "end_time": None,
+        "total_predictions": total_predictions,
+        "eligible_feedback_count": len(ids),
+        "previous_model_version": "v2.0",
+        "new_model_version": None,
+        "training_accuracy": None,
+        "validation_accuracy": None,
+        "f1_score": None,
+        "is_deployed": False,
+        "error_message": None,
+        "trigger_type": "automatic",
+        "training_mode": "local",
+        "dataset_row_count": dataset_row_count,
+        "small_sample_warning": None,
+        "metrics_note": None,
+        "clinic_id": clinic_key,
+    }
+
+    logger.info(
+        "Enqueued automatic batch training job=%s scope=%s batch_ids=%s..%s",
+        tid,
+        scope_key,
+        ids[0],
+        ids[-1],
+    )
+    asyncio.create_task(execute_actual_training(tid, "local"))
+    _refresh_training_metrics()
+
+
 @router.get("/config")
 async def get_training_policy():
     return {
@@ -1338,10 +1886,16 @@ async def execute_actual_training(training_id: int, training_mode: str):
             except Exception:
                 pass
         clinic_key: Optional[str] = None
+        job_row: Optional[Dict[str, Any]] = None
+        batch_ids: Optional[List[int]] = None
+        scope_key_batch: Optional[str] = None
         try:
-            row = ct_store.get_training_job(training_id)
-            if row and row.get("clinic_id") is not None:
-                clinic_key = normalize_clinic_key(row["clinic_id"])
+            job_row = ct_store.get_training_job(training_id)
+            if job_row and job_row.get("clinic_id") is not None:
+                clinic_key = normalize_clinic_key(job_row["clinic_id"])
+            if job_row and job_row.get("batch_feedback_ids"):
+                batch_ids = [int(x) for x in job_row["batch_feedback_ids"]]
+                scope_key_batch = _scope_key_from_job_row_for_batch(job_row)
         except Exception:
             pass
         if clinic_key is None and training_id in training_jobs:
@@ -1351,17 +1905,39 @@ async def execute_actual_training(training_id: int, training_mode: str):
 
         effective_mode = _effective_training_mode(training_mode)
         logger.info(
-            "Starting actual training for job %s (requested=%s, effective=%s, clinic_id=%s)",
+            "Starting actual training for job %s (requested=%s, effective=%s, clinic_id=%s, batch=%s)",
             training_id,
             training_mode,
             effective_mode,
             clinic_key,
-        )
-        current_feedback = ct_store.fetch_feedback(
-            eligible_only=True, days=TRAINING_WINDOW_DAYS, clinic_id=clinic_key
+            bool(batch_ids),
         )
         current_predictions = ct_store.fetch_predictions(clinic_id=clinic_key)
-        
+        if batch_ids:
+            lo, hi = min(batch_ids), max(batch_ids)
+            id_set = set(batch_ids)
+            fb = ct_store.fetch_feedback(
+                eligible_only=True,
+                days=TRAINING_WINDOW_DAYS,
+                clinic_id=clinic_key,
+                id_min=lo,
+                id_max=hi,
+            )
+            current_feedback = [f for f in fb if f.get("id") in id_set]
+        else:
+            current_feedback = ct_store.fetch_feedback(
+                eligible_only=True, days=TRAINING_WINDOW_DAYS, clinic_id=clinic_key
+            )
+
+        exec_kw: Dict[str, Any] = {
+            "clinic_id": clinic_key,
+            "training_id": training_id,
+            "dataset_window_days": TRAINING_WINDOW_DAYS,
+            "pipeline_kind": "continuous_training",
+        }
+        if batch_ids:
+            exec_kw["feedback_id_allowlist"] = set(batch_ids)
+
         if effective_mode == "eks_hybrid":
             # Optional: dedicated node group + Job (needs ALLOW_EKS_HYBRID_TRAINING=true and full infra)
             result = await run_eks_training(training_id)
@@ -1372,10 +1948,7 @@ async def execute_actual_training(training_id: int, training_mode: str):
                 current_feedback,
                 current_predictions,
                 "local",
-                clinic_id=clinic_key,
-                training_id=training_id,
-                dataset_window_days=TRAINING_WINDOW_DAYS,
-                pipeline_kind="continuous_training",
+                **exec_kw,
             )
 
         if result.get("status") == "completed":
@@ -1493,7 +2066,12 @@ async def execute_actual_training(training_id: int, training_mode: str):
                 logger.warning("Failed to set active model after training: %s", e)
 
             # Mark feedback ineligible after successful training (same batch is not re-fed); keep rows for dashboards.
-            consumed = ct_store.consume_feedback_after_training(clinic_id=clinic_key)
+            if batch_ids and scope_key_batch:
+                pool_str = "GLOBAL" if clinic_key is None else "CLINIC_ONLY"
+                consumed = ct_store.consume_feedback_ids_for_scope(clinic_key, pool_str, batch_ids)
+                ct_store.record_scope_training_success(scope_key_batch, max(batch_ids))
+            else:
+                consumed = ct_store.consume_feedback_after_training(clinic_id=clinic_key)
             logger.info("Feedback marked consumed after training completion. Updated rows: %s", consumed)
 
             logger.info(f"Training {training_id} completed successfully!")
@@ -1514,14 +2092,26 @@ async def execute_actual_training(training_id: int, training_mode: str):
                     "status": "failed",
                     "error_message": error_msg,
                 })
+            if scope_key_batch:
+                try:
+                    ct_store.record_scope_training_failure(scope_key_batch)
+                except Exception:
+                    logger.exception("record_scope_training_failure after failed result")
             _refresh_training_metrics()
-            
+
     except Exception as e:
         logger.error(f"Training execution failed for {training_id}: {e}")
         try:
             ct_store.update_training_job_failed(training_id, error_message=str(e))
         except Exception:
             pass
+        try:
+            jr = ct_store.get_training_job(training_id)
+            sk = _scope_key_from_job_row_for_batch(jr)
+            if sk:
+                ct_store.record_scope_training_failure(sk)
+        except Exception:
+            logger.exception("record_scope_training_failure after exception")
         if training_id in training_jobs:
             training_jobs[training_id].update({
                 "status": "failed",
@@ -2240,6 +2830,103 @@ async def get_training_history(
     except Exception as e:
         logger.error(f"Failed to get training history: {e}")
         raise HTTPException(status_code=500, detail="Failed to get training history")
+
+
+def _purge_training_job_memory(training_id: int) -> None:
+    tid = int(training_id)
+    training_jobs.pop(tid, None)
+    training_datasets.pop(tid, None)
+
+
+def _purge_training_memory_after_bulk(
+    *,
+    all_rows: bool,
+    only_global: bool,
+    clinic_id: Optional[str],
+) -> None:
+    if all_rows:
+        training_jobs.clear()
+        training_datasets.clear()
+        return
+    if only_global:
+        for tid in list(training_jobs.keys()):
+            cid = training_jobs.get(tid, {}).get("clinic_id")
+            if cid is None or str(cid).strip() == "":
+                training_jobs.pop(tid, None)
+                training_datasets.pop(tid, None)
+        return
+    ck = normalize_clinic_key(clinic_id)
+    for tid in list(training_jobs.keys()):
+        if normalize_clinic_key(training_jobs.get(tid, {}).get("clinic_id")) == ck:
+            training_jobs.pop(tid, None)
+            training_datasets.pop(tid, None)
+
+
+@router.delete("/training/history/{training_id}", status_code=200)
+async def delete_training_history_one(training_id: int, _: bool = Depends(verify_admin)):
+    """Xóa một job training khỏi Postgres và bộ nhớ snapshot (admin)."""
+    if not ct_store.enabled:
+        raise HTTPException(status_code=503, detail="Continuous training store is disabled")
+    try:
+        if not ct_store.delete_training_job(training_id):
+            raise HTTPException(status_code=404, detail="Training job not found")
+        _purge_training_job_memory(training_id)
+        _refresh_training_metrics()
+        return {"deleted": True, "training_id": int(training_id)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("delete_training_history_one failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to delete training job")
+
+
+@router.delete("/training/history", status_code=200)
+async def delete_training_history_bulk(
+    _: bool = Depends(verify_admin),
+    purge_all: bool = Query(False, description="Bật true để xóa hàng loạt (cần kèm một trong: all_rows / only_global / clinic_id)"),
+    all_rows: bool = Query(False, description="Xóa mọi bản ghi ai_training_jobs"),
+    only_global: bool = Query(False, description="Chỉ xóa job global (clinic_id NULL)"),
+    clinic_id: Optional[str] = Query(None, description="Chỉ xóa job của clinic này (mutually exclusive với only_global)"),
+):
+    """Xóa lịch sử training hàng loạt: toàn DB, chỉ global, hoặc theo clinic (admin)."""
+    if not ct_store.enabled:
+        raise HTTPException(status_code=503, detail="Continuous training store is disabled")
+    if not purge_all:
+        raise HTTPException(
+            status_code=422,
+            detail="Set purge_all=true and choose all_rows, only_global, or clinic_id",
+        )
+    modes = int(all_rows) + int(only_global) + int(clinic_id is not None and str(clinic_id).strip() != "")
+    if modes != 1:
+        raise HTTPException(
+            status_code=422,
+            detail="Choose exactly one of: all_rows=true, only_global=true, or clinic_id=<id>",
+        )
+    ck_norm = normalize_clinic_key(clinic_id) if clinic_id and str(clinic_id).strip() else None
+    try:
+        n = ct_store.delete_training_jobs_purge(
+            all_rows=all_rows,
+            clinic_id=ck_norm,
+            only_global=only_global,
+        )
+        _purge_training_memory_after_bulk(
+            all_rows=all_rows,
+            only_global=only_global,
+            clinic_id=ck_norm,
+        )
+        _refresh_training_metrics()
+        return {
+            "deleted_count": n,
+            "purge_all": True,
+            "all_rows": all_rows,
+            "only_global": only_global,
+            "clinic_id": ck_norm,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("delete_training_history_bulk failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to purge training history")
 
 
 @router.get("/training/dataset")
