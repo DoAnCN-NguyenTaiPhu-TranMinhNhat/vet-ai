@@ -10,6 +10,13 @@ async function jget(url) {
 const HISTORY_PAGE_SIZE = 10;
 let historyPage = 1;
 const MLUI_CLINIC_STORAGE_KEY = "vetai_mlops_clinic_id";
+const AUTO_REFRESH_MS = 2000;
+let autoRefreshTimer = null;
+let autoRefreshInFlight = false;
+let policyEditingLocked = false;
+let policyServerSnapshot = null;
+let policyLastUserEditAt = 0;
+const POLICY_REFRESH_GUARD_MS = 8000;
 
 function parseClinicFromUrl() {
   const p = new URLSearchParams(window.location.search || "");
@@ -353,8 +360,22 @@ async function loadHistory() {
 
 async function loadPolicy() {
   const p = await jget("/continuous-training/config");
-  document.getElementById("policy-threshold").value = p.training_threshold;
-  document.getElementById("policy-window").value = p.training_window_days;
+  policyServerSnapshot = {
+    training_threshold: Number(p.training_threshold),
+    training_window_days: Number(p.training_window_days),
+  };
+  const thresholdEl = document.getElementById("policy-threshold");
+  const windowEl = document.getElementById("policy-window");
+  if (!thresholdEl || !windowEl) return;
+
+  const now = Date.now();
+  const editingRecently = now - policyLastUserEditAt < POLICY_REFRESH_GUARD_MS;
+  const editingByFocus =
+    document.activeElement === thresholdEl || document.activeElement === windowEl;
+
+  if (policyEditingLocked || editingByFocus || editingRecently) return;
+  thresholdEl.value = p.training_threshold;
+  windowEl.value = p.training_window_days;
 }
 
 async function savePolicy() {
@@ -370,8 +391,44 @@ async function savePolicy() {
     training_threshold: threshold,
     training_window_days: windowDays
   });
+  policyEditingLocked = false;
+  policyServerSnapshot = {
+    training_threshold: Number(r.training_threshold),
+    training_window_days: Number(r.training_window_days),
+  };
   toast(`Saved policy: threshold=${r.training_threshold}, window=${r.training_window_days}`);
   await refreshTraining();
+  await loadPolicy();
+}
+
+function bindPolicyEditLock() {
+  const thresholdEl = document.getElementById("policy-threshold");
+  const windowEl = document.getElementById("policy-window");
+  if (!thresholdEl || !windowEl) return;
+
+  const markEditing = () => {
+    policyEditingLocked = true;
+    policyLastUserEditAt = Date.now();
+  };
+  const maybeUnlock = () => {
+    policyLastUserEditAt = Date.now();
+    const th = Number(thresholdEl.value);
+    const wd = Number(windowEl.value);
+    if (
+      policyServerSnapshot &&
+      th === policyServerSnapshot.training_threshold &&
+      wd === policyServerSnapshot.training_window_days
+    ) {
+      policyEditingLocked = false;
+    }
+  };
+
+  thresholdEl.addEventListener("input", markEditing);
+  windowEl.addEventListener("input", markEditing);
+  thresholdEl.addEventListener("focus", markEditing);
+  windowEl.addEventListener("focus", markEditing);
+  thresholdEl.addEventListener("change", maybeUnlock);
+  windowEl.addEventListener("change", maybeUnlock);
 }
 
 async function loadDrift() {
@@ -404,7 +461,32 @@ async function refreshAll() {
   await loadArtifactStorage();
 }
 
+async function runAutoRefreshTick() {
+  if (autoRefreshInFlight) return;
+  autoRefreshInFlight = true;
+  try {
+    await refreshAll();
+  } catch (_) {
+    // Auto-refresh should be silent; manual actions already surface errors.
+  } finally {
+    autoRefreshInFlight = false;
+  }
+}
+
+function stopAutoRefresh() {
+  if (autoRefreshTimer != null) {
+    clearInterval(autoRefreshTimer);
+    autoRefreshTimer = null;
+  }
+}
+
+function startAutoRefresh() {
+  stopAutoRefresh();
+  autoRefreshTimer = setInterval(runAutoRefreshTick, AUTO_REFRESH_MS);
+}
+
 async function main() {
+  bindPolicyEditLock();
   const tokenEl = document.getElementById("admin-token");
   if (tokenEl) {
     tokenEl.value = localStorage.getItem("vetai_admin_token") || "";
@@ -424,6 +506,7 @@ async function main() {
   });
   document.getElementById("clinic-scope").addEventListener("change", async () => {
     historyPage = 1;
+    policyEditingLocked = false;
     syncClinicToUrlAndStorage(getSelectedClinicKey());
     updateClinicContextBanner();
     try {
@@ -598,9 +681,21 @@ async function main() {
   try {
     await loadClinicOptions();
     await refreshAll();
+    startAutoRefresh();
   } catch (e) {
     toast(`Initial load failed (${e.status || "?"})`);
   }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      stopAutoRefresh();
+      return;
+    }
+    startAutoRefresh();
+    runAutoRefreshTick();
+  });
+
+  window.addEventListener("beforeunload", stopAutoRefresh);
 }
 
 main();
