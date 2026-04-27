@@ -2,7 +2,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 from ai_service.app.domain.services.clinic_scope_service import clinic_dir_slug, normalize_clinic_key
 
@@ -73,6 +73,73 @@ def list_model_versions(clinic_key: Optional[Union[str, int]] = None) -> List[st
         if v not in seen_order:
             seen_order.append(v)
     return seen_order
+
+
+def list_all_model_versions() -> List[str]:
+    """
+    Return all discoverable model versions from global root and all clinic subfolders.
+    """
+    root = _models_root()
+    seen = set()
+    out: List[str] = []
+
+    def _add(items: List[str]) -> None:
+        for item in items:
+            if item not in seen:
+                seen.add(item)
+                out.append(item)
+
+    _add(_collect_versions_under(root))
+    clinics_root = os.path.join(root, "clinics")
+    if os.path.isdir(clinics_root):
+        for clinic_slug in os.listdir(clinics_root):
+            clinic_path = os.path.join(clinics_root, clinic_slug)
+            if not os.path.isdir(clinic_path):
+                continue
+            _add(_collect_versions_under(clinic_path))
+
+    timestamped = sorted([v for v in out if "_" in v], reverse=True)
+    semantic = sorted([v for v in out if "_" not in v], reverse=True)
+    rest = [v for v in out if v not in timestamped and v not in semantic]
+    return timestamped + semantic + rest
+
+
+def list_model_versions_with_scope() -> List[Dict[str, Optional[str]]]:
+    """
+    Return model versions with scope metadata.
+    - clinic_key=None means global model root.
+    - clinic_key=<id> means clinic-scoped model under models/clinics/<slug>/.
+    """
+    root = _models_root()
+    rows: List[Dict[str, Optional[str]]] = []
+
+    for version in _collect_versions_under(root):
+        rows.append(
+            {
+                "version": version,
+                "clinic_key": None,
+                "model_dir": resolve_model_dir(version, None),
+            }
+        )
+
+    clinics_root = os.path.join(root, "clinics")
+    if os.path.isdir(clinics_root):
+        for clinic_slug in os.listdir(clinics_root):
+            clinic_path = os.path.join(clinics_root, clinic_slug)
+            if not os.path.isdir(clinic_path):
+                continue
+            for version in _collect_versions_under(clinic_path):
+                rows.append(
+                    {
+                        "version": version,
+                        "clinic_key": clinic_slug,
+                        "model_dir": os.path.join(clinic_path, version),
+                    }
+                )
+
+    # newest-looking versions first while keeping scope grouping stable enough
+    rows.sort(key=lambda r: str(r.get("version") or ""), reverse=True)
+    return rows
 
 
 def resolve_model_dir(model_version: str, clinic_key: Optional[Union[str, int]] = None) -> str:

@@ -1,6 +1,6 @@
 # Vet-AI
 
-FastAPI service for **veterinary diagnosis** (sklearn RandomForest), **continuous learning** from clinician feedback, **MLOps** (MLflow, optional S3 artifacts), **Prometheus** metrics, and a small **MLOps UI**.
+FastAPI service for **veterinary diagnosis** (sklearn RandomForest), **continuous learning** from clinician feedback, **MLOps** (MLflow, optional S3 artifacts), and **Prometheus** metrics.
 
 ---
 
@@ -48,7 +48,6 @@ vet-ai/
 - **Postgres** persistence for predictions, feedback, and training jobs (`DATABASE_URL`).
 - **MLflow** experiment tracking (`MLFLOW_TRACKING_URI`).
 - **Prometheus**: `/metrics` (via `prometheus-fastapi-instrumentator`) plus custom counters/histograms in `ai_service/metrics.py`.
-- **MLOps UI** (static): **`GET /mlops-ui`** — training triggers, policy, registry status (admin token required for mutating calls from the browser).
 
 ---
 
@@ -148,8 +147,25 @@ In **vet-microservices**, `docker-compose.yml` usually builds this repo as servi
 | `/continuous-training/*` | Config, eligibility, feedback, prediction logging, training trigger/history, bootstrap CSV (admin). |
 | `/mlops/*` | Registry, drift, alignment helpers. |
 | `/mlops/v2/*` | Champion–challenger workflow (Bearer admin). |
+| `/mlair/status`, `/mlair/runs/training`, `/mlair/runs/{run_id}` | Optional MLAir bridge endpoints for pipeline trigger and run tracking. |
 | `/metrics` | Prometheus scrape endpoint. |
-| `/mlops-ui` | Static MLOps UI. |
+
+---
+
+## MLAir integration (optional)
+
+Vet-AI can trigger and inspect MLAir runs via built-in bridge endpoints:
+
+- `GET /mlair/status`
+- `POST /mlair/runs/training` (admin token required)
+- `GET /mlair/runs/{run_id}`
+
+Required environment variables (see `env/.env.example`):
+
+- `MLAIR_ENABLED=true`
+- `MLAIR_API_BASE_URL` (for example `http://ml-air-api:8080` in Docker network)
+- `MLAIR_TENANT_ID`, `MLAIR_PROJECT_ID`, `MLAIR_PIPELINE_ID`
+- `MLAIR_AUTH_TOKEN` (if MLAir API requires bearer auth)
 
 Full schemas: **`/docs`**.
 

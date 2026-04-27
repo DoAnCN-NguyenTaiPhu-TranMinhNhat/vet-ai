@@ -1,14 +1,13 @@
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
 
 from ai_service.app.api.middleware.request_id import request_id_middleware
 from ai_service.app.api.routers.health import router as health_router
+from ai_service.app.api.routers.mlair import router as mlair_router
 from ai_service.app.api.routers.mlops import router as mlops_router
 from ai_service.app.api.routers.mlops_v2 import router as mlops_v2_router
 from ai_service.app.api.routers.models import router as models_router
@@ -27,6 +26,22 @@ async def _app_lifespan(app: FastAPI):
         load_artifacts()
     except Exception as exc:
         logger.warning("Cannot load artifacts at startup: %s", exc)
+
+    # Optional startup sync: push all discoverable model versions to MLAir
+    # so model registry is populated even before any new training run completes.
+    startup_sync_flag = os.getenv(
+        "VETAI_MLAIR_SYNC_MODELS_ON_STARTUP",
+        os.getenv("MLAIR_SYNC_MODELS_ON_STARTUP", "true"),
+    )
+    if startup_sync_flag.lower() == "true":
+        try:
+            from ai_service.app.infrastructure.external import mlair_client
+
+            if mlair_client.config_summary().get("enabled"):
+                sync_result = mlair_client.sync_all_models_to_mlair()
+                logger.info("MLAir startup model sync completed: %s", sync_result)
+        except Exception as exc:
+            logger.warning("MLAir startup model sync skipped/failed: %s", exc)
 
     refresh_fn = None
     try:
@@ -74,19 +89,6 @@ app = FastAPI(
     lifespan=_app_lifespan,
 )
 
-_UI_DIR = Path(__file__).resolve().parents[1] / "ui"
-_UI_STATIC_DIR = _UI_DIR / "static"
-if _UI_STATIC_DIR.exists():
-    app.mount("/mlops-ui/static", StaticFiles(directory=str(_UI_STATIC_DIR)), name="mlops-ui-static")
-
-
-@app.get("/mlops-ui", include_in_schema=False)
-def mlops_ui() -> HTMLResponse:
-    index = _UI_DIR / "index.html"
-    if not index.exists():
-        return HTMLResponse("<h3>UI not found</h3>", status_code=404)
-    return HTMLResponse(index.read_text(encoding="utf-8"))
-
 
 app.middleware("http")(request_id_middleware)
 setup_metrics(app)
@@ -95,6 +97,7 @@ app.include_router(health_router)
 app.include_router(predict_router)
 app.include_router(models_router)
 app.include_router(training_router)
+app.include_router(mlair_router)
 
 if mlops_router:
     app.include_router(mlops_router)
