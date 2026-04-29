@@ -169,6 +169,27 @@ Required environment variables (see `env/.env.example`):
 
 Full schemas: **`/docs`**.
 
+### Scope behavior (tenant/project)
+
+For multi-tenant setups, Vet-AI can sync MLAir scopes per clinic.
+
+Recommended defaults:
+
+- `MLAIR_MODEL_SCOPE_PER_CLINIC=true`
+- `MLAIR_ENSURE_CLINIC_SCOPES=true`
+- `MLAIR_ENSURE_CLINIC_TRAINING_PIPELINES=true` (creates an initial MLAir pipeline version per `clinic_*` project on sync so training can use the latest DAG)
+
+Default scope mapping:
+
+- Global model scope -> `project_id=default_project`
+- Clinic model scope -> `project_id=clinic_<clinic_id_slug>`
+
+If MLAir UI dropdown only shows `global/all`, verify:
+
+1. Vet-AI has run model sync: `POST /mlair/models/sync`
+2. MLAir `/v1/tenants/{tenant}/projects` returns clinic projects
+3. Token used in MLAir UI has access to the target tenant/projects
+
 ---
 
 ## Admin authentication

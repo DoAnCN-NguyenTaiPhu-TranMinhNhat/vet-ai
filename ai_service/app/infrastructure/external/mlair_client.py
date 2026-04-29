@@ -1,17 +1,29 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import urllib.error
 import urllib.request
 from typing import Any, Dict, Optional
 
+from ai_service.app.domain.services.clinic_catalog_service import get_clinics_for_mlops
 from ai_service.app.domain.services.clinic_scope_service import clinic_dir_slug
 from ai_service.app.infrastructure.storage import model_store
 
+logger = logging.getLogger(__name__)
+
+# Default DAG for MLAir executor (same shape as ml-air/scripts/day6_integration_check.py).
+_DEFAULT_TRAINING_PIPELINE_CONFIG: Dict[str, Any] = {
+    "tasks": [
+        {"id": "extract"},
+        {"id": "transform", "depends_on": ["extract"]},
+        {"id": "train", "depends_on": ["transform"]},
+    ]
+}
+
 
 def _cfg() -> Dict[str, Any]:
-    clinic_project_map = os.getenv("MLAIR_CLINIC_PROJECT_MAP_JSON", "").strip()
     clinic_tenant_map = os.getenv("MLAIR_CLINIC_TENANT_MAP_JSON", "").strip()
     clinic_model_alias_map = os.getenv("MLAIR_CLINIC_MODEL_ALIAS_MAP_JSON", "").strip()
     return {
@@ -22,7 +34,6 @@ def _cfg() -> Dict[str, Any]:
         "pipeline_id": os.getenv("MLAIR_PIPELINE_ID", "vet_ai_training_pipeline"),
         "token": os.getenv("MLAIR_AUTH_TOKEN", ""),
         "timeout": float(os.getenv("MLAIR_TIMEOUT_SECONDS", "10")),
-        "clinic_project_map": json.loads(clinic_project_map) if clinic_project_map else {},
         "clinic_tenant_map": json.loads(clinic_tenant_map) if clinic_tenant_map else {},
         "clinic_model_alias_map": json.loads(clinic_model_alias_map) if clinic_model_alias_map else {},
         "model_scope_per_clinic": os.getenv("MLAIR_MODEL_SCOPE_PER_CLINIC", "true").lower() == "true",
@@ -69,10 +80,8 @@ def _resolve_scope(cfg: Dict[str, Any], clinic_id: Optional[str]) -> Dict[str, s
     project_id = cfg["project_id"]
     if clinic_key:
         tenant_id = str(cfg["clinic_tenant_map"].get(clinic_key) or tenant_id)
-        mapped_project = str(cfg["clinic_project_map"].get(clinic_key) or "").strip()
-        # DB-driven default: if clinic is present and no explicit map, derive
-        # one stable project id from clinic id so data is not forced into global.
-        project_id = mapped_project or f"clinic_{clinic_dir_slug(clinic_key)}"
+        # Scope is always clinic-driven to avoid env hard-coded project mapping.
+        project_id = f"clinic_{clinic_dir_slug(clinic_key)}"
     return {"tenant_id": tenant_id, "project_id": project_id}
 
 
@@ -83,12 +92,29 @@ def _clinic_model_suffix(cfg: Dict[str, Any], clinic_key: str) -> str:
     return clinic_dir_slug(clinic_key)
 
 
+def _scoped_model_name(base_name: str, clinic_key: Optional[str]) -> str:
+    # Naming convention:
+    # - global scope: vet-global
+    # - clinic scope: vet-<clinic_id>
+    # Keep default "vet" prefix to make filtering deterministic in MLAir UI.
+    prefix = "vet"
+    if base_name.strip():
+        normalized = clinic_dir_slug(base_name.strip())
+        if normalized and normalized != "vet-ai":
+            prefix = normalized
+    if clinic_key:
+        return f"{prefix}-{clinic_dir_slug(clinic_key)}"
+    return f"{prefix}-global"
+
+
 def trigger_training_run(
     *,
     idempotency_key: str,
     pipeline_id: str | None = None,
     clinic_id: Optional[str] = None,
     context: Optional[Dict[str, Any]] = None,
+    training_mode: Optional[str] = None,
+    override_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     cfg = _cfg()
     if not cfg["enabled"]:
@@ -96,7 +122,9 @@ def trigger_training_run(
 
     pid = pipeline_id or cfg["pipeline_id"]
     scope = _resolve_scope(cfg, clinic_id)
-    url = f"{cfg['base_url']}/v1/tenants/{scope['tenant_id']}/projects/{scope['project_id']}/runs"
+    use_gating_run = os.getenv("MLAIR_USE_GATING_RUN_ENDPOINT", "true").lower() == "true"
+    route = "run" if use_gating_run else "runs"
+    url = f"{cfg['base_url']}/v1/tenants/{scope['tenant_id']}/projects/{scope['project_id']}/pipelines/{pid}/{route}"
     body: Dict[str, Any] = {"pipeline_id": pid, "idempotency_key": idempotency_key}
     if clinic_id:
         body["context"] = {"clinic_id": clinic_id}
@@ -104,6 +132,10 @@ def trigger_training_run(
         merged = dict(body.get("context") or {})
         merged.update(context)
         body["context"] = merged
+    if training_mode:
+        body["training_mode"] = str(training_mode).strip().lower()
+    if override_config and isinstance(override_config, dict):
+        body["override_config"] = override_config
     return _request_json("POST", url, body=body, headers=_headers(cfg), timeout=cfg["timeout"])
 
 
@@ -151,6 +183,55 @@ def _create_model_version(
     url = f"{cfg['base_url']}/v1/tenants/{tenant_id}/projects/{project_id}/models/{model_id}/versions"
     body = {"artifact_uri": artifact_uri, "stage": stage}
     return _request_json("POST", url, body=body, headers=_headers(cfg), timeout=cfg["timeout"])
+
+
+def _training_pipeline_dag_config() -> Dict[str, Any]:
+    raw = (os.getenv("MLAIR_TRAINING_PIPELINE_CONFIG_JSON") or "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict) and parsed.get("tasks"):
+                return parsed
+            logger.warning("MLAIR_TRAINING_PIPELINE_CONFIG_JSON ignored: expected object with 'tasks'")
+        except json.JSONDecodeError as exc:
+            logger.warning("MLAIR_TRAINING_PIPELINE_CONFIG_JSON invalid: %s", exc)
+    return dict(_DEFAULT_TRAINING_PIPELINE_CONFIG)
+
+
+def _list_pipeline_versions(
+    cfg: Dict[str, Any], tenant_id: str, project_id: str, pipeline_id: str
+) -> Dict[str, Any]:
+    url = (
+        f"{cfg['base_url']}/v1/tenants/{tenant_id}/projects/{project_id}"
+        f"/pipelines/{pipeline_id}/versions?limit=50"
+    )
+    return _request_json("GET", url, body=None, headers=_headers(cfg), timeout=cfg["timeout"])
+
+
+def _create_pipeline_version(
+    cfg: Dict[str, Any],
+    tenant_id: str,
+    project_id: str,
+    pipeline_id: str,
+    dag: Dict[str, Any],
+) -> Dict[str, Any]:
+    url = f"{cfg['base_url']}/v1/tenants/{tenant_id}/projects/{project_id}/pipelines/{pipeline_id}/versions"
+    body = {"config": dag}
+    return _request_json("POST", url, body=body, headers=_headers(cfg), timeout=cfg["timeout"])
+
+
+def _ensure_clinic_training_pipeline(
+    cfg: Dict[str, Any], tenant_id: str, project_id: str, pipeline_id: str
+) -> bool:
+    """Create initial pipeline version for this scope if none exist. Returns True if created."""
+    listed = _list_pipeline_versions(cfg, tenant_id, project_id, pipeline_id)
+    items = listed.get("items") if isinstance(listed, dict) else []
+    items = items if isinstance(items, list) else []
+    if items:
+        return False
+    dag = _training_pipeline_dag_config()
+    _create_pipeline_version(cfg, tenant_id, project_id, pipeline_id, dag)
+    return True
 
 
 def _list_runs(cfg: Dict[str, Any], tenant_id: str, project_id: str, limit: int = 200) -> Dict[str, Any]:
@@ -252,6 +333,7 @@ def sync_all_models_to_mlair() -> Dict[str, Any]:
     default_stage = os.getenv("MLAIR_MODEL_STAGE", "staging")
     discovered = model_store.list_model_versions_with_scope()
     created_count = 0
+    created_models = 0
     skipped_count = 0
     synced_scopes = []
     seen_models: Dict[str, str] = {}
@@ -265,9 +347,7 @@ def sync_all_models_to_mlair() -> Dict[str, Any]:
         scope = _resolve_scope(cfg, clinic_key)
         tenant_id = scope["tenant_id"]
         project_id = scope["project_id"]
-        scope_model_name = model_name
-        if cfg["model_scope_per_clinic"] and clinic_key:
-            scope_model_name = f"{model_name}-{_clinic_model_suffix(cfg, clinic_key)}"
+        scope_model_name = _scoped_model_name(model_name, clinic_key if cfg["model_scope_per_clinic"] else None)
 
         model_key = f"{tenant_id}:{project_id}:{scope_model_name}"
         model_id = seen_models.get(model_key)
@@ -315,10 +395,93 @@ def sync_all_models_to_mlair() -> Dict[str, Any]:
             }
         )
 
+    # Ensure every clinic from business DB/catalog has an MLAir model scope,
+    # even before the first clinic-specific model artifact is uploaded.
+    try:
+        clinics, _source = get_clinics_for_mlops()
+    except Exception:
+        clinics = []
+    ensure_empty_scopes = os.getenv("MLAIR_ENSURE_CLINIC_SCOPES", "true").lower() == "true"
+    if ensure_empty_scopes:
+        for clinic in clinics:
+            clinic_key = str((clinic or {}).get("id") or "").strip()
+            if not clinic_key:
+                continue
+            scope = _resolve_scope(cfg, clinic_key)
+            tenant_id = scope["tenant_id"]
+            project_id = scope["project_id"]
+            scope_model_name = _scoped_model_name(model_name, clinic_key if cfg["model_scope_per_clinic"] else None)
+            model_key = f"{tenant_id}:{project_id}:{scope_model_name}"
+            if model_key in seen_models:
+                continue
+            listed = _list_models(cfg, tenant_id, project_id)
+            items = listed.get("items") if isinstance(listed, dict) else []
+            items = items if isinstance(items, list) else []
+            model_id = ""
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("name") or "").strip() == scope_model_name:
+                    model_id = str(item.get("model_id") or item.get("id") or "").strip()
+                    if model_id:
+                        break
+            if not model_id:
+                created = _create_model(
+                    cfg,
+                    tenant_id,
+                    project_id,
+                    scope_model_name,
+                    f"{model_desc} (clinic scope placeholder)",
+                )
+                model_id = str(created.get("model_id") or created.get("id") or "").strip()
+                if model_id:
+                    created_models += 1
+            if model_id:
+                seen_models[model_key] = model_id
+
+    # One pipeline version per clinic project so MLAir can resolve latest DAG for training runs.
+    clinic_scopes_for_pipeline: set[tuple[str, str]] = set()
+    for clinic in clinics:
+        ck = str((clinic or {}).get("id") or "").strip()
+        if not ck:
+            continue
+        sc = _resolve_scope(cfg, ck)
+        clinic_scopes_for_pipeline.add((sc["tenant_id"], sc["project_id"]))
+    for row in discovered:
+        ck = str(row.get("clinic_key") or "").strip() or None
+        if not ck:
+            continue
+        sc = _resolve_scope(cfg, ck)
+        clinic_scopes_for_pipeline.add((sc["tenant_id"], sc["project_id"]))
+
+    ensure_clinic_pipelines = os.getenv("MLAIR_ENSURE_CLINIC_TRAINING_PIPELINES", "true").lower() == "true"
+    pipeline_id = str(cfg.get("pipeline_id") or "vet_ai_training_pipeline").strip()
+    created_pipeline_versions = 0
+    clinic_pipeline_scope_count = sum(1 for _, p in clinic_scopes_for_pipeline if str(p).startswith("clinic_"))
+    if ensure_clinic_pipelines and pipeline_id:
+        for tid, pid in sorted(clinic_scopes_for_pipeline):
+            if not str(pid).startswith("clinic_"):
+                continue
+            try:
+                if _ensure_clinic_training_pipeline(cfg, tid, pid, pipeline_id):
+                    created_pipeline_versions += 1
+            except Exception as exc:
+                logger.warning(
+                    "Failed to ensure training pipeline tenant=%s project=%s pipeline_id=%s: %s",
+                    tid,
+                    pid,
+                    pipeline_id,
+                    exc,
+                )
+
     return {
         "base_model_name": model_name,
         "discovered_versions": len(discovered),
+        "ensured_clinic_scopes": len(clinics) if ensure_empty_scopes else 0,
+        "created_models": created_models,
         "created_versions": created_count,
         "skipped_versions": skipped_count,
         "synced_scopes": synced_scopes,
+        "created_pipeline_versions": created_pipeline_versions,
+        "clinic_pipeline_scopes": clinic_pipeline_scope_count,
     }

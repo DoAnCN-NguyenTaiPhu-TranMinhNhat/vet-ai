@@ -1945,14 +1945,22 @@ async def trigger_training_job(request: TrainingTriggerRequest) -> int:
         cfg = mlair_client.config_summary()
         if cfg.get("enabled"):
             mlair_key = f"vet-ai-training-job-{training_id}"
+            mlair_mode = _mlair_training_mode_for_rows(dataset_row_count)
             mlair_client.trigger_training_run(
                 idempotency_key=mlair_key,
                 clinic_id=ck,
+                training_mode=mlair_mode,
+                override_config=_mlair_override_config_for_scope(
+                    clinic_key=ck,
+                    required_size=TRAINING_THRESHOLD,
+                ),
                 context={
                     "source_app": "vet-ai",
                     "source_task_type": "continuous_training",
                     "source_training_id": str(training_id),
                     "source_clinic_id": str(ck or "global"),
+                    "source_dataset_row_count": str(dataset_row_count),
+                    "source_mlair_training_mode": mlair_mode,
                 },
             )
             logger.info(
@@ -2001,6 +2009,27 @@ def _build_mlair_run_params(
         if text:
             params[out_key] = text
     return params
+
+
+def _mlair_training_mode_for_rows(row_count: int) -> str:
+    n = int(row_count or 0)
+    if n >= 10000:
+        return "full"
+    if n >= 1000:
+        return "standard"
+    return "quick"
+
+
+def _mlair_override_config_for_scope(*, clinic_key: Optional[str], required_size: int) -> Dict[str, Any]:
+    dataset_name = "vetai_feedback_global" if clinic_key is None else f"vetai_feedback_{clinic_key}"
+    return {
+        "inputs": [
+            {
+                "dataset": dataset_name,
+                "required_size": int(max(1, required_size)),
+            }
+        ]
+    }
 
 async def execute_actual_training(training_id: int, training_mode: str):
     """Execute actual ML training"""
@@ -3034,14 +3063,22 @@ async def bootstrap_csv_training_endpoint(
             cfg = mlair_client.config_summary()
             if cfg.get("enabled"):
                 mlair_key = f"vet-ai-bootstrap-job-{training_id}"
+                mlair_mode = _mlair_training_mode_for_rows(len(dataset_rows))
                 mlair_client.trigger_training_run(
                     idempotency_key=mlair_key,
                     clinic_id=ck,
+                    training_mode=mlair_mode,
+                    override_config=_mlair_override_config_for_scope(
+                        clinic_key=ck,
+                        required_size=len(fb_rows),
+                    ),
                     context={
                         "source_app": "vet-ai",
                         "source_task_type": "bootstrap_csv",
                         "source_training_id": str(training_id),
                         "source_clinic_id": str(ck or "global"),
+                        "source_dataset_row_count": str(len(dataset_rows)),
+                        "source_mlair_training_mode": mlair_mode,
                     },
                 )
                 logger.info(

@@ -22,6 +22,24 @@ _cache_until: float = 0.0
 _last_good: list[dict[str, Any]] | None = None
 
 
+def _merge_clinic_lists(*lists: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for clinics in lists:
+        if not clinics:
+            continue
+        for clinic in clinics:
+            if not isinstance(clinic, dict):
+                continue
+            clinic_id = _coerce_catalog_clinic_id(clinic.get("id"))
+            if clinic_id is None:
+                continue
+            name = clinic.get("name")
+            normalized = {"id": clinic_id, "name": str(name) if name else f"Clinic {clinic_id}"}
+            # Keep first occurrence (higher-priority source passed earlier).
+            merged.setdefault(clinic_id, normalized)
+    return sorted(merged.values(), key=lambda x: str(x["id"]))
+
+
 def _coerce_catalog_clinic_id(raw: Any) -> str | None:
     if raw is None or isinstance(raw, bool):
         return None
@@ -105,11 +123,15 @@ def get_clinics_for_mlops() -> tuple[list[dict[str, Any]], str]:
 
         try:
             fresh = _fetch_customers_service_clinics()
+            env_list = _parse_env_json_clinics()
+            merged = _merge_clinic_lists(fresh, env_list)
             with _lock:
-                _last_good = fresh
-                _cache_clinics = fresh
+                _last_good = merged
+                _cache_clinics = merged
                 _cache_until = now + ttl if ttl > 0 else 0.0
-            return list(fresh), "customers-service"
+            if env_list:
+                return list(merged), "customers-service+env"
+            return list(merged), "customers-service"
         except Exception as exc:
             logger.warning("Failed to fetch clinics from customers-service: %s", exc)
             with _lock:

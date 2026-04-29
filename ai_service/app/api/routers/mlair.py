@@ -16,6 +16,8 @@ class MlairTriggerRequest(BaseModel):
     pipeline_id: Optional[str] = Field(default=None, description="Optional MLAir pipeline override")
     idempotency_key: Optional[str] = Field(default=None, description="Optional idempotency key")
     clinic_id: Optional[str] = Field(default=None, description="Optional clinic id for tenant/project scope mapping")
+    training_mode: Optional[str] = Field(default=None, description="Optional MLAir training mode (quick|standard|full)")
+    override_config: Optional[dict] = Field(default=None, description="Optional per-run readiness override config")
 
 
 def _normalize_mlair_status(raw: Optional[str]) -> str:
@@ -86,6 +88,8 @@ async def trigger_mlair_training(request: MlairTriggerRequest, _: bool = Depends
             idempotency_key=key,
             pipeline_id=request.pipeline_id,
             clinic_id=request.clinic_id,
+            training_mode=request.training_mode,
+            override_config=request.override_config,
         )
         return {"status": "success", "mlair_response": data, "idempotency_key": key}
     except RuntimeError as exc:
