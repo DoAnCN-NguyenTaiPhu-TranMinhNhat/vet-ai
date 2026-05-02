@@ -72,10 +72,22 @@ class TrainingTriggerRequest(BaseModel):
     training_mode: str = Field(default="local", pattern="^(local|eks_hybrid)$")
     eks_node_group: Optional[str] = None
     clinic_id: Optional[str] = None
+    finetune_base_model_version: Optional[str] = Field(
+        default=None,
+        description="Optional MODEL_ROOT version folder to warm-start from; default is active model at trigger time.",
+    )
 
     @field_validator("clinic_id", mode="before")
     @classmethod
     def _normalize_trigger_clinic(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s if s else None
+
+    @field_validator("finetune_base_model_version", mode="before")
+    @classmethod
+    def _normalize_finetune_base(cls, v: Any) -> Optional[str]:
         if v is None:
             return None
         s = str(v).strip()

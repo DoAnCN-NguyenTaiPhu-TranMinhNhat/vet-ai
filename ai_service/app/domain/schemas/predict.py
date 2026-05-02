@@ -33,6 +33,14 @@ class PredictRequest(BaseModel):
     )
     pet_id: str | None = Field(default=None, alias="petId")
     visit_id: int | str | None = Field(default=None, alias="visitId")
+    model_version: str | None = Field(
+        default=None,
+        alias="modelVersion",
+        description=(
+            "Optional model version folder (e.g. v2.0). When omitted, the clinic active model "
+            "(or global default) is used. Must be listed by GET /predict/models for the same clinic."
+        ),
+    )
 
     @field_validator("animal_type")
     @classmethod

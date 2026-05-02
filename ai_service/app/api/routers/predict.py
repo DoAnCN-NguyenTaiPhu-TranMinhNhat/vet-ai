@@ -6,17 +6,22 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Query
 from prometheus_client import Gauge, Info
 from scipy import sparse
 
 from ai_service.app.core.metrics import observe_inference, timing
+from ai_service.app.domain.services.clinic_catalog_service import resolve_clinic_identifier
 from ai_service.app.domain.services.clinic_scope_service import normalize_clinic_key
 from ai_service.app.domain.schemas.predict import PredictRequest, parse_symptoms
 from ai_service.app.infrastructure.storage.model_store import (
     ActiveModel,
+    active_model_for_predict,
     detect_default_model,
     get_active_model_for_clinic,
+    get_clinic_pinned_model,
+    list_user_visible_model_versions,
+    storage_scope_for_version,
 )
 
 logger = logging.getLogger(__name__)
@@ -102,7 +107,10 @@ def model_info() -> dict[str, Any]:
 
 
 def _clinic_id_for_model_router(cid_raw: Any) -> str | None:
-    return normalize_clinic_key(cid_raw)
+    if cid_raw is None:
+        return None
+    resolved = resolve_clinic_identifier(str(cid_raw).strip())
+    return normalize_clinic_key(resolved)
 
 
 def _clinic_id_for_prediction_log(cid_raw: Any) -> str | None:
@@ -110,6 +118,48 @@ def _clinic_id_for_prediction_log(cid_raw: Any) -> str | None:
         return None
     value = str(cid_raw).strip()
     return value or None
+
+
+@router.get("/predict/models", summary="List model versions usable for POST /predict (optional clinic)")
+async def list_predict_models(
+    clinic_id: str | int | None = Query(default=None, alias="clinicId"),
+) -> dict[str, Any]:
+    """
+    Versions are those returned by ``list_user_visible_model_versions`` for the clinic key
+    (merged global + clinic folder when a clinic is set). Internal ``v_mlair_*`` symlinks are omitted.
+
+    Each row in ``models`` includes ``isActiveDefault`` so UIs can badge the active model and
+    offer "Set as default" on other rows. For dropdowns, omit rows where ``isActiveDefault``
+    is true to avoid duplicating the "Use active default" option.
+    """
+    ck = _clinic_id_for_model_router(clinic_id)
+    fallback = detect_default_model() or ActiveModel(str(MODEL_VERSION), MODEL_DIR)
+    effective = get_active_model_for_clinic(ck) or fallback
+    versions = list_user_visible_model_versions(ck)
+    eff_ver = (effective.model_version or "").strip()
+
+    if ck:
+        pinned = get_clinic_pinned_model(ck)
+        active_source = "clinic_pin" if pinned is not None else "global_fallback"
+    else:
+        active_source = "global"
+
+    models = [
+        {
+            "version": v,
+            "storageScope": storage_scope_for_version(ck, v),
+            "isActiveDefault": v == eff_ver,
+        }
+        for v in versions
+    ]
+    return {
+        "clinicId": str(clinic_id).strip() if clinic_id is not None and str(clinic_id).strip() else None,
+        "clinicKey": ck,
+        "defaultModelVersion": effective.model_version,
+        "defaultModelScope": storage_scope_for_version(ck, effective.model_version),
+        "activeSource": active_source,
+        "models": models,
+    }
 
 
 @router.post("/predict")
@@ -123,7 +173,20 @@ async def predict(req: PredictRequest) -> dict[str, Any]:
     if req.clinic_id is not None:
         payload["clinic_id"] = req.clinic_id
 
-    active = get_active_model_for_clinic(cid) or ActiveModel(str(MODEL_VERSION), MODEL_DIR)
+    fallback = ActiveModel(str(MODEL_VERSION), MODEL_DIR)
+    try:
+        active, explicit_override = active_model_for_predict(
+            cid,
+            req.model_version,
+            fallback,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    payload["inference_model_version"] = active.model_version
+    payload["inference_model_explicit_override"] = explicit_override
+    payload["inference_model_scope"] = storage_scope_for_version(cid, active.model_version)
+
     model, tab_preprocess, symptoms_mlb, calibrated = load_artifacts_for_dir(
         active.model_dir, active.model_version
     )
@@ -177,7 +240,14 @@ async def predict(req: PredictRequest) -> dict[str, Any]:
             visit_id=visit_key,
             pet_id=pet_key,
             prediction_input=payload,
-            prediction_output={"diagnosis": str(pred), "confidence": confidence, "top_k": top_k},
+            prediction_output={
+                "diagnosis": str(pred),
+                "confidence": confidence,
+                "top_k": top_k,
+                "model_version": active.model_version,
+                "model_scope": storage_scope_for_version(cid, active.model_version),
+                "explicit_model_override": explicit_override,
+            },
             model_version=active.model_version,
             confidence_score=confidence if confidence is not None else 0.0,
             top_k_predictions=top_k or [],
@@ -194,6 +264,8 @@ async def predict(req: PredictRequest) -> dict[str, Any]:
         "confidence": confidence,
         "top_k": top_k,
         "modelVersion": active.model_version,
+        "modelScope": storage_scope_for_version(cid, active.model_version),
+        "explicitModelVersion": explicit_override,
         "predictions": top_k or [],
         "predictionId": str(prediction_id),
         "clinicId": clinic_log,

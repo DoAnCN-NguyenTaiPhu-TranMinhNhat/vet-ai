@@ -57,6 +57,23 @@ from ai_service.app.infrastructure.storage.model_store import resolve_model_dir
 
 logger = logging.getLogger(__name__)
 
+
+def _snapshot_active_model_version(clinic_key: Optional[str]) -> Optional[str]:
+    """Model version label pinned at job creation (warm-start / guardrail baseline)."""
+    try:
+        if clinic_key is not None:
+            from ai_service.app.infrastructure.storage.model_store import get_active_model_for_clinic
+
+            active = get_active_model_for_clinic(clinic_key)
+        else:
+            from ai_service.app.infrastructure.storage.model_store import get_active_model
+
+            active = get_active_model()
+        return active.model_version if active else None
+    except Exception:
+        return None
+
+
 router = APIRouter(prefix="/continuous-training", tags=["continuous-training"])
 from ai_service.app.core.auth import verify_admin
 
@@ -1889,11 +1906,17 @@ async def trigger_training_job(request: TrainingTriggerRequest) -> int:
     )
     dataset_row_count = len(dataset_rows)
 
+    prev_mv = (
+        str(request.finetune_base_model_version).strip()
+        if request.finetune_base_model_version
+        else _snapshot_active_model_version(ck)
+    )
+
     training_id = ct_store.create_training_job(
         status="running",
         total_predictions=total_predictions,
         eligible_feedback_count=eligible_feedback_count,
-        previous_model_version="v2.0",
+        previous_model_version=prev_mv,
         trigger_type=request.trigger_type,
         training_mode=request.training_mode,
         eks_node_group=request.eks_node_group,
@@ -1916,7 +1939,7 @@ async def trigger_training_job(request: TrainingTriggerRequest) -> int:
         "end_time": None,
         "total_predictions": total_predictions,
         "eligible_feedback_count": eligible_feedback_count,
-        "previous_model_version": "v2.0",
+        "previous_model_version": prev_mv,
         "new_model_version": None,
         "training_accuracy": None,
         "validation_accuracy": None,
@@ -1946,7 +1969,7 @@ async def trigger_training_job(request: TrainingTriggerRequest) -> int:
         if cfg.get("enabled"):
             mlair_key = f"vet-ai-training-job-{training_id}"
             mlair_mode = _mlair_training_mode_for_rows(dataset_row_count)
-            mlair_client.trigger_training_run(
+            mlair_client.mirror_training_job_to_mlair(
                 idempotency_key=mlair_key,
                 clinic_id=ck,
                 training_mode=mlair_mode,
@@ -1959,9 +1982,16 @@ async def trigger_training_job(request: TrainingTriggerRequest) -> int:
                     "source_task_type": "continuous_training",
                     "source_training_id": str(training_id),
                     "source_clinic_id": str(ck or "global"),
+                    **({"clinic_id": str(ck)} if ck else {}),
                     "source_dataset_row_count": str(dataset_row_count),
                     "source_mlair_training_mode": mlair_mode,
                 },
+            )
+            _sync_mlair_running_state(
+                idempotency_key=mlair_key,
+                clinic_key=ck,
+                training_id=training_id,
+                trigger_type="continuous_training",
             )
             logger.info(
                 "MLAir mirror trigger sent for training_id=%s (clinic_id=%s, key=%s)",
@@ -2011,6 +2041,33 @@ def _build_mlair_run_params(
     return params
 
 
+def _sync_mlair_running_state(
+    *,
+    idempotency_key: str,
+    clinic_key: Optional[str],
+    training_id: int,
+    trigger_type: str,
+) -> None:
+    """Best-effort: mark mirrored MLAir run as RUNNING when Vet-AI starts real training."""
+    try:
+        from ai_service.app.infrastructure.external import mlair_client
+
+        mlair_client.sync_training_outcome_to_mlair(
+            idempotency_key=idempotency_key,
+            status="RUNNING",
+            clinic_id=clinic_key,
+            reason="vet-ai training job started",
+            run_params=_build_mlair_run_params(
+                training_id=training_id,
+                clinic_key=clinic_key,
+                trigger_type=trigger_type,
+                status_hint="RUNNING",
+            ),
+        )
+    except Exception as exc:
+        logger.warning("MLAir running-state sync failed for training_id=%s: %s", training_id, exc)
+
+
 def _mlair_training_mode_for_rows(row_count: int) -> str:
     n = int(row_count or 0)
     if n >= 10000:
@@ -2021,7 +2078,8 @@ def _mlair_training_mode_for_rows(row_count: int) -> str:
 
 
 def _mlair_override_config_for_scope(*, clinic_key: Optional[str], required_size: int) -> Dict[str, Any]:
-    dataset_name = "vetai_feedback_global" if clinic_key is None else f"vetai_feedback_{clinic_key}"
+    prefix = (os.getenv("VETAI_MLAIR_READINESS_DATASET_PREFIX", "training_feedback") or "training_feedback").strip()
+    dataset_name = f"{prefix}_global" if clinic_key is None else f"{prefix}_{clinic_key}"
     return {
         "inputs": [
             {
@@ -2098,6 +2156,16 @@ async def execute_actual_training(training_id: int, training_mode: str):
         }
         if batch_ids:
             exec_kw["feedback_id_allowlist"] = set(batch_ids)
+
+        finetune_base_model_dir: Optional[str] = None
+        if job_row:
+            pm = job_row.get("previous_model_version")
+            if pm and str(pm).strip():
+                cand = resolve_model_dir(str(pm).strip(), clinic_key)
+                if os.path.isdir(cand):
+                    finetune_base_model_dir = cand
+        if finetune_base_model_dir:
+            exec_kw["finetune_base_model_dir"] = finetune_base_model_dir
 
         if effective_mode == "eks_hybrid":
             # Optional: dedicated node group + Job (needs ALLOW_EKS_HYBRID_TRAINING=true and full infra)
@@ -2355,16 +2423,32 @@ async def execute_bootstrap_training(
             clinic_key,
             len(feedback_rows),
         )
+        finetune_base_model_dir: Optional[str] = None
+        try:
+            job_row_bs = ct_store.get_training_job(training_id)
+            if job_row_bs:
+                pm = job_row_bs.get("previous_model_version")
+                if pm and str(pm).strip():
+                    cand = resolve_model_dir(str(pm).strip(), clinic_key)
+                    if os.path.isdir(cand):
+                        finetune_base_model_dir = cand
+        except Exception:
+            pass
+        exec_bs: Dict[str, Any] = {
+            "clinic_id": clinic_key,
+            "training_id": training_id,
+            "dataset_window_days": TRAINING_WINDOW_DAYS,
+            "pipeline_kind": "bootstrap_csv",
+        }
+        if finetune_base_model_dir:
+            exec_bs["finetune_base_model_dir"] = finetune_base_model_dir
         # Bootstrap train is also CPU-bound; offload to thread to avoid blocking inference endpoints.
         result = await asyncio.to_thread(
             execute_training,
             feedback_rows,
             prediction_rows,
             "local",
-            clinic_id=clinic_key,
-            training_id=training_id,
-            dataset_window_days=TRAINING_WINDOW_DAYS,
-            pipeline_kind="bootstrap_csv",
+            **exec_bs,
         )
 
         if result.get("status") == "completed":
@@ -2805,7 +2889,7 @@ async def get_training_status(training_id: int) -> Optional[TrainingStatus]:
         eligible_feedback_count=ct_store.count_feedback(eligible_only=True, days=TRAINING_WINDOW_DAYS),
         trigger_type=None,
         dataset_row_count=None,
-        previous_model_version="v2.0",
+        previous_model_version=None,
         new_model_version=None,
         training_accuracy=None,
         validation_accuracy=None,
@@ -3017,11 +3101,12 @@ async def bootstrap_csv_training_endpoint(
 
         dataset_rows = build_training_dataset_snapshot(fb_rows, pred_rows)
         # eligible_feedback_count here stores len(CSV), not ct_store.count_feedback (Postgres unchanged).
+        prev_bootstrap = _snapshot_active_model_version(ck)
         training_id = ct_store.create_training_job(
             status="running",
             total_predictions=ct_store.count_predictions(clinic_id=ck),
             eligible_feedback_count=len(fb_rows),
-            previous_model_version="v2.0",
+            previous_model_version=prev_bootstrap,
             trigger_type="bootstrap_csv",
             training_mode=tm,
             eks_node_group=None,
@@ -3037,7 +3122,7 @@ async def bootstrap_csv_training_endpoint(
             "end_time": None,
             "total_predictions": ct_store.count_predictions(clinic_id=ck),
             "eligible_feedback_count": len(fb_rows),
-            "previous_model_version": "v2.0",
+            "previous_model_version": prev_bootstrap,
             "new_model_version": None,
             "training_accuracy": None,
             "validation_accuracy": None,
@@ -3064,7 +3149,7 @@ async def bootstrap_csv_training_endpoint(
             if cfg.get("enabled"):
                 mlair_key = f"vet-ai-bootstrap-job-{training_id}"
                 mlair_mode = _mlair_training_mode_for_rows(len(dataset_rows))
-                mlair_client.trigger_training_run(
+                mlair_client.mirror_training_job_to_mlair(
                     idempotency_key=mlair_key,
                     clinic_id=ck,
                     training_mode=mlair_mode,
@@ -3077,9 +3162,16 @@ async def bootstrap_csv_training_endpoint(
                         "source_task_type": "bootstrap_csv",
                         "source_training_id": str(training_id),
                         "source_clinic_id": str(ck or "global"),
+                        **({"clinic_id": str(ck)} if ck else {}),
                         "source_dataset_row_count": str(len(dataset_rows)),
                         "source_mlair_training_mode": mlair_mode,
                     },
+                )
+                _sync_mlair_running_state(
+                    idempotency_key=mlair_key,
+                    clinic_key=ck,
+                    training_id=training_id,
+                    trigger_type="bootstrap_csv",
                 )
                 logger.info(
                     "MLAir mirror trigger sent for bootstrap training_id=%s (clinic_id=%s, key=%s)",

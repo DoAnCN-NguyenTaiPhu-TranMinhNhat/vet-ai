@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "properties": {
+    "age": {
+      "type": "number"
+    },
+    "weight": {
+      "type": "number"
+    },
+    "temperature": {
+      "type": "number"
+    },
+    "symptoms": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "age",
+    "weight",
+    "temperature",
+    "symptoms"
+  ]
+}

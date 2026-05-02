@@ -3,7 +3,7 @@ from typing import Any
 from fastapi import APIRouter
 
 from ai_service.app.api.routers import predict as predict_router
-from ai_service.app.infrastructure.storage.model_store import list_model_versions, set_clinic_active_model
+from ai_service.app.infrastructure.storage.model_store import list_user_visible_model_versions, set_clinic_active_model
 
 router = APIRouter(tags=["Models"])
 
@@ -15,7 +15,7 @@ def model_info_endpoint() -> dict[str, Any]:
 
 @router.get("/models/versions", include_in_schema=False)
 def model_versions() -> dict[str, Any]:
-    return {"active": predict_router.MODEL_VERSION, "versions": list_model_versions()}
+    return {"active": predict_router.MODEL_VERSION, "versions": list_user_visible_model_versions(None)}
 
 
 @router.post("/models/active", include_in_schema=False)

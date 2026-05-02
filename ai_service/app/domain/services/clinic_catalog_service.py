@@ -8,9 +8,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
-from typing import Any
+from typing import Any, Optional
+
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 from ai_service.app.infrastructure.external.customers_client import fetch_customers_service_clinics
 
@@ -107,6 +112,35 @@ def _fetch_customers_service_clinics() -> list[dict[str, Any]]:
         )
     output.sort(key=lambda x: str(x["id"]))
     return output
+
+
+def resolve_clinic_identifier(user_clinic: Optional[str]) -> Optional[str]:
+    """
+    Map a UI label to the canonical clinic id used on disk and in ``clinic_<slug>`` MLAir projects.
+
+    - If ``user_clinic`` is already a UUID string, it is returned unchanged.
+    - Otherwise we look up ``get_clinics_for_mlops()`` for an exact **id** match (case-insensitive)
+      or an exact **name** match (case-insensitive), e.g. name ``demo0`` → that row's ``id`` UUID.
+
+    If nothing matches, the original string is returned (legacy callers may use non-UUID ids).
+    """
+    if user_clinic is None:
+        return None
+    s = str(user_clinic).strip()
+    if not s:
+        return None
+    if _UUID_RE.match(s):
+        return s
+    low = s.lower()
+    clinics, _src = get_clinics_for_mlops()
+    for c in clinics:
+        cid = str(c.get("id") or "").strip()
+        if cid.lower() == low:
+            return cid
+        name = str(c.get("name") or "").strip()
+        if name.lower() == low:
+            return cid
+    return s
 
 
 def get_clinics_for_mlops() -> tuple[list[dict[str, Any]], str]:

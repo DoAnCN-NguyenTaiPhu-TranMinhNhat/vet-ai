@@ -18,7 +18,8 @@ from ai_service.app.infrastructure.storage.model_store import (
     get_active_model,
     get_active_model_for_clinic,
     get_clinic_pinned_model,
-    list_model_versions,
+    list_user_visible_model_versions,
+    list_user_visible_model_versions_clinic_storage_only,
     set_active_model,
 )
 from ai_service.app.mlops.manager import MLOpsManager
@@ -192,7 +193,12 @@ async def run_health_check():
 @router.get("/models", summary="List model versions + active (global or per-clinic)")
 async def list_models(clinic_id: Optional[str] = Query(None)):
     ck = normalize_clinic_key(clinic_id)
-    versions = list_model_versions(ck)
+    # Clinic scope: list only on-disk versions under models/clinics/<slug>/ (do not merge global root).
+    versions = (
+        list_user_visible_model_versions(ck)
+        if ck is None
+        else list_user_visible_model_versions_clinic_storage_only(ck)
+    )
     if ck is None:
         active = get_active_model()
         return {

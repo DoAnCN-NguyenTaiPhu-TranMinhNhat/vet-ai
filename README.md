@@ -147,7 +147,8 @@ In **vet-microservices**, `docker-compose.yml` usually builds this repo as servi
 | `/continuous-training/*` | Config, eligibility, feedback, prediction logging, training trigger/history, bootstrap CSV (admin). |
 | `/mlops/*` | Registry, drift, alignment helpers. |
 | `/mlops/v2/*` | Champion–challenger workflow (Bearer admin). |
-| `/mlair/status`, `/mlair/runs/training`, `/mlair/runs/{run_id}` | Optional MLAir bridge endpoints for pipeline trigger and run tracking. |
+| `/mlair/status`, `/mlair/runs/training`, `/mlair/runs/{run_id}`, `POST /mlair/models/sync`, `POST /mlair/models/dedupe-versions` | Optional MLAir bridge: sync registry, dedupe duplicate version rows (admin token). |
+| `POST /internal/mlair/model-promotion` | Inbound MLAir promote webhook (Bearer); behavior controlled by `VETAI_MLAIR_PROMOTION_MODE`. |
 | `/metrics` | Prometheus scrape endpoint. |
 
 ---
@@ -179,16 +180,55 @@ Recommended defaults:
 - `MLAIR_ENSURE_CLINIC_SCOPES=true`
 - `MLAIR_ENSURE_CLINIC_TRAINING_PIPELINES=true` (creates an initial MLAir pipeline version per `clinic_*` project on sync so training can use the latest DAG)
 
+Pipeline tasks created by Vet-AI use MLAir reference plugin names **`app_etl_adapter`** and **`app_train_adapter`**. The MLAir **API** image must include those plugins via the `mlair.plugins` entry-point group (the `ml-air` repo ships `mlair-reference-plugins` in the API Docker build). If you see `Train blocked (PLUGIN_NOT_FOUND)`, rebuild or upgrade the **`ml-air-api`** image you run against, then call `POST /mlair/models/sync` again.
+
 Default scope mapping:
 
 - Global model scope -> `project_id=default_project`
 - Clinic model scope -> `project_id=clinic_<clinic_id_slug>`
+
+**`VETAI_MLAIR_MIRROR_GLOBAL_VERSIONS_IN_CLINIC_PROJECTS`** (default `true`): when `POST /mlair/models/sync` runs, Vet-AI also registers, for **each clinic in the catalog**, the same merged list of versions as inference uses (`list_user_visible_model_versions` for that clinic — global + clinic disk). Those rows land in that clinic’s MLAir `clinic_*` project (same `file://` URIs as global where applicable), so the MLAir UI for clinic A aligns with Vet-AI. **Training started for clinic A** still saves new weights only under `models/clinics/<slug>/` and is scoped to clinic A in MLAir (not “global-only” output).
+
+If MLAir shows **many** lines for one clinic, that is usually **one logical model** (`vet-<clinic>`) with **one registry row per distinct weights folder** (each `v*` on disk). Symlinks that point at the same folder are deduped by **canonical `file://` + realpath**. To cap how many merged versions are pushed per clinic, set **`VETAI_MLAIR_MIRROR_CLINIC_MAX_VERSIONS`** (e.g. `5`); `0` means no cap.
+
+**Duplicate versions after each sync:** if the MLAir API only returned the first page of versions, Vet-AI could not see existing `artifact_uri` rows and would POST again. Sync now uses **paginated** `GET .../models/{id}/versions` (`_list_model_versions_all_items`, tunable via **`MLAIR_MODEL_VERSIONS_PAGE_SIZE`** / **`MLAIR_MODEL_VERSIONS_MAX_PAGES`**). Older duplicate rows in MLAir must be removed or archived in MLAir if you want a clean count.
+
+**Dedupe tool:** `POST /mlair/models/dedupe-versions` (admin Bearer) groups MLAir rows by canonical `file://` realpath, keeps the best **stage** (production > staging > other) then highest **version** int, and **DELETE**s the rest (`DELETE .../models/{model_id}/versions/{version}` — requires your MLAir build to support that route). Query: `dry_run=true` (default) preview; `dry_run=false` apply. `clinic_id=<uuid>` one clinic; `all_scopes=true` global + catalog clinics; omit both for **global** project only.
 
 If MLAir UI dropdown only shows `global/all`, verify:
 
 1. Vet-AI has run model sync: `POST /mlair/models/sync`
 2. MLAir `/v1/tenants/{tenant}/projects` returns clinic projects
 3. Token used in MLAir UI has access to the target tenant/projects
+
+### Model promotion webhook (MLAir → Vet-AI)
+
+When MLAir is configured with **`MLAIR_MODEL_PROMOTE_WEBHOOK_URL`** pointing at this service, it calls:
+
+- **`POST /internal/mlair/model-promotion`** (Bearer: `MLAIR_MODEL_PROMOTE_WEBHOOK_BEARER_TOKEN` on Vet-AI, same secret MLAir uses to sign the request).
+
+**`VETAI_MLAIR_PROMOTION_MODE`** controls whether Vet-AI creates extra on-disk entries:
+
+| Mode | Behavior |
+|------|----------|
+| **`materialize`** (default) | Map MLAir’s `file://` artifact into `MODEL_ROOT` (symlink or copy). If the same weights already exist as a normal `v*` folder (same realpath), **reuse that name** — no extra `v_mlair_*`. Internal `v_mlair_*` aliases (when created) are **not listed** in user-facing model APIs (`list_user_visible_model_versions` / `GET /predict/models`). |
+| **`reuse_only`** | **No new files.** Resolve `artifact_uri` to a real path and **only** call `set_clinic_active_model` / global active if that path **already equals** an existing `v*` folder under `MODEL_ROOT` (e.g. output of continuous training). If nothing matches → **409** — deploy weights into a `v*` directory first, or temporarily use `materialize`. |
+
+The external MLAir worker’s finetune path (`plugin_context.artifact_uri`) honors the same flag: in **`reuse_only`**, it reuses an existing matching `v*` folder instead of creating `v_mlair_*_u…` when possible.
+
+**MLAir does not need source changes** for either mode; only Vet-AI env and (optionally) whether the webhook URL is set.
+
+After you change the clinic/global **active** pin (UI, `POST /models/clinic/{id}/active`, or a successful promotion), **`VETAI_MLAIR_SYNC_ON_ACTIVE_CHANGE`** (default `true`) refreshes MLAir model stages so registry **production** tracks the same artifact as Vet-AI’s active model.
+
+### External MLAir worker (optional)
+
+When MLAir runs with **`ML_AIR_TASK_EXECUTION_MODE=external`**, Vet-AI can **lease** tasks, run **continuous training** for `app_train_adapter`, and **complete** runs with real metrics (HTTP to this service’s `/continuous-training/...` using `ADMIN_TOKEN`).
+
+Enable in Vet-AI:
+
+- `VETAI_MLAIR_WORKER_ENABLED=true` (requires `MLAIR_ENABLED=true` and `MLAIR_AUTH_TOKEN` set to a token MLAir accepts for `/v1/tasks/*`, typically the same value as MLAir’s `ML_AIR_WORKER_TOKEN` or a maintainer token).
+
+See `env/.env.example` for `VETAI_MLAIR_WORKER_*` and `VETAI_MLAIR_CT_*` tuning. No changes to the `ml-air` core repo are required for this worker.
 
 ---
 

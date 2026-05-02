@@ -40,6 +40,7 @@ from ai_service.app.domain.services.clinic_scope_service import clinic_dir_slug,
 from ai_service.app.infrastructure.storage.model_store import (
     get_active_model_for_clinic,
     list_model_versions,
+    list_user_visible_model_versions,
     resolve_model_dir,
 )
 
@@ -795,21 +796,33 @@ class ModelTrainer:
         logger.info(f"Feature preprocessing complete: {X_final.shape}")
         return X_final, preprocessing_info
 
-    def load_active_artifacts(self, clinic_key: Optional[str] = None) -> tuple[RandomForestClassifier, str]:
+    def load_active_artifacts(
+        self,
+        clinic_key: Optional[str] = None,
+        *,
+        base_model_dir: Optional[str] = None,
+    ) -> tuple[RandomForestClassifier, str]:
         """
         Load active model + preprocessors so we can warm-start training.
         Returns (model, active_model_dir).
+
+        When ``base_model_dir`` is set and exists, load from that directory instead of the
+        clinic/global active pin (e.g. MLAir ``plugin_context.artifact_uri`` materialized under MODEL_ROOT).
         """
         ck = normalize_clinic_key(clinic_key)
-        active = get_active_model_for_clinic(ck)
-        if active is None:
-            # fallback to newest version directory under models root (global + clinic subdir)
-            versions = list_model_versions(ck)
-            if not versions:
-                raise ValueError("No existing model versions found to fine-tune")
-            active_dir = resolve_model_dir(versions[0], ck)
+        bdir = str(base_model_dir).strip() if base_model_dir else ""
+        if bdir and os.path.isdir(bdir):
+            active_dir = bdir
         else:
-            active_dir = active.model_dir
+            active = get_active_model_for_clinic(ck)
+            if active is None:
+                # fallback to newest version directory under models root (global + clinic subdir)
+                versions = list_user_visible_model_versions(ck)
+                if not versions:
+                    raise ValueError("No existing model versions found to fine-tune")
+                active_dir = resolve_model_dir(versions[0], ck)
+            else:
+                active_dir = active.model_dir
 
         model_path = os.path.join(active_dir, "model.pkl")
         tab_path = os.path.join(active_dir, "tab_preprocess.pkl")
@@ -1683,6 +1696,7 @@ def execute_training(
     dataset_window_days: Optional[int] = None,
     pipeline_kind: str = "continuous_training",
     feedback_id_allowlist: Optional[AbstractSet[int]] = None,
+    finetune_base_model_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Execute training pipeline with dynamic parameters.
 
@@ -1739,7 +1753,11 @@ def execute_training(
         # Fine-tune mode (warm-start) vs full retrain
         finetune = os.getenv("FINETUNE_PREVIOUS_MODEL", "true").lower() in ("1", "true", "yes", "y")
         if finetune:
-            base_model, base_dir = trainer.load_active_artifacts(clinic_key)
+            fdir = str(finetune_base_model_dir).strip() if finetune_base_model_dir else ""
+            base_kw: Dict[str, Any] = {}
+            if fdir and os.path.isdir(fdir):
+                base_kw["base_model_dir"] = fdir
+            base_model, base_dir = trainer.load_active_artifacts(clinic_key, **base_kw)
             X_processed, preprocessing_info = trainer.preprocess_features(X, fit_encoders=False)
             add_trees = int(os.getenv("FINETUNE_ADD_TREES", "20"))
             try:
@@ -1995,6 +2013,8 @@ def execute_training(
             training_metrics["training_scope"] = "global"
         else:
             training_metrics["training_scope"] = "clinic"
+            # New weights are always under models/clinics/<slug>/ even when warm-starting from a global base.
+            training_metrics["mlair_artifact_scope"] = "clinic"
         training_metrics["model_version"] = model_version
 
         # Save model
