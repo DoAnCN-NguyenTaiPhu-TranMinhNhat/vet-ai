@@ -1976,6 +1976,7 @@ async def trigger_training_job(request: TrainingTriggerRequest) -> int:
                 override_config=_mlair_override_config_for_scope(
                     clinic_key=ck,
                     required_size=TRAINING_THRESHOLD,
+                    current_size=eligible_feedback_count,
                 ),
                 context={
                     "source_app": "vet-ai",
@@ -2077,14 +2078,24 @@ def _mlair_training_mode_for_rows(row_count: int) -> str:
     return "quick"
 
 
-def _mlair_override_config_for_scope(*, clinic_key: Optional[str], required_size: int) -> Dict[str, Any]:
+def _mlair_override_config_for_scope(
+    *,
+    clinic_key: Optional[str],
+    required_size: int,
+    current_size: int,
+) -> Dict[str, Any]:
     prefix = (os.getenv("VETAI_MLAIR_READINESS_DATASET_PREFIX", "training_feedback") or "training_feedback").strip()
     dataset_name = f"{prefix}_global" if clinic_key is None else f"{prefix}_{clinic_key}"
+    minimum_data = int(max(1, required_size))
+    current_data = int(max(0, current_size))
     return {
+        "minimum_data": minimum_data,
+        "current_data": current_data,
         "inputs": [
             {
                 "dataset": dataset_name,
-                "required_size": int(max(1, required_size)),
+                "required_size": minimum_data,
+                "current_size": current_data,
             }
         ]
     }
@@ -3156,6 +3167,7 @@ async def bootstrap_csv_training_endpoint(
                     override_config=_mlair_override_config_for_scope(
                         clinic_key=ck,
                         required_size=len(fb_rows),
+                        current_size=len(fb_rows),
                     ),
                     context={
                         "source_app": "vet-ai",

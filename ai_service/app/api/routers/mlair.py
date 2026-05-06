@@ -101,6 +101,46 @@ async def mlair_status():
 
 
 @router.get(
+    "/pipelines",
+    summary="List MLAir pipelines for a tenant/project (from runs + pipeline_versions)",
+)
+async def list_mlair_pipelines(
+    clinic_id: Optional[str] = Query(
+        None,
+        description="Omit for global MLAIR_PROJECT_ID; set for clinic_<slug> project mapping.",
+    ),
+    limit: int = Query(100, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    _: bool = Depends(require_admin),
+):
+    try:
+        data = mlair_client.list_project_pipelines(clinic_id=clinic_id, limit=limit, offset=offset)
+        return {"status": "success", "mlair": data}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.get(
+    "/pipelines/{pipeline_id}/versions",
+    summary="List MLAir pipeline DAG versions for a pipeline_id in a tenant/project",
+)
+async def list_mlair_pipeline_versions(
+    pipeline_id: str,
+    clinic_id: Optional[str] = Query(None, description="Omit for global project"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    _: bool = Depends(require_admin),
+):
+    try:
+        data = mlair_client.list_project_pipeline_versions(
+            clinic_id=clinic_id, pipeline_id=pipeline_id, limit=limit, offset=offset
+        )
+        return {"status": "success", "mlair": data}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.get(
     "/alignment",
     summary="Compare Vet-AI active model vs MLAir production for a clinic (read-only)",
 )

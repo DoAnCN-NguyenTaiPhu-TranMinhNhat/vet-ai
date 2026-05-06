@@ -71,27 +71,32 @@ def ensure_model_directory_from_s3(model_version: str, clinic_key: Optional[str]
         return False, f"Model directory missing locally and S3 not configured: {local}"
 
     prefix = s3_key_prefix(model_version, clinic_key)
-    client = _s3_client()
-    os.makedirs(local, exist_ok=True)
-    paginator = client.get_paginator("list_objects_v2")
-    keys: list[str] = []
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix + "/"):
-        for obj in page.get("Contents") or []:
-            k = obj.get("Key")
-            if k:
-                keys.append(k)
-    if not keys:
-        return False, f"No objects at s3://{bucket}/{prefix}/"
+    try:
+        client = _s3_client()
+        os.makedirs(local, exist_ok=True)
+        paginator = client.get_paginator("list_objects_v2")
+        keys: list[str] = []
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix + "/"):
+            for obj in page.get("Contents") or []:
+                k = obj.get("Key")
+                if k:
+                    keys.append(k)
+        if not keys:
+            return False, f"No objects at s3://{bucket}/{prefix}/"
 
-    for key in keys:
-        suffix = key[len(prefix) + 1 :] if key.startswith(prefix + "/") else key
-        if not suffix:
-            continue
-        dest = os.path.join(local, suffix.replace("/", os.sep))
-        parent = os.path.dirname(dest)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        client.download_file(bucket, key, dest)
+        for key in keys:
+            suffix = key[len(prefix) + 1 :] if key.startswith(prefix + "/") else key
+            if not suffix:
+                continue
+            dest = os.path.join(local, suffix.replace("/", os.sep))
+            parent = os.path.dirname(dest)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            client.download_file(bucket, key, dest)
+    except Exception as e:
+        # If S3 creds are missing (common in local/dev) we must not crash the caller
+        # with an uncaught botocore exception (it breaks MLAir promote webhook).
+        return False, f"S3 restore failed ({type(e).__name__}): {e}"
 
     if not os.path.isfile(os.path.join(local, "model.pkl")):
         return False, f"Downloaded from S3 but model.pkl missing under {local}"

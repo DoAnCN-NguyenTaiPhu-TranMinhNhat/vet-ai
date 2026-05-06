@@ -9,6 +9,7 @@ from ai_service.app.api.middleware.request_id import request_id_middleware
 from ai_service.app.api.routers.health import router as health_router
 from ai_service.app.api.routers.internal_mlair import router as internal_mlair_router
 from ai_service.app.api.routers.mlair import router as mlair_router
+from ai_service.app.api.routers.mlair_registry import router as mlair_registry_router
 from ai_service.app.api.routers.mlops import router as mlops_router
 from ai_service.app.api.routers.mlops_v2 import router as mlops_v2_router
 from ai_service.app.api.routers.models import router as models_router
@@ -119,6 +120,7 @@ app.include_router(predict_router)
 app.include_router(models_router)
 app.include_router(training_router)
 app.include_router(mlair_router)
+app.include_router(mlair_registry_router)
 app.include_router(internal_mlair_router)
 
 if mlops_router:

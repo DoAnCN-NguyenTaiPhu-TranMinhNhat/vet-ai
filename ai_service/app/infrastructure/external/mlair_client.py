@@ -47,6 +47,20 @@ def _env_truthy(name: str, default: str = "false") -> bool:
     return str(os.getenv(name, default) or "").lower() in ("1", "true", "yes", "y")
 
 
+def _effective_training_pipeline_id_for_seed() -> str:
+    """
+    MLAir lists pipelines from runs plus any ``pipeline_id`` present in ``pipeline_versions``.
+    If ``MLAIR_PIPELINE_ID`` is unset, optionally use a stable default so sync/trigger can seed
+    ``POST .../pipelines/{id}/versions`` and model–pipeline mapping without extra manual setup.
+    """
+    explicit = str(os.getenv("MLAIR_PIPELINE_ID", "") or "").strip()
+    if explicit:
+        return explicit
+    if not _env_truthy("VETAI_MLAIR_AUTO_ENSURE_TRAINING_PIPELINE_ID", "true"):
+        return ""
+    return str(os.getenv("VETAI_MLAIR_DEFAULT_PIPELINE_ID", "vet-ai-training") or "").strip()
+
+
 def _mirror_model_dataset_map_raw() -> Dict[str, Any]:
     raw = os.getenv("VETAI_MLAIR_MIRROR_MODEL_DATASET_MAP_JSON", "").strip()
     if not raw:
@@ -177,7 +191,7 @@ def mirror_training_job_to_mlair(
                 override_config=override_config,
                 context=context,
             )
-        p_ov = str(os.getenv("MLAIR_PIPELINE_ID", "") or "").strip() or None
+        p_ov = _effective_training_pipeline_id_for_seed() or None
         return trigger_run_by_model_dataset(
             model_id=mid,
             dataset_id=did,
@@ -187,7 +201,7 @@ def mirror_training_job_to_mlair(
             pipeline_id_override=p_ov,
             context=context,
             training_mode=training_mode,
-            override_config=None,
+            override_config=override_config,
         )
     return trigger_training_run(
         idempotency_key=idempotency_key,
@@ -206,8 +220,8 @@ def _cfg() -> Dict[str, Any]:
         "base_url": os.getenv("MLAIR_API_BASE_URL", "http://localhost:8080").rstrip("/"),
         "tenant_id": os.getenv("MLAIR_TENANT_ID", "default"),
         "project_id": os.getenv("MLAIR_PROJECT_ID", "default_project"),
-        # No baked-in pipeline id: set MLAIR_PIPELINE_ID (and optionally override per trigger_training_run(..., pipeline_id=)).
-        "pipeline_id": str(os.getenv("MLAIR_PIPELINE_ID", "") or "").strip(),
+        # MLAIR_PIPELINE_ID or, when VETAI_MLAIR_AUTO_ENSURE_TRAINING_PIPELINE_ID=true, VETAI_MLAIR_DEFAULT_PIPELINE_ID.
+        "pipeline_id": _effective_training_pipeline_id_for_seed(),
         "token": os.getenv("MLAIR_AUTH_TOKEN", ""),
         "timeout": float(os.getenv("MLAIR_TIMEOUT_SECONDS", "10")),
         "clinic_tenant_map": json.loads(clinic_tenant_map) if clinic_tenant_map else {},
@@ -250,19 +264,111 @@ def _http_delete(url: str, cfg: Dict[str, Any]) -> int:
         raise RuntimeError(f"Cannot reach MLAir: {exc.reason}") from exc
 
 
+def _request_delete_json(url: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    req = urllib.request.Request(url, method="DELETE", headers=_headers(cfg))
+    try:
+        with urllib.request.urlopen(req, timeout=float(cfg.get("timeout") or 30.0)) as resp:  # noqa: S310
+            raw = resp.read().decode("utf-8", errors="replace")
+            return json.loads(raw) if raw.strip() else {}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"MLAir HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Cannot reach MLAir: {exc.reason}") from exc
+
+
+def _note_pipeline_map_target(
+    targets: set[tuple[Optional[str], str]],
+    clinic_id_for_scope: Optional[str],
+    model_id: str,
+) -> None:
+    mid = str(model_id).strip()
+    if not mid:
+        return
+    ck: Optional[str] = None
+    if clinic_id_for_scope:
+        ck = normalize_clinic_key(str(clinic_id_for_scope).strip())
+    targets.add((ck, mid))
+
+
+def _put_model_version_approval(
+    cfg: Dict[str, Any],
+    tenant_id: str,
+    project_id: str,
+    model_id: str,
+    version: int,
+    *,
+    approval_status: str,
+    reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    tid = quote(str(tenant_id).strip(), safe="")
+    pid = quote(str(project_id).strip(), safe="")
+    mid = quote(str(model_id).strip(), safe="")
+    base = str(cfg.get("base_url") or "").rstrip("/")
+    url = f"{base}/v1/tenants/{tid}/projects/{pid}/models/{mid}/versions/{int(version)}/approval"
+    body: Dict[str, Any] = {"approval_status": str(approval_status).strip()}
+    if reason is not None and str(reason).strip():
+        body["reason"] = str(reason).strip()
+    return _request_json("PUT", url, body=body, headers=_headers(cfg), timeout=float(cfg.get("timeout") or 10.0))
+
+
+def _maybe_auto_approve_version_for_promote(
+    cfg: Dict[str, Any],
+    tenant_id: str,
+    project_id: str,
+    model_id: str,
+    version: int,
+) -> bool:
+    """
+    MLAir promote to production rejects unless approval_status=approved (unless ML_AIR_SKIP_APPROVAL_FOR_PROMOTE).
+    New model_versions are always created pending_manual_approval, so Vet-AI sync must approve before promote.
+    """
+    if not _env_truthy("VETAI_MLAIR_AUTO_APPROVE_ON_SYNC", "true"):
+        return False
+    try:
+        _put_model_version_approval(
+            cfg,
+            tenant_id,
+            project_id,
+            model_id,
+            int(version),
+            approval_status="approved",
+            reason="vet-ai sync (auto-approve for production promote)",
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "MLAir auto-approve skipped/failed tenant=%s project=%s model=%s v=%s: %s",
+            tenant_id,
+            project_id,
+            model_id,
+            version,
+            exc,
+        )
+        return False
+
+
 def config_summary() -> Dict[str, Any]:
     cfg = _cfg()
     use_runs_trigger = _env_truthy("VETAI_MLAIR_MIRROR_USE_RUNS_TRIGGER", "false")
     autodisc = _env_truthy("VETAI_MLAIR_MIRROR_AUTODISCOVER", "true")
     mid, did, _ = _resolve_mirror_model_dataset_ids(None)
+    explicit_pipe = str(os.getenv("MLAIR_PIPELINE_ID", "") or "").strip()
+    eff_pipe = _effective_training_pipeline_id_for_seed()
     return {
         "enabled": cfg["enabled"],
         "base_url": cfg["base_url"],
         "tenant_id": cfg["tenant_id"],
         "project_id": cfg["project_id"],
         "pipeline_id": cfg["pipeline_id"],
+        "mlair_pipeline_id_explicit": explicit_pipe,
+        "pipeline_id_configured": bool(eff_pipe),
+        "auto_ensure_training_pipeline_id": _env_truthy("VETAI_MLAIR_AUTO_ENSURE_TRAINING_PIPELINE_ID", "true"),
+        "default_training_pipeline_id": str(os.getenv("VETAI_MLAIR_DEFAULT_PIPELINE_ID", "vet-ai-training") or "").strip(),
         "has_token": bool(cfg["token"]),
         "model_scope_per_clinic": cfg["model_scope_per_clinic"],
+        "auto_approve_on_sync": _env_truthy("VETAI_MLAIR_AUTO_APPROVE_ON_SYNC", "true"),
+        "map_pipeline_on_sync": _env_truthy("VETAI_MLAIR_MAP_PIPELINE_ON_SYNC", "true"),
         "mirror_use_runs_trigger": use_runs_trigger,
         "mirror_autodiscover": autodisc,
         "mirror_model_dataset_configured_global": bool(mid and did),
@@ -347,12 +453,16 @@ def trigger_training_run(
     pid = str(pipeline_id or cfg["pipeline_id"] or "").strip()
     if not pid:
         raise RuntimeError(
-            "MLAIR_PIPELINE_ID is not set in the environment and trigger_training_run was called without pipeline_id"
+            "No pipeline id: set MLAIR_PIPELINE_ID, or enable VETAI_MLAIR_AUTO_ENSURE_TRAINING_PIPELINE_ID (default true) "
+            "with VETAI_MLAIR_DEFAULT_PIPELINE_ID, and run POST /mlair/models/sync to create pipeline_versions."
         )
     scope = _resolve_scope(cfg, clinic_id)
     use_gating_run = os.getenv("MLAIR_USE_GATING_RUN_ENDPOINT", "true").lower() == "true"
     route = "run" if use_gating_run else "runs"
-    url = f"{cfg['base_url']}/v1/tenants/{scope['tenant_id']}/projects/{scope['project_id']}/pipelines/{pid}/{route}"
+    tid = quote(str(scope["tenant_id"]).strip(), safe="")
+    prj = quote(str(scope["project_id"]).strip(), safe="")
+    pl = quote(str(pid).strip(), safe="")
+    url = f"{cfg['base_url']}/v1/tenants/{tid}/projects/{prj}/pipelines/{pl}/{route}"
     body: Dict[str, Any] = {
         "pipeline_id": pid,
         "idempotency_key": idempotency_key,
@@ -422,6 +532,40 @@ def trigger_run_by_model_dataset(
     return _request_json("POST", url, body=body, headers=_headers(cfg), timeout=cfg["timeout"])
 
 
+def list_project_pipelines(
+    *,
+    clinic_id: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """Proxy MLAir ``GET .../pipelines`` (pipelines appear after runs or ``pipeline_versions`` rows)."""
+    cfg = _cfg()
+    if not cfg["enabled"]:
+        raise RuntimeError("MLAir integration disabled (set MLAIR_ENABLED=true)")
+    lim = max(1, min(int(limit), 200))
+    off = max(0, int(offset))
+    url = _tenant_project_http_path(cfg, clinic_id, f"/pipelines?limit={lim}&offset={off}")
+    return _request_json("GET", url, body=None, headers=_headers(cfg), timeout=float(cfg.get("timeout") or 10.0))
+
+
+def list_project_pipeline_versions(
+    *,
+    clinic_id: Optional[str] = None,
+    pipeline_id: str,
+    limit: int = 50,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """Proxy MLAir ``GET .../pipelines/{pipeline_id}/versions``."""
+    cfg = _cfg()
+    if not cfg["enabled"]:
+        raise RuntimeError("MLAir integration disabled (set MLAIR_ENABLED=true)")
+    pl = quote(str(pipeline_id).strip(), safe="")
+    lim = max(1, min(int(limit), 200))
+    off = max(0, int(offset))
+    url = _tenant_project_http_path(cfg, clinic_id, f"/pipelines/{pl}/versions?limit={lim}&offset={off}")
+    return _request_json("GET", url, body=None, headers=_headers(cfg), timeout=float(cfg.get("timeout") or 10.0))
+
+
 def get_run(run_id: str) -> Dict[str, Any]:
     cfg = _cfg()
     if not cfg["enabled"]:
@@ -431,8 +575,20 @@ def get_run(run_id: str) -> Dict[str, Any]:
     return _request_json("GET", url, body=None, headers=_headers(cfg), timeout=cfg["timeout"])
 
 
-def _list_models(cfg: Dict[str, Any], tenant_id: str, project_id: str) -> Dict[str, Any]:
-    url = f"{cfg['base_url']}/v1/tenants/{tenant_id}/projects/{project_id}/models?limit=200"
+def _list_models(
+    cfg: Dict[str, Any],
+    tenant_id: str,
+    project_id: str,
+    *,
+    limit: int = 200,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    tid = quote(str(tenant_id).strip(), safe="")
+    pid = quote(str(project_id).strip(), safe="")
+    url = (
+        f"{cfg['base_url']}/v1/tenants/{tid}/projects/{pid}/models"
+        f"?limit={int(max(1, min(limit, 500)))}&offset={int(max(0, offset))}"
+    )
     return _request_json("GET", url, body=None, headers=_headers(cfg), timeout=cfg["timeout"])
 
 
@@ -621,7 +777,9 @@ def _create_model(
     name: str,
     description: str | None = None,
 ) -> Dict[str, Any]:
-    url = f"{cfg['base_url']}/v1/tenants/{tenant_id}/projects/{project_id}/models"
+    tid = quote(str(tenant_id).strip(), safe="")
+    pid = quote(str(project_id).strip(), safe="")
+    url = f"{cfg['base_url']}/v1/tenants/{tid}/projects/{pid}/models"
     body: Dict[str, Any] = {"name": name}
     if description:
         body["description"] = description
@@ -644,17 +802,25 @@ def _list_model_versions_all_items(
     model_id: str,
 ) -> list[dict[str, Any]]:
     """
-    Load every version row for a model (paginated).
+    Load every model version row for ``model_id``.
 
-    MLAir often defaults to a small page size; without this, sync only sees the first page,
-    misses existing ``artifact_uri`` rows, and POSTs duplicate versions on each sync.
+    Current **ml-air** ``GET .../models/{id}/versions`` returns **all** rows in one response (no limit/offset
+    in the handler). Vet-AI therefore uses a **single** GET by default. Set ``MLAIR_MODEL_VERSIONS_USE_OFFSET_PAGINATION=true``
+    only if your MLAir fork adds pagination query params; otherwise offset loops can duplicate rows.
     """
-    page = max(10, min(int(os.getenv("MLAIR_MODEL_VERSIONS_PAGE_SIZE", "200") or "200"), 1000))
     tid = quote(str(tenant_id).strip(), safe="")
     pid = quote(str(project_id).strip(), safe="")
     mid = quote(str(model_id).strip(), safe="")
     base = str(cfg.get("base_url") or "").rstrip("/")
     timeout = float(cfg.get("timeout") or 10.0)
+
+    if not _env_truthy("MLAIR_MODEL_VERSIONS_USE_OFFSET_PAGINATION", "false"):
+        url = f"{base}/v1/tenants/{tid}/projects/{pid}/models/{mid}/versions"
+        body = _request_json("GET", url, body=None, headers=_headers(cfg), timeout=timeout)
+        items = body.get("items") if isinstance(body.get("items"), list) else []
+        return [it for it in items if isinstance(it, dict)]
+
+    page = max(10, min(int(os.getenv("MLAIR_MODEL_VERSIONS_PAGE_SIZE", "200") or "200"), 1000))
     all_rows: list[dict[str, Any]] = []
     offset = 0
     max_pages = max(1, min(int(os.getenv("MLAIR_MODEL_VERSIONS_MAX_PAGES", "50") or "50"), 500))
@@ -770,6 +936,8 @@ def inspect_serving_alignment_with_mlair(clinic_id: Optional[str] = None) -> Dic
             best_n = vn
             best = it
     out["mlair_production_version_row"] = best
+    if best:
+        out["mlair_production_approval_status"] = str(best.get("approval_status") or "").strip() or None
 
     vet_ver = str((eff.model_version if eff else "") or "").strip()
     vet_dir = str((eff.model_dir if eff else "") or "").strip()
@@ -794,6 +962,14 @@ def inspect_serving_alignment_with_mlair(clinic_id: Optional[str] = None) -> Dic
         out["aligned"] = False
         notes.append("MLAir model exists but no production-staged version row returned.")
     else:
+        ap_st = str(best.get("approval_status") or "").strip().lower()
+        if ap_st and ap_st != "approved":
+            notes.append(
+                "MLAir production row has approval_status other than 'approved'; "
+                "ml-air may not treat it as production weights for runs until approved "
+                "(POST /mlair/models/sync with VETAI_MLAIR_AUTO_APPROVE_ON_SYNC=true, "
+                "or ML_AIR_SKIP_APPROVAL_FOR_PROMOTE=1 on the ml-air server)."
+            )
         out["aligned"] = bool(aligned)
         if not aligned:
             notes.append(
@@ -814,7 +990,10 @@ def _create_model_version(
     artifact_uri: str,
     stage: str,
 ) -> Dict[str, Any]:
-    url = f"{cfg['base_url']}/v1/tenants/{tenant_id}/projects/{project_id}/models/{model_id}/versions"
+    tid = quote(str(tenant_id).strip(), safe="")
+    pid = quote(str(project_id).strip(), safe="")
+    mid = quote(str(model_id).strip(), safe="")
+    url = f"{cfg['base_url']}/v1/tenants/{tid}/projects/{pid}/models/{mid}/versions"
     body = {"artifact_uri": artifact_uri, "stage": stage}
     return _request_json("POST", url, body=body, headers=_headers(cfg), timeout=cfg["timeout"])
 
@@ -827,7 +1006,10 @@ def _promote_model_version(
     version: int,
     stage: str = "production",
 ) -> Dict[str, Any]:
-    url = f"{cfg['base_url']}/v1/tenants/{tenant_id}/projects/{project_id}/models/{model_id}/promote"
+    tid = quote(str(tenant_id).strip(), safe="")
+    pid = quote(str(project_id).strip(), safe="")
+    mid = quote(str(model_id).strip(), safe="")
+    url = f"{cfg['base_url']}/v1/tenants/{tid}/projects/{pid}/models/{mid}/promote"
     body = {"version": int(version), "stage": stage}
     return _request_json("POST", url, body=body, headers=_headers(cfg), timeout=cfg["timeout"])
 
@@ -848,10 +1030,10 @@ def _training_pipeline_dag_config() -> Dict[str, Any]:
 def _list_pipeline_versions(
     cfg: Dict[str, Any], tenant_id: str, project_id: str, pipeline_id: str
 ) -> Dict[str, Any]:
-    url = (
-        f"{cfg['base_url']}/v1/tenants/{tenant_id}/projects/{project_id}"
-        f"/pipelines/{pipeline_id}/versions?limit=50"
-    )
+    tid = quote(str(tenant_id).strip(), safe="")
+    pid = quote(str(project_id).strip(), safe="")
+    pl = quote(str(pipeline_id).strip(), safe="")
+    url = f"{cfg['base_url']}/v1/tenants/{tid}/projects/{pid}/pipelines/{pl}/versions?limit=50"
     return _request_json("GET", url, body=None, headers=_headers(cfg), timeout=cfg["timeout"])
 
 
@@ -862,7 +1044,10 @@ def _create_pipeline_version(
     pipeline_id: str,
     dag: Dict[str, Any],
 ) -> Dict[str, Any]:
-    url = f"{cfg['base_url']}/v1/tenants/{tenant_id}/projects/{project_id}/pipelines/{pipeline_id}/versions"
+    tid = quote(str(tenant_id).strip(), safe="")
+    pid = quote(str(project_id).strip(), safe="")
+    pl = quote(str(pipeline_id).strip(), safe="")
+    url = f"{cfg['base_url']}/v1/tenants/{tid}/projects/{pid}/pipelines/{pl}/versions"
     body = {"config": dag}
     return _request_json("POST", url, body=body, headers=_headers(cfg), timeout=cfg["timeout"])
 
@@ -982,6 +1167,7 @@ def _sync_disk_version_to_mlair(
     active_global_version: Optional[str],
     seen_models: Dict[str, str],
     dedupe_artifact_scope: set[tuple[str, str, str]],
+    pipeline_map_targets: Optional[set[tuple[Optional[str], str]]] = None,
 ) -> tuple[int, int, int, Optional[Dict[str, Any]]]:
     """
     Register one on-disk Vet-AI version under the MLAir tenant/project for ``clinic_id_for_scope``
@@ -1037,6 +1223,9 @@ def _sync_disk_version_to_mlair(
                 raise RuntimeError("Cannot resolve model_id after create_model")
         seen_models[model_key] = model_id
 
+    if pipeline_map_targets is not None:
+        _note_pipeline_map_target(pipeline_map_targets, clinic_id_for_scope, model_id)
+
     existing_items = _list_model_versions_all_items(cfg, tenant_id, project_id, model_id)
     existing_version_by_canon_uri: Dict[str, int] = {}
     for item in existing_items:
@@ -1059,6 +1248,9 @@ def _sync_disk_version_to_mlair(
         if desired_stage == "production":
             existing_version = existing_version_by_canon_uri.get(artifact_uri)
             if existing_version is not None:
+                _maybe_auto_approve_version_for_promote(
+                    cfg, tenant_id, project_id, model_id, int(existing_version)
+                )
                 _promote_model_version(
                     cfg=cfg,
                     tenant_id=tenant_id,
@@ -1079,7 +1271,22 @@ def _sync_disk_version_to_mlair(
             }
         return 0, 1, 0, None
 
-    _create_model_version(cfg, tenant_id, project_id, model_id, artifact_uri, desired_stage)
+    created_row = _create_model_version(cfg, tenant_id, project_id, model_id, artifact_uri, desired_stage)
+    if _env_truthy("VETAI_MLAIR_AUTO_APPROVE_ON_SYNC", "true") and str(desired_stage or "").strip().lower() == "production":
+        try:
+            vn = int((created_row or {}).get("version") or 0)
+            if vn:
+                _put_model_version_approval(
+                    cfg,
+                    tenant_id,
+                    project_id,
+                    model_id,
+                    vn,
+                    approval_status="approved",
+                    reason="vet-ai sync (production artifact)",
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("MLAir auto-approve after version create model_id=%s: %s", model_id, exc)
     return 1, 0, 0, {
         "clinic_key": clinic_id_for_scope or "global",
         "tenant_id": tenant_id,
@@ -1088,6 +1295,73 @@ def _sync_disk_version_to_mlair(
         "stage": desired_stage,
         "action": "created_version",
     }
+
+
+def _fill_pipeline_map_targets_from_seen_models(
+    cfg: Dict[str, Any],
+    *,
+    seen_models: Dict[str, str],
+    clinics: list[Any],
+    discovered: list[Any],
+    work: list[tuple[Optional[str], str, str]],
+    pipeline_map_targets: set[tuple[Optional[str], str]],
+) -> None:
+    """
+    Ensure pipeline mapping runs for every MLAir model row we track: global (default project),
+    every catalog/discovered/mirror clinic, and any clinic project inferred from ``clinic_<slug>``.
+    """
+    ordered_clinic_ids: list[str] = []
+    seen_ck: set[str] = set()
+    for clinic in clinics or []:
+        raw = str((clinic or {}).get("id") or "").strip()
+        if not raw or raw in seen_ck:
+            continue
+        seen_ck.add(raw)
+        ordered_clinic_ids.append(raw)
+    for row in discovered or []:
+        raw = str(row.get("clinic_key") or "").strip() or None
+        if not raw or raw in seen_ck:
+            continue
+        seen_ck.add(raw)
+        ordered_clinic_ids.append(raw)
+    for ck, _, _ in work:
+        if not ck or ck in seen_ck:
+            continue
+        seen_ck.add(ck)
+        ordered_clinic_ids.append(ck)
+
+    slug_to_clinic: dict[str, str] = {}
+    for raw_ck in ordered_clinic_ids:
+        nk = normalize_clinic_key(raw_ck) or raw_ck
+        slug_to_clinic[clinic_dir_slug(nk)] = raw_ck
+        slug_to_clinic[clinic_dir_slug(raw_ck)] = raw_ck
+
+    for model_key, mid in seen_models.items():
+        mid_s = str(mid).strip()
+        if not mid_s:
+            continue
+        parts = str(model_key).split(":", 2)
+        if len(parts) != 3:
+            continue
+        tid_k, pid_k, _ = parts[0], parts[1], parts[2]
+        gsc = _resolve_scope(cfg, None)
+        if tid_k == gsc["tenant_id"] and pid_k == gsc["project_id"]:
+            _note_pipeline_map_target(pipeline_map_targets, None, mid_s)
+            continue
+        resolved_raw: Optional[str] = None
+        for raw_ck in ordered_clinic_ids:
+            sc = _resolve_scope(cfg, raw_ck)
+            if sc["tenant_id"] == tid_k and sc["project_id"] == pid_k:
+                resolved_raw = raw_ck
+                break
+        if resolved_raw:
+            _note_pipeline_map_target(pipeline_map_targets, resolved_raw, mid_s)
+            continue
+        if str(pid_k).startswith("clinic_"):
+            slug = str(pid_k)[len("clinic_") :]
+            guess = slug_to_clinic.get(slug)
+            if guess:
+                _note_pipeline_map_target(pipeline_map_targets, guess, mid_s)
 
 
 def sync_all_models_to_mlair() -> Dict[str, Any]:
@@ -1106,6 +1380,7 @@ def sync_all_models_to_mlair() -> Dict[str, Any]:
     synced_scopes: list[Dict[str, Any]] = []
     seen_models: Dict[str, str] = {}
     dedupe_artifact_scope: set[tuple[str, str, str]] = set()
+    pipeline_map_targets: set[tuple[Optional[str], str]] = set()
 
     active_global = model_store.get_active_model()
     active_global_version = active_global.model_version if active_global else None
@@ -1165,6 +1440,7 @@ def sync_all_models_to_mlair() -> Dict[str, Any]:
             active_global_version=active_global_version,
             seen_models=seen_models,
             dedupe_artifact_scope=dedupe_artifact_scope,
+            pipeline_map_targets=pipeline_map_targets,
         )
         created_count += c
         skipped_count += s
@@ -1215,9 +1491,55 @@ def sync_all_models_to_mlair() -> Dict[str, Any]:
                     created_models += 1
             if model_id:
                 seen_models[model_key] = model_id
+                _note_pipeline_map_target(pipeline_map_targets, clinic_key, model_id)
 
-    # One pipeline version per clinic project so MLAir can resolve latest DAG for training runs.
+    # Default (global) project: same placeholder behavior as clinics so pipeline mapping has a model_id.
+    if ensure_empty_scopes:
+        gscope = _resolve_scope(cfg, None)
+        g_tenant_id = gscope["tenant_id"]
+        g_project_id = gscope["project_id"]
+        g_scope_model_name = _scoped_model_name(model_name, None)
+        g_model_key = f"{g_tenant_id}:{g_project_id}:{g_scope_model_name}"
+        if g_model_key not in seen_models:
+            g_model_id = ""
+            g_listed = _list_models(cfg, g_tenant_id, g_project_id)
+            g_items = g_listed.get("items") if isinstance(g_listed, dict) else []
+            g_items = g_items if isinstance(g_items, list) else []
+            for item in g_items:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("name") or "").strip() == g_scope_model_name:
+                    g_model_id = str(item.get("model_id") or item.get("id") or "").strip()
+                    if g_model_id:
+                        break
+            if not g_model_id:
+                g_created = _create_model(
+                    cfg,
+                    g_tenant_id,
+                    g_project_id,
+                    g_scope_model_name,
+                    f"{model_desc} (global scope placeholder)",
+                )
+                g_model_id = str(g_created.get("model_id") or g_created.get("id") or "").strip()
+                if g_model_id:
+                    created_models += 1
+            if g_model_id:
+                seen_models[g_model_key] = g_model_id
+                _note_pipeline_map_target(pipeline_map_targets, None, g_model_id)
+
+    _fill_pipeline_map_targets_from_seen_models(
+        cfg,
+        seen_models=seen_models,
+        clinics=clinics,
+        discovered=discovered,
+        work=work,
+        pipeline_map_targets=pipeline_map_targets,
+    )
+
+    # One pipeline version per project (global + clinic) so MLAir can resolve latest DAG for training runs.
     clinic_scopes_for_pipeline: set[tuple[str, str]] = set()
+    g0 = _resolve_scope(cfg, None)
+    clinic_scopes_for_pipeline.add((g0["tenant_id"], g0["project_id"]))
     for clinic in clinics:
         ck = str((clinic or {}).get("id") or "").strip()
         if not ck:
@@ -1231,14 +1553,18 @@ def sync_all_models_to_mlair() -> Dict[str, Any]:
         sc = _resolve_scope(cfg, ck)
         clinic_scopes_for_pipeline.add((sc["tenant_id"], sc["project_id"]))
 
+    for mk in seen_models:
+        bits = str(mk).split(":", 2)
+        if len(bits) == 3:
+            clinic_scopes_for_pipeline.add((bits[0], bits[1]))
+
     ensure_clinic_pipelines = os.getenv("MLAIR_ENSURE_CLINIC_TRAINING_PIPELINES", "true").lower() == "true"
+    explicit_mlair_pipeline = str(os.getenv("MLAIR_PIPELINE_ID", "") or "").strip()
     pipeline_id = str(cfg.get("pipeline_id") or "").strip()
     created_pipeline_versions = 0
     clinic_pipeline_scope_count = sum(1 for _, p in clinic_scopes_for_pipeline if str(p).startswith("clinic_"))
     if ensure_clinic_pipelines and pipeline_id:
         for tid, pid in sorted(clinic_scopes_for_pipeline):
-            if not str(pid).startswith("clinic_"):
-                continue
             try:
                 if _ensure_clinic_training_pipeline(cfg, tid, pid, pipeline_id):
                     created_pipeline_versions += 1
@@ -1249,6 +1575,22 @@ def sync_all_models_to_mlair() -> Dict[str, Any]:
                     pid,
                     pipeline_id,
                     exc,
+                )
+
+    pipeline_mappings_upserted = 0
+    pipeline_mapping_errors: list[Dict[str, Any]] = []
+    if pipeline_id and _env_truthy("VETAI_MLAIR_MAP_PIPELINE_ON_SYNC", "true") and pipeline_map_targets:
+        for ck_map, mid_map in sorted(pipeline_map_targets, key=lambda x: (x[0] or "", x[1])):
+            try:
+                registry_put_pipeline_mapping(
+                    clinic_id=ck_map,
+                    model_id=mid_map,
+                    pipeline_id=pipeline_id,
+                )
+                pipeline_mappings_upserted += 1
+            except Exception as exc:  # noqa: BLE001
+                pipeline_mapping_errors.append(
+                    {"clinic_id": ck_map, "model_id": mid_map, "error": str(exc)}
                 )
 
     return {
@@ -1262,6 +1604,200 @@ def sync_all_models_to_mlair() -> Dict[str, Any]:
         "promoted_versions": promoted_count,
         "skipped_versions": skipped_count,
         "synced_scopes": synced_scopes,
+        "training_pipeline_id_used": pipeline_id,
+        "used_default_training_pipeline_id": bool(pipeline_id and not explicit_mlair_pipeline),
         "created_pipeline_versions": created_pipeline_versions,
         "clinic_pipeline_scopes": clinic_pipeline_scope_count,
+        "pipeline_scopes_total": len(clinic_scopes_for_pipeline),
+        "pipeline_mappings_upserted": pipeline_mappings_upserted,
+        "pipeline_mapping_errors": pipeline_mapping_errors,
     }
+
+
+def _require_mlair_enabled() -> Dict[str, Any]:
+    cfg = _cfg()
+    if not cfg.get("enabled"):
+        raise RuntimeError("MLAir integration disabled (set MLAIR_ENABLED=true)")
+    return cfg
+
+
+def _registry_scope_ids(clinic_id: Optional[str]) -> tuple[str, str]:
+    cfg = _require_mlair_enabled()
+    sc = _resolve_scope(cfg, str(clinic_id).strip() if clinic_id else None)
+    return str(sc["tenant_id"]).strip(), str(sc["project_id"]).strip()
+
+
+def _registry_model_base_url(cfg: Dict[str, Any], tenant_id: str, project_id: str, model_id: str) -> str:
+    tq = quote(str(tenant_id).strip(), safe="")
+    pq = quote(str(project_id).strip(), safe="")
+    mq = quote(str(model_id).strip(), safe="")
+    return f"{str(cfg.get('base_url') or '').rstrip('/')}/v1/tenants/{tq}/projects/{pq}/models/{mq}"
+
+
+def registry_list_models(
+    *,
+    clinic_id: Optional[str] = None,
+    limit: int = 200,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    cfg = _require_mlair_enabled()
+    tid, pid = _registry_scope_ids(clinic_id)
+    return _list_models(cfg, tid, pid, limit=limit, offset=offset)
+
+
+def registry_get_model(*, clinic_id: Optional[str], model_id: str) -> Dict[str, Any]:
+    cfg = _require_mlair_enabled()
+    tid, pid = _registry_scope_ids(clinic_id)
+    url = _registry_model_base_url(cfg, tid, pid, model_id)
+    return _request_json("GET", url, body=None, headers=_headers(cfg), timeout=float(cfg["timeout"]))
+
+
+def registry_get_model_status(*, clinic_id: Optional[str], model_id: str) -> Dict[str, Any]:
+    cfg = _require_mlair_enabled()
+    tid, pid = _registry_scope_ids(clinic_id)
+    url = _registry_model_base_url(cfg, tid, pid, model_id) + "/status"
+    return _request_json("GET", url, body=None, headers=_headers(cfg), timeout=float(cfg["timeout"]))
+
+
+def registry_get_resolved_pipeline(*, clinic_id: Optional[str], model_id: str) -> Dict[str, Any]:
+    cfg = _require_mlair_enabled()
+    tid, pid = _registry_scope_ids(clinic_id)
+    url = _registry_model_base_url(cfg, tid, pid, model_id) + "/resolved-pipeline"
+    return _request_json("GET", url, body=None, headers=_headers(cfg), timeout=float(cfg["timeout"]))
+
+
+def registry_put_pipeline_mapping(*, clinic_id: Optional[str], model_id: str, pipeline_id: str) -> Dict[str, Any]:
+    cfg = _require_mlair_enabled()
+    tid, pid = _registry_scope_ids(clinic_id)
+    url = _registry_model_base_url(cfg, tid, pid, model_id) + "/pipeline-mapping"
+    body = {"pipeline_id": str(pipeline_id).strip()}
+    return _request_json("PUT", url, body=body, headers=_headers(cfg), timeout=float(cfg["timeout"]))
+
+
+def registry_get_trigger_policy(*, clinic_id: Optional[str], model_id: str) -> Dict[str, Any]:
+    cfg = _require_mlair_enabled()
+    tid, pid = _registry_scope_ids(clinic_id)
+    url = _registry_model_base_url(cfg, tid, pid, model_id) + "/trigger-policy"
+    return _request_json("GET", url, body=None, headers=_headers(cfg), timeout=float(cfg["timeout"]))
+
+
+def registry_put_trigger_policy(
+    *,
+    clinic_id: Optional[str],
+    model_id: str,
+    trigger_mode: str = "manual",
+    debounce_minutes: int = 10,
+    schedule_cron: Optional[str] = None,
+) -> Dict[str, Any]:
+    cfg = _require_mlair_enabled()
+    tid, pid = _registry_scope_ids(clinic_id)
+    url = _registry_model_base_url(cfg, tid, pid, model_id) + "/trigger-policy"
+    body: Dict[str, Any] = {
+        "trigger_mode": str(trigger_mode or "manual").strip(),
+        "debounce_minutes": int(debounce_minutes),
+        "schedule_cron": schedule_cron,
+    }
+    return _request_json("PUT", url, body=body, headers=_headers(cfg), timeout=float(cfg["timeout"]))
+
+
+def registry_list_model_versions(*, clinic_id: Optional[str], model_id: str) -> Dict[str, Any]:
+    cfg = _require_mlair_enabled()
+    tid, pid = _registry_scope_ids(clinic_id)
+    items = _list_model_versions_all_items(cfg, tid, pid, model_id)
+    return {"items": items}
+
+
+def registry_preview_next_artifact_uri(*, clinic_id: Optional[str], model_id: str) -> Dict[str, Any]:
+    cfg = _require_mlair_enabled()
+    tid, pid = _registry_scope_ids(clinic_id)
+    url = _registry_model_base_url(cfg, tid, pid, model_id) + "/next-artifact-uri"
+    return _request_json("GET", url, body=None, headers=_headers(cfg), timeout=float(cfg["timeout"]))
+
+
+def registry_promote_model_version(
+    *,
+    clinic_id: Optional[str],
+    model_id: str,
+    version: int,
+    stage: str = "production",
+) -> Dict[str, Any]:
+    cfg = _require_mlair_enabled()
+    tid, pid = _registry_scope_ids(clinic_id)
+    url = _registry_model_base_url(cfg, tid, pid, model_id) + "/promote"
+    body = {"version": int(version), "stage": str(stage or "production").strip()}
+    return _request_json("POST", url, body=body, headers=_headers(cfg), timeout=float(cfg["timeout"]))
+
+
+def registry_get_version_approval(*, clinic_id: Optional[str], model_id: str, version: int) -> Dict[str, Any]:
+    cfg = _require_mlair_enabled()
+    tid, pid = _registry_scope_ids(clinic_id)
+    url = f"{_registry_model_base_url(cfg, tid, pid, model_id)}/versions/{int(version)}/approval"
+    return _request_json("GET", url, body=None, headers=_headers(cfg), timeout=float(cfg["timeout"]))
+
+
+def registry_put_version_approval(
+    *,
+    clinic_id: Optional[str],
+    model_id: str,
+    version: int,
+    approval_status: str,
+    reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    cfg = _require_mlair_enabled()
+    tid, pid = _registry_scope_ids(clinic_id)
+    url = f"{_registry_model_base_url(cfg, tid, pid, model_id)}/versions/{int(version)}/approval"
+    body: Dict[str, Any] = {"approval_status": str(approval_status).strip()}
+    if reason is not None and str(reason).strip():
+        body["reason"] = str(reason).strip()
+    return _request_json("PUT", url, body=body, headers=_headers(cfg), timeout=float(cfg["timeout"]))
+
+
+def registry_delete_model_version(*, clinic_id: Optional[str], model_id: str, version: int) -> Dict[str, Any]:
+    cfg = _require_mlair_enabled()
+    tid, pid = _registry_scope_ids(clinic_id)
+    url = f"{_registry_model_base_url(cfg, tid, pid, model_id)}/versions/{int(version)}"
+    return _request_delete_json(url, cfg)
+
+
+def registry_delete_model(*, clinic_id: Optional[str], model_id: str) -> Dict[str, Any]:
+    cfg = _require_mlair_enabled()
+    tid, pid = _registry_scope_ids(clinic_id)
+    url = _registry_model_base_url(cfg, tid, pid, model_id)
+    return _request_delete_json(url, cfg)
+
+
+def registry_create_model(
+    *,
+    clinic_id: Optional[str],
+    name: str,
+    description: Optional[str] = None,
+) -> Dict[str, Any]:
+    cfg = _require_mlair_enabled()
+    tid, pid = _registry_scope_ids(clinic_id)
+    return _create_model(cfg, tid, pid, str(name).strip(), description)
+
+
+def registry_create_model_version(
+    *,
+    clinic_id: Optional[str],
+    model_id: str,
+    artifact_uri: str,
+    run_id: Optional[str] = None,
+    stage: str = "staging",
+) -> Dict[str, Any]:
+    cfg = _require_mlair_enabled()
+    tid, pid = _registry_scope_ids(clinic_id)
+    return register_model_version_for_scope(
+        tenant_id=tid,
+        project_id=pid,
+        model_id=str(model_id).strip(),
+        artifact_uri=str(artifact_uri).strip(),
+        run_id=run_id,
+        stage=stage,
+    )
+
+
+def registry_list_plugins() -> Dict[str, Any]:
+    cfg = _require_mlair_enabled()
+    url = f"{str(cfg.get('base_url') or '').rstrip('/')}/v1/plugins"
+    return _request_json("GET", url, body=None, headers=_headers(cfg), timeout=float(cfg["timeout"]))

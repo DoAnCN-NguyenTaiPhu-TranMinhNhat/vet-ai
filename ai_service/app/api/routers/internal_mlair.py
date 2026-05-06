@@ -117,7 +117,7 @@ async def mlair_model_promotion_webhook(
     elif mode == "materialize":
         version_label = _version_label_for_promotion(payload.model_id, payload.version)
         try:
-            model_store.materialize_mlair_artifact_as_version(
+            version_label = model_store.materialize_mlair_artifact_as_version(
                 artifact_uri=uri,
                 version_label=version_label,
                 clinic_key=clinic_key,

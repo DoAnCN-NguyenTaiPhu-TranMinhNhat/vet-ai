@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import shutil
+import threading
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 from urllib.parse import urlparse
@@ -50,15 +51,19 @@ def _sync_mlair_stages_after_active_change() -> None:
     """
     if os.getenv("VETAI_MLAIR_SYNC_ON_ACTIVE_CHANGE", "true").lower() not in ("1", "true", "yes", "y"):
         return
-    try:
-        from ai_service.app.infrastructure.external import mlair_client as _mc
+    def _run_sync() -> None:
+        try:
+            from ai_service.app.infrastructure.external import mlair_client as _mc
 
-        if not _mc.config_summary().get("enabled"):
-            return
-        _mc.sync_all_models_to_mlair()
-        logger.info("MLAir model stages refreshed after Vet-AI active model change")
-    except Exception as exc:
-        logger.warning("MLAir refresh after active model change failed (non-fatal): %s", exc)
+            if not _mc.config_summary().get("enabled"):
+                return
+            _mc.sync_all_models_to_mlair()
+            logger.info("MLAir model stages refreshed after Vet-AI active model change")
+        except Exception as exc:
+            logger.warning("MLAir refresh after active model change failed (non-fatal): %s", exc)
+
+    # Non-blocking: active-model APIs should return fast even when MLAir sync is slow.
+    threading.Thread(target=_run_sync, daemon=True, name="vetai-mlair-sync-after-active").start()
 
 
 def materialize_mlair_artifact_as_version(
@@ -142,8 +147,14 @@ def _collect_versions_under(dir_path: str) -> List[str]:
         return []
     out: List[str] = []
     for item in os.listdir(dir_path):
+        if not item.startswith("v"):
+            continue
+        # Internal MLAir alias links may point outside local disk and can be slow to stat;
+        # user-visible model pickers do not need them.
+        if is_mlair_materialization_alias(item):
+            continue
         path = os.path.join(dir_path, item)
-        if os.path.isdir(path) and item.startswith("v"):
+        if os.path.isdir(path):
             out.append(item)
     return out
 
@@ -287,8 +298,19 @@ def resolve_model_dir(model_version: str, clinic_key: Optional[Union[str, int]] 
     ck = normalize_clinic_key(clinic_key)
     if ck:
         sub = os.path.join(root, "clinics", clinic_dir_slug(ck), model_version)
+        # Prefer clinic-local storage only when inference artifacts are complete.
+        # Empty/incomplete clinic folders can appear during failed syncs and should
+        # not shadow valid global versions.
         if os.path.isdir(sub):
-            return sub
+            required = ("model.pkl", "tab_preprocess.pkl", "symptoms_mlb.pkl")
+            if all(os.path.isfile(os.path.join(sub, name)) for name in required):
+                return sub
+            logger.warning(
+                "Clinic model folder incomplete; fallback to global version=%s clinic=%s path=%s",
+                model_version,
+                ck,
+                sub,
+            )
     return os.path.join(root, model_version)
 
 
