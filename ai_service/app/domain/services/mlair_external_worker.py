@@ -23,6 +23,10 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
+# Vet-AI training endpoints read this via trigger_reason / bootstrap-csv form to skip MLAir run mirroring
+# (the parent run already exists in MLAir when the external worker invokes Vet-AI).
+VETAI_MLAIR_EXTERNAL_WORKER_TRIGGER_REASON = "mlair_external_worker"
+
 
 def _internal_api_base() -> str:
     explicit = os.getenv("VETAI_INTERNAL_API_BASE_URL", "").strip().rstrip("/")
@@ -109,6 +113,12 @@ def _trigger_bootstrap_csv_training(*, csv_bytes: bytes, filename: str, clinic_i
     parts.append(csv_bytes)
     parts.append(b"\r\n")
     parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"training_mode\"\r\n\r\nlocal\r\n".encode("utf-8"))
+    parts.append(
+        (
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"trigger_reason\"\r\n\r\n"
+            f"{VETAI_MLAIR_EXTERNAL_WORKER_TRIGGER_REASON}\r\n"
+        ).encode("utf-8")
+    )
     if clinic_id:
         parts.append(
             (
@@ -150,7 +160,7 @@ def _trigger_continuous_training(
     """POST /continuous-training/training/trigger; returns one or more training_ids."""
     body: dict[str, Any] = {
         "trigger_type": "manual",
-        "trigger_reason": "mlair_external_worker",
+        "trigger_reason": VETAI_MLAIR_EXTERNAL_WORKER_TRIGGER_REASON,
         "force": force,
         "training_mode": "local",
     }
