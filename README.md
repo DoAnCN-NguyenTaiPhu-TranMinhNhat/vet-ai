@@ -26,7 +26,6 @@ vet-ai/
 ├── ai_service/               # FastAPI app + MLOps modules
 ├── docker/                   # Compose manifests (dev/prod)
 ├── docs/                     # Architecture, deployment, local dev docs
-├── env/                      # Environment templates
 ├── scripts/                  # Training and helper scripts
 ├── monitoring/               # Monitoring assets
 ├── docker/
@@ -37,7 +36,7 @@ vet-ai/
 
 - Dev compose: `docker/compose.dev.yml`
 - Prod compose: `docker/compose.prod.yml`
-- Env template: `env/.env.example`
+- Env: `.env.example` (template) and `.env` (local, gitignored)
 
 ---
 
@@ -92,14 +91,16 @@ pip install "python-multipart>=0.0.20"
 
 ### Environment files in this repository
 
+Only two env files belong at the **repository root**:
+
 | File | Purpose | Loaded automatically? |
 |------|---------|---------------------|
-| **`env/.env.example`** | **Committed template.** Full variable set and defaults. | No — template only |
-| **`.env.local`** | **Local runtime file** (gitignored). Use this for local `uvicorn` / scripts. | No — load with `source` or inject in your shell |
+| **`.env.example`** | **Committed template.** Full variable set and defaults. | No — copy to `.env` and edit |
+| **`.env`** | **Your local secrets and overrides** (gitignored). | No — export in your shell or use `set -a && source .env && set +a` before `uvicorn` |
 
-In Docker, **`vet-microservices`** Compose usually injects variables via **`../vet-infra/.env`** for the `vet-ai` service — not from these files unless you wire them yourself.
+In Docker, **`vet-microservices`** Compose usually injects variables via **`../vet-infra/.env`** or **`vet-microservices/.env.local`** for the `vet-ai` service — not from this repo’s `.env` unless you mount or pass it yourself.
 
-Start from **`env/.env.example`** in this repo. Copy values into **`.env.local`** for local runs, or merge needed keys into **`vet-infra/.env`** when using `vet-microservices` Compose.
+Start from **`.env.example`**: `cp .env.example .env`, then fill in values. For the Java/Compose stack, merge the same keys into **`vet-infra/.env`** or **`vet-microservices/.env.local`** as needed.
 
 Below are the most important variables. Training and ML code honor many more (split ratios, gates, fine-tuning) — see `ai_service/training_engine.py` and `ai_service/continuous_training.py`.
 

@@ -26,10 +26,8 @@ Thumbs.db
 .vscode/
 *.iml
 
-# Env files / secrets
+# Env: committed template is .env.example; local overrides live in .env (never commit).
 .env
-.env.local
-.env.*.local
 
 # Logs
 *.log
