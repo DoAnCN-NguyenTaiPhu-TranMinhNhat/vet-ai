@@ -95,7 +95,7 @@ def ensure_model_directory_from_s3(model_version: str, clinic_key: Optional[str]
             client.download_file(bucket, key, dest)
     except Exception as e:
         # If S3 creds are missing (common in local/dev) we must not crash the caller
-        # with an uncaught botocore exception (it breaks MLAir promote webhook).
+        # with an uncaught botocore exception (e.g. during active-model restore).
         return False, f"S3 restore failed ({type(e).__name__}): {e}"
 
     if not os.path.isfile(os.path.join(local, "model.pkl")):

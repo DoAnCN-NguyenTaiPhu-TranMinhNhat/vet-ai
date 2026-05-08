@@ -807,7 +807,7 @@ class ModelTrainer:
         Returns (model, active_model_dir).
 
         When ``base_model_dir`` is set and exists, load from that directory instead of the
-        clinic/global active pin (e.g. MLAir ``plugin_context.artifact_uri`` materialized under MODEL_ROOT).
+        clinic/global active pin (e.g. explicit finetune base directory under ``MODEL_ROOT``).
         """
         ck = normalize_clinic_key(clinic_key)
         bdir = str(base_model_dir).strip() if base_model_dir else ""
@@ -2013,8 +2013,6 @@ def execute_training(
             training_metrics["training_scope"] = "global"
         else:
             training_metrics["training_scope"] = "clinic"
-            # New weights are always under models/clinics/<slug>/ even when warm-starting from a global base.
-            training_metrics["mlair_artifact_scope"] = "clinic"
         training_metrics["model_version"] = model_version
 
         # Save model

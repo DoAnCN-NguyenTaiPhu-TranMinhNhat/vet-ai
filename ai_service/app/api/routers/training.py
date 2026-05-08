@@ -46,7 +46,6 @@ from ai_service.app.domain.services.training_service import (
 )
 
 from ai_service.app.domain.services.clinic_scope_service import normalize_clinic_key
-from ai_service.app.domain.services.mlair_external_worker import VETAI_MLAIR_EXTERNAL_WORKER_TRIGGER_REASON
 from ai_service.app.domain.schemas.training import (
     DoctorFeedback,
     PredictionLog,
@@ -1517,15 +1516,6 @@ training_datasets: Dict[int, List[Dict[str, Any]]] = {}
 training_jobs.clear()
 training_datasets.clear()
 
-
-def _training_job_should_skip_mlair_mirror(training_id: int) -> bool:
-    """True when this job was started by MLAir's external worker (parent run already exists in MLAir)."""
-    row = training_jobs.get(training_id)
-    if not row:
-        return False
-    return str(row.get("trigger_reason") or "").strip() == VETAI_MLAIR_EXTERNAL_WORKER_TRIGGER_REASON
-
-
 logger.info("Production-ready continuous training system initialized")
 
 _predictions_logged_total = Counter("vetai_predictions_logged_total", "Total predictions logged for continuous training")
@@ -1971,151 +1961,8 @@ async def trigger_training_job(request: TrainingTriggerRequest) -> int:
     logger.info(f"Training task created: {task}")
     _refresh_training_metrics()
 
-    # Best-effort mirror to MLAir right after job creation so MLAir receives
-    # the run regardless of local training outcome (success/failed later).
-    try:
-        from ai_service.app.infrastructure.external import mlair_client
-
-        cfg = mlair_client.config_summary()
-        if cfg.get("enabled"):
-            if _training_job_should_skip_mlair_mirror(training_id):
-                logger.info(
-                    "MLAir mirror skipped for training_id=%s: external MLAir worker origin (no duplicate run)",
-                    training_id,
-                )
-            else:
-                mlair_key = f"vet-ai-training-job-{training_id}"
-                mlair_mode = _mlair_training_mode_for_rows(dataset_row_count)
-                mlair_client.mirror_training_job_to_mlair(
-                    idempotency_key=mlair_key,
-                    clinic_id=ck,
-                    training_mode=mlair_mode,
-                    override_config=_mlair_override_config_for_scope(
-                        clinic_key=ck,
-                        required_size=TRAINING_THRESHOLD,
-                        current_size=eligible_feedback_count,
-                    ),
-                    context={
-                        "source_app": "vet-ai",
-                        "source_task_type": "continuous_training",
-                        "source_training_id": str(training_id),
-                        "source_clinic_id": str(ck or "global"),
-                        **({"clinic_id": str(ck)} if ck else {}),
-                        "source_dataset_row_count": str(dataset_row_count),
-                        "source_mlair_training_mode": mlair_mode,
-                    },
-                )
-                _sync_mlair_running_state(
-                    idempotency_key=mlair_key,
-                    clinic_key=ck,
-                    training_id=training_id,
-                    trigger_type="continuous_training",
-                )
-                logger.info(
-                    "MLAir mirror trigger sent for training_id=%s (clinic_id=%s, key=%s)",
-                    training_id,
-                    ck,
-                    mlair_key,
-                )
-        else:
-            logger.info("MLAir mirror skipped for training_id=%s: integration disabled", training_id)
-    except Exception as exc:
-        logger.warning("MLAir mirror trigger failed for training_id=%s: %s", training_id, exc)
-
     return training_id
 
-
-def _build_mlair_run_params(
-    training_id: int,
-    clinic_key: Optional[str],
-    trigger_type: str,
-    status_hint: Optional[str] = None,
-) -> Dict[str, str]:
-    params: Dict[str, str] = {
-        "source_app": "vet-ai",
-        "source_task_type": trigger_type,
-        "source_training_id": str(training_id),
-        "source_clinic_id": str(clinic_key or "global"),
-    }
-    if status_hint:
-        params["source_status"] = str(status_hint)
-    try:
-        row = ct_store.get_training_job(training_id) or {}
-    except Exception:
-        row = {}
-    fields = {
-        "source_trigger_type": "trigger_type",
-        "source_training_mode": "training_mode",
-        "source_previous_model_version": "previous_model_version",
-        "source_new_model_version": "new_model_version",
-    }
-    for out_key, row_key in fields.items():
-        value = row.get(row_key)
-        if value is None:
-            continue
-        text = str(value).strip()
-        if text:
-            params[out_key] = text
-    return params
-
-
-def _sync_mlair_running_state(
-    *,
-    idempotency_key: str,
-    clinic_key: Optional[str],
-    training_id: int,
-    trigger_type: str,
-) -> None:
-    """Best-effort: mark mirrored MLAir run as RUNNING when Vet-AI starts real training."""
-    try:
-        from ai_service.app.infrastructure.external import mlair_client
-
-        mlair_client.sync_training_outcome_to_mlair(
-            idempotency_key=idempotency_key,
-            status="RUNNING",
-            clinic_id=clinic_key,
-            reason="vet-ai training job started",
-            run_params=_build_mlair_run_params(
-                training_id=training_id,
-                clinic_key=clinic_key,
-                trigger_type=trigger_type,
-                status_hint="RUNNING",
-            ),
-        )
-    except Exception as exc:
-        logger.warning("MLAir running-state sync failed for training_id=%s: %s", training_id, exc)
-
-
-def _mlair_training_mode_for_rows(row_count: int) -> str:
-    n = int(row_count or 0)
-    if n >= 10000:
-        return "full"
-    if n >= 1000:
-        return "standard"
-    return "quick"
-
-
-def _mlair_override_config_for_scope(
-    *,
-    clinic_key: Optional[str],
-    required_size: int,
-    current_size: int,
-) -> Dict[str, Any]:
-    prefix = (os.getenv("VETAI_MLAIR_READINESS_DATASET_PREFIX", "training_feedback") or "training_feedback").strip()
-    dataset_name = f"{prefix}_global" if clinic_key is None else f"{prefix}_{clinic_key}"
-    minimum_data = int(max(1, required_size))
-    current_data = int(max(0, current_size))
-    return {
-        "minimum_data": minimum_data,
-        "current_data": current_data,
-        "inputs": [
-            {
-                "dataset": dataset_name,
-                "required_size": minimum_data,
-                "current_size": current_data,
-            }
-        ]
-    }
 
 async def execute_actual_training(training_id: int, training_mode: str):
     """Execute actual ML training"""
@@ -2332,24 +2179,6 @@ async def execute_actual_training(training_id: int, training_mode: str):
             logger.info("Feedback marked consumed after training completion. Updated rows: %s", consumed)
 
             logger.info(f"Training {training_id} completed successfully!")
-            try:
-                if not _training_job_should_skip_mlair_mirror(training_id):
-                    from ai_service.app.infrastructure.external import mlair_client
-
-                    mlair_client.sync_training_outcome_to_mlair(
-                        idempotency_key=f"vet-ai-training-job-{training_id}",
-                        status="SUCCESS",
-                        clinic_id=clinic_key,
-                        reason="vet-ai training completed",
-                        run_params=_build_mlair_run_params(
-                            training_id=training_id,
-                            clinic_key=clinic_key,
-                            trigger_type="continuous_training",
-                            status_hint="SUCCESS",
-                        ),
-                    )
-            except Exception as exc:
-                logger.warning("MLAir outcome sync failed for training_id=%s (SUCCESS): %s", training_id, exc)
             _refresh_training_metrics()
         else:
             error_msg = result.get("error", "Unknown error")
@@ -2372,24 +2201,6 @@ async def execute_actual_training(training_id: int, training_mode: str):
                     ct_store.record_scope_training_failure(scope_key_batch)
                 except Exception:
                     logger.exception("record_scope_training_failure after failed result")
-            try:
-                if not _training_job_should_skip_mlair_mirror(training_id):
-                    from ai_service.app.infrastructure.external import mlair_client
-
-                    mlair_client.sync_training_outcome_to_mlair(
-                        idempotency_key=f"vet-ai-training-job-{training_id}",
-                        status="FAILED",
-                        clinic_id=clinic_key,
-                        reason=error_msg,
-                        run_params=_build_mlair_run_params(
-                            training_id=training_id,
-                            clinic_key=clinic_key,
-                            trigger_type="continuous_training",
-                            status_hint="FAILED",
-                        ),
-                    )
-            except Exception as exc:
-                logger.warning("MLAir outcome sync failed for training_id=%s (FAILED): %s", training_id, exc)
             _refresh_training_metrics()
 
     except Exception as e:
@@ -2410,24 +2221,6 @@ async def execute_actual_training(training_id: int, training_mode: str):
                 "status": "failed",
                 "error_message": str(e),
             })
-        try:
-            if not _training_job_should_skip_mlair_mirror(training_id):
-                from ai_service.app.infrastructure.external import mlair_client
-
-                mlair_client.sync_training_outcome_to_mlair(
-                    idempotency_key=f"vet-ai-training-job-{training_id}",
-                    status="FAILED",
-                    clinic_id=clinic_key,
-                    reason=str(e),
-                    run_params=_build_mlair_run_params(
-                        training_id=training_id,
-                        clinic_key=clinic_key,
-                        trigger_type="continuous_training",
-                        status_hint="FAILED",
-                    ),
-                )
-        except Exception as exc:
-            logger.warning("MLAir outcome sync failed for training_id=%s (EXCEPTION): %s", training_id, exc)
         _refresh_training_metrics()
 
 
@@ -2576,28 +2369,6 @@ async def execute_bootstrap_training(
                 logger.warning("Failed to set active model after bootstrap training: %s", e)
 
             logger.info("Bootstrap training %s completed successfully (Postgres feedback unchanged).", training_id)
-            try:
-                if not _training_job_should_skip_mlair_mirror(training_id):
-                    from ai_service.app.infrastructure.external import mlair_client
-
-                    mlair_client.sync_training_outcome_to_mlair(
-                        idempotency_key=f"vet-ai-bootstrap-job-{training_id}",
-                        status="SUCCESS",
-                        clinic_id=clinic_key,
-                        reason="vet-ai bootstrap csv training completed",
-                        run_params=_build_mlair_run_params(
-                            training_id=training_id,
-                            clinic_key=clinic_key,
-                            trigger_type="bootstrap_csv",
-                            status_hint="SUCCESS",
-                        ),
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "MLAir outcome sync failed for bootstrap training_id=%s (SUCCESS): %s",
-                    training_id,
-                    exc,
-                )
             _refresh_training_metrics()
         else:
             error_msg = result.get("error", "Unknown error")
@@ -2608,28 +2379,6 @@ async def execute_bootstrap_training(
                         "status": "failed",
                         "error_message": error_msg,
                     }
-                )
-            try:
-                if not _training_job_should_skip_mlair_mirror(training_id):
-                    from ai_service.app.infrastructure.external import mlair_client
-
-                    mlair_client.sync_training_outcome_to_mlair(
-                        idempotency_key=f"vet-ai-bootstrap-job-{training_id}",
-                        status="FAILED",
-                        clinic_id=clinic_key,
-                        reason=error_msg,
-                        run_params=_build_mlair_run_params(
-                            training_id=training_id,
-                            clinic_key=clinic_key,
-                            trigger_type="bootstrap_csv",
-                            status_hint="FAILED",
-                        ),
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "MLAir outcome sync failed for bootstrap training_id=%s (FAILED): %s",
-                    training_id,
-                    exc,
                 )
             _refresh_training_metrics()
 
@@ -2645,28 +2394,6 @@ async def execute_bootstrap_training(
                     "status": "failed",
                     "error_message": str(e),
                 }
-            )
-        try:
-            if not _training_job_should_skip_mlair_mirror(training_id):
-                from ai_service.app.infrastructure.external import mlair_client
-
-                mlair_client.sync_training_outcome_to_mlair(
-                    idempotency_key=f"vet-ai-bootstrap-job-{training_id}",
-                    status="FAILED",
-                    clinic_id=clinic_key,
-                    reason=str(e),
-                    run_params=_build_mlair_run_params(
-                        training_id=training_id,
-                        clinic_key=clinic_key,
-                        trigger_type="bootstrap_csv",
-                        status_hint="FAILED",
-                    ),
-                )
-        except Exception as exc:
-            logger.warning(
-                "MLAir outcome sync failed for bootstrap training_id=%s (EXCEPTION): %s",
-                training_id,
-                exc,
             )
         _refresh_training_metrics()
 
@@ -3116,7 +2843,7 @@ async def bootstrap_csv_training_endpoint(
     training_mode: str = Form("local"),
     trigger_reason: Optional[str] = Form(
         None,
-        description="Internal: set by MLAir external worker so Vet-AI does not create a duplicate MLAir run.",
+        description="Optional note stored on the training job row (operators / integrations).",
     ),
     _: bool = Depends(verify_admin),
 ):
@@ -3180,56 +2907,6 @@ async def bootstrap_csv_training_endpoint(
         asyncio.create_task(
             execute_bootstrap_training(training_id, fb_rows, pred_rows, ck, tm)
         )
-
-        # Best-effort mirror to MLAir for CSV-triggered jobs too.
-        try:
-            from ai_service.app.infrastructure.external import mlair_client
-
-            cfg = mlair_client.config_summary()
-            if cfg.get("enabled"):
-                if _training_job_should_skip_mlair_mirror(training_id):
-                    logger.info(
-                        "MLAir mirror skipped for bootstrap training_id=%s: external MLAir worker origin (no duplicate run)",
-                        training_id,
-                    )
-                else:
-                    mlair_key = f"vet-ai-bootstrap-job-{training_id}"
-                    mlair_mode = _mlair_training_mode_for_rows(len(dataset_rows))
-                    mlair_client.mirror_training_job_to_mlair(
-                        idempotency_key=mlair_key,
-                        clinic_id=ck,
-                        training_mode=mlair_mode,
-                        override_config=_mlair_override_config_for_scope(
-                            clinic_key=ck,
-                            required_size=len(fb_rows),
-                            current_size=len(fb_rows),
-                        ),
-                        context={
-                            "source_app": "vet-ai",
-                            "source_task_type": "bootstrap_csv",
-                            "source_training_id": str(training_id),
-                            "source_clinic_id": str(ck or "global"),
-                            **({"clinic_id": str(ck)} if ck else {}),
-                            "source_dataset_row_count": str(len(dataset_rows)),
-                            "source_mlair_training_mode": mlair_mode,
-                        },
-                    )
-                    _sync_mlair_running_state(
-                        idempotency_key=mlair_key,
-                        clinic_key=ck,
-                        training_id=training_id,
-                        trigger_type="bootstrap_csv",
-                    )
-                    logger.info(
-                        "MLAir mirror trigger sent for bootstrap training_id=%s (clinic_id=%s, key=%s)",
-                        training_id,
-                        ck,
-                        mlair_key,
-                    )
-            else:
-                logger.info("MLAir mirror skipped for bootstrap training_id=%s: integration disabled", training_id)
-        except Exception as exc:
-            logger.warning("MLAir mirror trigger failed for bootstrap training_id=%s: %s", training_id, exc)
 
         _refresh_training_metrics()
 

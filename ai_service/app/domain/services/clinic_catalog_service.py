@@ -116,7 +116,7 @@ def _fetch_customers_service_clinics() -> list[dict[str, Any]]:
 
 def resolve_clinic_identifier(user_clinic: Optional[str]) -> Optional[str]:
     """
-    Map a UI label to the canonical clinic id used on disk and in ``clinic_<slug>`` MLAir projects.
+    Map a UI label to the canonical clinic id used on disk (e.g. ``models/clinics/<slug>``).
 
     - If ``user_clinic`` is already a UUID string, it is returned unchanged.
     - Otherwise we look up ``get_clinics_for_mlops()`` for an exact **id** match (case-insensitive)

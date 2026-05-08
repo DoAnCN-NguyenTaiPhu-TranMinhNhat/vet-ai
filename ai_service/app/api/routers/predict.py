@@ -126,7 +126,7 @@ async def list_predict_models(
 ) -> dict[str, Any]:
     """
     Versions are those returned by ``list_user_visible_model_versions`` for the clinic key
-    (merged global + clinic folder when a clinic is set). Internal ``v_mlair_*`` symlinks are omitted.
+    (merged global + clinic folder when a clinic is set).
 
     Each row in ``models`` includes ``isActiveDefault`` so UIs can badge the active model and
     offer "Set as default" on other rows. For dropdowns, omit rows where ``isActiveDefault``

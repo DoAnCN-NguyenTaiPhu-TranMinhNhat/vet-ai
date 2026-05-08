@@ -2,36 +2,21 @@ import json
 import logging
 import os
 import shutil
-import threading
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
-from urllib.parse import urlparse
 
 from ai_service.app.domain.services.clinic_scope_service import clinic_dir_slug, normalize_clinic_key
 
 logger = logging.getLogger(__name__)
 
-# Symlinks created under MODEL_ROOT to map MLAir ``file://`` trees into a ``v*`` name.
-# They are not "models" for operators: hide from version pickers; dedupe by realpath.
-_MLAIR_ALIAS_PREFIX = "v_mlair_"
-
-
-def is_mlair_materialization_alias(version: str) -> bool:
-    v = str(version or "").strip()
-    return bool(v) and v.startswith(_MLAIR_ALIAS_PREFIX)
-
 
 def list_user_visible_model_versions(clinic_key: Optional[Union[str, int]] = None) -> List[str]:
-    """Like :func:`list_model_versions` but omits internal MLAir materialization symlinks."""
-    return [v for v in list_model_versions(clinic_key) if not is_mlair_materialization_alias(v)]
+    """Same as :func:`list_model_versions` (all discovered ``v*`` dirs are user-selectable)."""
+    return list_model_versions(clinic_key)
 
 
 def list_user_visible_model_versions_clinic_storage_only(clinic_key: Optional[Union[str, int]] = None) -> List[str]:
-    return [
-        v
-        for v in list_model_versions_clinic_storage_only(clinic_key)
-        if not is_mlair_materialization_alias(v)
-    ]
+    return list_model_versions_clinic_storage_only(clinic_key)
 
 
 @dataclass(frozen=True)
@@ -42,87 +27,6 @@ class ActiveModel:
 
 _STATE_DIR = os.getenv("VETAI_STATE_DIR") or os.path.join(os.path.dirname(__file__), "state")
 _ACTIVE_MODEL_FILE = os.path.join(_STATE_DIR, "active_model.json")
-
-
-def _sync_mlair_stages_after_active_change() -> None:
-    """
-    After Vet-AI active/pinned model changes, re-sync MLAir so production stage matches
-    the same artifact as Vet-AI active (see mlair_client.sync_all_models_to_mlair).
-    """
-    if os.getenv("VETAI_MLAIR_SYNC_ON_ACTIVE_CHANGE", "true").lower() not in ("1", "true", "yes", "y"):
-        return
-    def _run_sync() -> None:
-        try:
-            from ai_service.app.infrastructure.external import mlair_client as _mc
-
-            if not _mc.config_summary().get("enabled"):
-                return
-            _mc.sync_all_models_to_mlair()
-            logger.info("MLAir model stages refreshed after Vet-AI active model change")
-        except Exception as exc:
-            logger.warning("MLAir refresh after active model change failed (non-fatal): %s", exc)
-
-    # Non-blocking: active-model APIs should return fast even when MLAir sync is slow.
-    threading.Thread(target=_run_sync, daemon=True, name="vetai-mlair-sync-after-active").start()
-
-
-def materialize_mlair_artifact_as_version(
-    *,
-    artifact_uri: str,
-    version_label: str,
-    clinic_key: Optional[Union[str, int]] = None,
-) -> str:
-    """
-    Map a ``file://`` MLAir artifact directory into ``MODEL_ROOT`` as a ``v*`` entry (symlink or copy).
-
-    If the same weights already exist under any ``v*`` folder for this scope (same realpath),
-    returns that folder name and **does not** create another ``v_mlair_*`` symlink.
-
-    ``v_mlair_*`` names are internal aliases for Vet-AI only; they are not shown in user-facing
-    model lists (see :func:`list_user_visible_model_versions`).
-    """
-    uri = str(artifact_uri or "").strip()
-    parsed = urlparse(uri)
-    if parsed.scheme != "file":
-        raise ValueError("materialize_mlair_artifact_requires_file_scheme")
-    src = os.path.realpath(parsed.path)
-    if not os.path.isdir(src):
-        raise FileNotFoundError(f"mlair_artifact_not_a_directory:{src}")
-
-    ck = normalize_clinic_key(clinic_key)
-    existing = find_version_label_for_artifact_realpath(src, ck)
-    if existing:
-        logger.info(
-            "materialize_mlair_reuse_existing realpath=%s version=%s (skip new symlink)",
-            src,
-            existing,
-        )
-        return existing
-
-    label = str(version_label).strip()
-    if not label or not label.startswith("v"):
-        raise ValueError("version_label_must_start_with_v")
-
-    root = _models_root()
-    if ck:
-        dest_parent = os.path.join(root, "clinics", clinic_dir_slug(ck))
-    else:
-        dest_parent = root
-    os.makedirs(dest_parent, exist_ok=True)
-    dest = os.path.join(dest_parent, label)
-
-    if os.path.lexists(dest):
-        if os.path.islink(dest) and os.path.realpath(dest) == src:
-            return label
-        if os.path.isdir(dest) and not os.path.islink(dest):
-            shutil.rmtree(dest)
-        elif os.path.lexists(dest):
-            os.unlink(dest)
-    try:
-        os.symlink(src, dest, target_is_directory=True)
-    except OSError:
-        shutil.copytree(src, dest)
-    return label
 
 
 def _models_root() -> str:
@@ -148,10 +52,6 @@ def _collect_versions_under(dir_path: str) -> List[str]:
     out: List[str] = []
     for item in os.listdir(dir_path):
         if not item.startswith("v"):
-            continue
-        # Internal MLAir alias links may point outside local disk and can be slow to stat;
-        # user-visible model pickers do not need them.
-        if is_mlair_materialization_alias(item):
             continue
         path = os.path.join(dir_path, item)
         if os.path.isdir(path):
@@ -241,13 +141,9 @@ def list_all_model_versions() -> List[str]:
                 continue
             _add(_collect_versions_under(clinic_path))
 
-    timestamped = sorted([v for v in out if "_" in v and not is_mlair_materialization_alias(v)], reverse=True)
-    semantic = sorted([v for v in out if "_" not in v and not is_mlair_materialization_alias(v)], reverse=True)
-    rest = [
-        v
-        for v in out
-        if v not in timestamped and v not in semantic and not is_mlair_materialization_alias(v)
-    ]
+    timestamped = sorted([v for v in out if "_" in v], reverse=True)
+    semantic = sorted([v for v in out if "_" not in v], reverse=True)
+    rest = [v for v in out if v not in timestamped and v not in semantic]
     return timestamped + semantic + rest
 
 
@@ -261,8 +157,6 @@ def list_model_versions_with_scope() -> List[Dict[str, Optional[str]]]:
     rows: List[Dict[str, Optional[str]]] = []
 
     for version in _collect_versions_under(root):
-        if is_mlair_materialization_alias(version):
-            continue
         rows.append(
             {
                 "version": version,
@@ -278,8 +172,6 @@ def list_model_versions_with_scope() -> List[Dict[str, Optional[str]]]:
             if not os.path.isdir(clinic_path):
                 continue
             for version in _collect_versions_under(clinic_path):
-                if is_mlair_materialization_alias(version):
-                    continue
                 rows.append(
                     {
                         "version": version,
@@ -321,9 +213,6 @@ def find_version_label_for_artifact_realpath(
     """
     Return an existing version folder name (under ``MODEL_ROOT``) whose resolved directory
     equals ``artifact_realpath`` (after :func:`os.path.realpath`).
-
-    Used when MLAir promote should only **pin active** to weights already present in the store
-    (no new ``v_mlair_*`` symlinks).
     """
     target = os.path.realpath(str(artifact_realpath or "").strip())
     if not os.path.isdir(target):
@@ -339,9 +228,7 @@ def find_version_label_for_artifact_realpath(
             matches.append(v)
     if not matches:
         return None
-    non_alias = [m for m in matches if not is_mlair_materialization_alias(m)]
-    pool = non_alias if non_alias else matches
-    return sorted(pool, reverse=True)[0]
+    return sorted(matches, reverse=True)[0]
 
 
 def storage_scope_for_version(clinic_key: Optional[Union[str, int]], model_version: str) -> str:
@@ -447,7 +334,6 @@ def set_active_model(model_version: str) -> ActiveModel:
     os.replace(tmp, _ACTIVE_MODEL_FILE)
 
     logger.info("Active model set to %s (%s)", mv, model_dir)
-    _sync_mlair_stages_after_active_change()
     return ActiveModel(model_version=mv, model_dir=model_dir)
 
 
@@ -551,5 +437,4 @@ def set_clinic_active_model(clinic_id: Union[str, int], model_version: str) -> A
         json.dump({"model_version": mv, "model_dir": model_dir}, f)
     os.replace(tmp, out)
     logger.info("Clinic %s active model set to %s (%s)", ck, mv, model_dir)
-    _sync_mlair_stages_after_active_change()
     return ActiveModel(model_version=mv, model_dir=model_dir)
