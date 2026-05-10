@@ -2133,6 +2133,11 @@ async def execute_actual_training(training_id: int, training_mode: str):
 
                         set_clinic_active_model(clinic_key, model_version)
                         clear_artifact_cache()
+                        from ai_service.app.infrastructure.external.mlair_client import (
+                            try_sync_vetai_pin_to_mlair_production,
+                        )
+
+                        try_sync_vetai_pin_to_mlair_production(clinic_key, model_version)
                         try:
                             inc_model_reload("clinic", "success")
                         except Exception:
@@ -2145,8 +2150,12 @@ async def execute_actual_training(training_id: int, training_mode: str):
                         )
                     else:
                         from ai_service.app.api.routers.predict import set_active_model_and_reload
+                        from ai_service.app.infrastructure.external.mlair_client import (
+                            try_sync_vetai_pin_to_mlair_production,
+                        )
 
                         set_active_model_and_reload(model_version)
+                        try_sync_vetai_pin_to_mlair_production(None, model_version)
                         try:
                             inc_model_reload("global", "success")
                         except Exception:
@@ -2344,6 +2353,11 @@ async def execute_bootstrap_training(
 
                         set_clinic_active_model(clinic_key, model_version)
                         clear_artifact_cache()
+                        from ai_service.app.infrastructure.external.mlair_client import (
+                            try_sync_vetai_pin_to_mlair_production,
+                        )
+
+                        try_sync_vetai_pin_to_mlair_production(clinic_key, model_version)
                         logger.info(
                             "Clinic %s pinned to %s after bootstrap job %s",
                             clinic_key,
@@ -2352,8 +2366,12 @@ async def execute_bootstrap_training(
                         )
                     else:
                         from ai_service.app.api.routers.predict import set_active_model_and_reload
+                        from ai_service.app.infrastructure.external.mlair_client import (
+                            try_sync_vetai_pin_to_mlair_production,
+                        )
 
                         set_active_model_and_reload(model_version)
+                        try_sync_vetai_pin_to_mlair_production(None, model_version)
                         logger.info(
                             "Global active model set to %s after bootstrap job %s",
                             model_version,

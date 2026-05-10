@@ -14,6 +14,10 @@ Env:
   MLAIR_IMPORT_STAGE          default: staging
   MLAIR_IMPORT_INCLUDE_RUN_ID default: unset — do **not** send multipart ``run_id`` unless ``1``; synthetic ids
         (``vet-ai-disk-*`` / ``vet-ai-training-*``) are not ``runs`` rows in MLAir and trigger ``model_versions_run_id_fkey`` (HTTP 500).
+  MLAIR_SYNC_ACTIVE_TO_PRODUCTION default: 1 — when Vet-AI pins an active model, POST MLAir ``.../models/{id}/promote`` for the matching version.
+  MLAIR_SYNC_APPROVE_BEFORE_PROMOTE default: 0 — set ``1`` to PUT ``.../versions/{v}/approval`` ``approved`` before promote (strict gates).
+  MLAIR_PROMOTE_WEBHOOK_INBOUND_TOKEN  Bearer for ``POST /mlops/mlair/promote-webhook`` (set MLAIR_MODEL_PROMOTE_WEBHOOK_* on mlair-api to call vet-ai).
+  MLAIR_PROMOTE_SYNC_DEBOUNCE_SECONDS default: 3 — ignore repeat Vet-AI→MLAir promote calls for the same project+folder within this window (stops client/webhook ping-pong).
   MLAIR_TIMEOUT_SECONDS       default: 120
   MLAIR_REGISTRY_SYNC_AT_STARTUP  default: 1 — POST /v1/tenants/.../projects/registry for catalog + global project
   MLAIR_REGISTRY_GLOBAL_PROJECT_NAME  optional display name for the global MLAir project row
@@ -670,10 +674,17 @@ def _list_model_items(client: httpx.Client, tenant_id: str, project_id: str) -> 
     return items if isinstance(items, list) else []
 
 
+def _norm_mlair_registry_model_name(name: str) -> str:
+    """Collapse odd whitespace so we match MLAir rows even when ``name`` was stored with typos."""
+    return " ".join(str(name or "").split()).strip()
+
+
 def _ensure_model_id(client: httpx.Client, tenant_id: str, project_id: str, name: str, description: str) -> str:
+    want = _norm_mlair_registry_model_name(name)
     for row in _list_model_items(client, tenant_id, project_id):
-        if isinstance(row, dict) and row.get("name") == name and row.get("model_id"):
-            return str(row["model_id"])
+        if isinstance(row, dict) and row.get("model_id"):
+            if _norm_mlair_registry_model_name(str(row.get("name") or "")) == want:
+                return str(row["model_id"])
 
     url = f"{mlair_api_base_url()}/v1/tenants/{tenant_id}/projects/{project_id}/models"
     r = client.post(
@@ -717,22 +728,6 @@ def _mlair_fetch_model_version_items(
     body = r.json() if r.content else {}
     items = body.get("items") if isinstance(body, dict) else None
     return items if isinstance(items, list) else []
-
-
-def _mlair_disk_folder_hints_from_version_rows(items: list) -> set[str]:
-    """
-    Best-effort parse of MLAir version rows so we can skip re-importing folders already registered.
-
-    Matches path segments like ``.../v1/model.pkl`` emitted under ``ML_AIR_DEFAULT_MODEL_ARTIFACT_ROOT``.
-    """
-    out: set[str] = set()
-    rx = re.compile(r"/(v\d[A-Za-z0-9_-]*)/")
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        blob = json.dumps(it, default=str)
-        out.update(m.group(1) for m in rx.finditer(blob))
-    return out
 
 
 def _mlair_import_http_looks_duplicate(exc: httpx.HTTPStatusError) -> bool:
@@ -846,10 +841,10 @@ def bootstrap_mlair_models_from_disk_for_project(
     """
     Import every on-disk ``model.pkl`` bundle for this scope into the logical MLAir model.
 
-    Previously skipped entirely once *any* version existed, which left later folders (e.g. ``v2``)
-    on disk never pushed while MLAir only showed ``v1``. We now attempt each disk folder and treat
-    HTTP duplicate / idempotent responses as success. If MLAir's GET ``.../versions`` returns rows,
-    we skip folders whose path segment (``v*``) already appears in that payload.
+    Skips a disk folder when a registry row already points at that folder (same check as promote:
+    :func:`find_mlair_numeric_version_for_disk_folder`). Relying only on regex hints over ``artifact_uri``
+    missed paths like ``.../v2`` without a trailing slash, which caused **re-import on every periodic
+    sync** and many spurious MLAir versions after container restarts.
     """
     if not mlair_enabled() or not _disk_model_import_at_registry_enabled():
         return {"status": "skipped", "reason": "MLAIR_DISK_MODEL_IMPORT_AT_REGISTRY off or MLAIR disabled"}
@@ -860,15 +855,23 @@ def bootstrap_mlair_models_from_disk_for_project(
         version_items = _mlair_fetch_model_version_items(client, tenant_id, project_id, model_id)
         if version_items is None:
             return {"status": "skipped", "reason": "mlair_model_versions_not_supported", "project_id": project_id}
-        api_hints = {h.lower() for h in _mlair_disk_folder_hints_from_version_rows(version_items)}
         n = len(version_items)
         candidates = _disk_model_import_candidates(clinic_key)
         if not candidates:
             return {"status": "skipped", "reason": "no_disk_bundles", "project_id": project_id, "model_id": model_id}
         imported: list[Dict[str, Any]] = []
         for mv, vdir in candidates:
-            if str(mv).strip().lower() in api_hints:
-                imported.append({"version": mv, "status": "skipped_already_in_api", "reason": "version_list_hint"})
+            existing = find_mlair_numeric_version_for_disk_folder(
+                client, tenant_id, project_id, model_id, str(mv)
+            )
+            if existing is not None:
+                imported.append(
+                    {
+                        "version": mv,
+                        "status": "skipped_already_in_registry",
+                        "mlair_numeric_version": existing,
+                    }
+                )
                 continue
             try:
                 row = import_mlair_model_bundle_with_client(
@@ -910,7 +913,11 @@ def bootstrap_mlair_models_from_disk_for_project(
                 )
                 imported.append({"version": mv, "status": "error", "error": str(one_exc)})
         ok_n = sum(1 for x in imported if x.get("status") == "ok")
-        skip_dup = sum(1 for x in imported if x.get("status") in ("skipped_duplicate", "skipped_already_in_api"))
+        skip_dup = sum(
+            1
+            for x in imported
+            if x.get("status") in ("skipped_duplicate", "skipped_already_in_registry")
+        )
         err_n = sum(1 for x in imported if x.get("status") == "error")
         if ok_n == 0 and err_n > 0 and skip_dup == 0:
             return {
@@ -1389,3 +1396,325 @@ def sync_training_directory_to_mlair(
         out["status"] = "error"
         out["error"] = str(exc)
         return out
+
+
+def _mlair_normalize_disk_tag_from_model_version(model_version: str) -> str:
+    s = str(model_version or "").strip()
+    suf = " - global"
+    if s.lower().endswith(suf.lower()):
+        s = s[: -len(suf)].strip()
+    return s
+
+
+def _mlair_disk_tag_from_artifact_uri(uri: str) -> Optional[str]:
+    u = (uri or "").strip().rstrip("/")
+    if not u:
+        return None
+    return u.split("/")[-1] or None
+
+
+def _mlair_stage_for_numeric_version(
+    client: httpx.Client,
+    tenant_id: str,
+    project_id: str,
+    model_id: str,
+    version_int: int,
+) -> Optional[str]:
+    for it in _mlair_fetch_model_version_items(client, tenant_id, project_id, model_id) or []:
+        if not isinstance(it, dict):
+            continue
+        try:
+            if int(it.get("version")) != int(version_int):
+                continue
+        except (TypeError, ValueError):
+            continue
+        st = it.get("stage")
+        return str(st).strip() if st is not None else None
+    return None
+
+
+def find_mlair_numeric_version_for_disk_folder(
+    client: httpx.Client,
+    tenant_id: str,
+    project_id: str,
+    model_id: str,
+    disk_folder: str,
+) -> Optional[int]:
+    """Map Vet-AI folder name (``v2``) to MLAir integer ``version`` using registry ``artifact_uri`` rows."""
+    tag = _mlair_normalize_disk_tag_from_model_version(disk_folder).strip().lstrip("/")
+    if not tag:
+        return None
+    items = _mlair_fetch_model_version_items(client, tenant_id, project_id, model_id) or []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        uri = str(it.get("artifact_uri") or "")
+        if uri.rstrip("/").endswith("/" + tag):
+            v = it.get("version")
+            try:
+                return int(v) if v is not None else None
+            except (TypeError, ValueError):
+                continue
+    if tag.startswith("v") and tag[1:].isdigit():
+        want = int(tag[1:])
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            try:
+                if int(it.get("version")) == want:
+                    return want
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def resolve_disk_folder_for_mlair_version_number(
+    client: httpx.Client,
+    tenant_id: str,
+    project_id: str,
+    model_id: str,
+    version_int: int,
+) -> Optional[str]:
+    items = _mlair_fetch_model_version_items(client, tenant_id, project_id, model_id) or []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        try:
+            if int(it.get("version")) != int(version_int):
+                continue
+        except (TypeError, ValueError):
+            continue
+        tag = _mlair_disk_tag_from_artifact_uri(str(it.get("artifact_uri") or ""))
+        if tag:
+            return tag
+    return None
+
+
+def clinic_key_from_mlair_project_id(project_id: str) -> Optional[str]:
+    """Inverse of :func:`mlair_project_for_clinic` when ``project_id`` uses the default clinic prefix."""
+    gid = mlair_project_for_clinic(None)
+    if str(project_id).strip() == gid:
+        return None
+    pref = (os.getenv("MLAIR_PROJECT_CLINIC_PREFIX") or "clinic_").strip() or "clinic_"
+    pid = str(project_id).strip()
+    if pid.startswith(pref):
+        return normalize_clinic_key(pid[len(pref) :])
+    return None
+
+
+def _mlair_maybe_approve_before_promote(
+    client: httpx.Client,
+    tenant_id: str,
+    project_id: str,
+    model_id: str,
+    version_int: int,
+) -> None:
+    if os.getenv("MLAIR_SYNC_APPROVE_BEFORE_PROMOTE", "0").strip().lower() not in ("1", "true", "yes", "on"):
+        return
+    base = mlair_api_base_url().rstrip("/")
+    safe_pid = quote(project_id, safe="")
+    safe_mid = quote(model_id, safe="")
+    url = f"{base}/v1/tenants/{tenant_id}/projects/{safe_pid}/models/{safe_mid}/versions/{int(version_int)}/approval"
+    r = client.put(
+        url,
+        headers={**_headers(), "Content-Type": "application/json"},
+        json={"approval_status": "approved", "reason": "vet-ai active-model sync"},
+    )
+    r.raise_for_status()
+
+
+def sync_active_model_version_to_mlair_production(
+    *,
+    clinic_key: Optional[str],
+    model_version: str,
+) -> Dict[str, Any]:
+    """
+    After Vet-AI pins ``model_version`` for inference, promote the matching MLAir registry version to ``production``.
+
+    MLAir ``version`` is an integer; disk folders are matched via ``artifact_uri`` (``.../v2``).
+    """
+    if not mlair_enabled():
+        return {"status": "skipped", "reason": "MLAIR_API_BASE_URL unset"}
+    if os.getenv("MLAIR_SYNC_ACTIVE_TO_PRODUCTION", "1").strip().lower() in ("0", "false", "no", "off"):
+        return {"status": "skipped", "reason": "MLAIR_SYNC_ACTIVE_TO_PRODUCTION off"}
+
+    tenant_id = mlair_tenant_id()
+    project_id = mlair_project_for_clinic(clinic_key)
+    logical_name = mlair_logical_model_name(clinic_key)
+    desc = (f"vet-ai active pin sync; clinic={clinic_key or 'global'}")[:2000]
+    tag = _mlair_normalize_disk_tag_from_model_version(model_version)
+
+    try:
+        tmo = min(_timeout(), 120.0)
+        with httpx.Client(timeout=tmo) as client:
+            model_id = _ensure_model_id(client, tenant_id, project_id, logical_name, desc)
+            nver = find_mlair_numeric_version_for_disk_folder(client, tenant_id, project_id, model_id, tag)
+            if nver is None:
+                return {
+                    "status": "skipped",
+                    "reason": "mlair_version_not_found_for_disk_folder",
+                    "disk_folder": tag,
+                    "project_id": project_id,
+                    "model_id": model_id,
+                }
+            cur_stage = _mlair_stage_for_numeric_version(client, tenant_id, project_id, model_id, nver)
+            if cur_stage and str(cur_stage).lower() == "production":
+                return {
+                    "status": "skipped",
+                    "reason": "already_production",
+                    "numeric_version": nver,
+                    "disk_folder": tag,
+                    "project_id": project_id,
+                    "model_id": model_id,
+                }
+            _mlair_maybe_approve_before_promote(client, tenant_id, project_id, model_id, nver)
+            base = mlair_api_base_url().rstrip("/")
+            safe_pid = quote(project_id, safe="")
+            safe_mid = quote(model_id, safe="")
+            url = f"{base}/v1/tenants/{tenant_id}/projects/{safe_pid}/models/{safe_mid}/promote"
+            r = client.post(
+                url,
+                headers={**_headers(), "Content-Type": "application/json"},
+                json={"version": int(nver), "stage": "production"},
+            )
+            r.raise_for_status()
+            body = r.json() if r.content else {}
+            logger.info(
+                "MLAir promote→production ok tenant=%s project=%s model_id=%s version=%s disk=%s",
+                tenant_id,
+                project_id,
+                model_id,
+                nver,
+                tag,
+            )
+            return {
+                "status": "ok",
+                "tenant_id": tenant_id,
+                "project_id": project_id,
+                "model_id": model_id,
+                "numeric_version": nver,
+                "disk_folder": tag,
+                "mlair": body if isinstance(body, dict) else {},
+            }
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text[:2000] if exc.response is not None else ""
+        logger.warning("MLAir promote after Vet-AI pin failed: %s body=%s", exc, detail)
+        return {"status": "error", "error": str(exc), "http_detail": detail}
+    except Exception as exc:
+        logger.warning("MLAir promote after Vet-AI pin failed: %s", exc)
+        return {"status": "error", "error": str(exc)}
+
+
+_last_vetai_to_mlair_promote_at: Dict[tuple[str, str], float] = {}
+
+
+def try_sync_vetai_pin_to_mlair_production(clinic_key: Optional[str], model_version: str) -> None:
+    """Fire-and-forget wrapper for API/training paths; failures are logged only."""
+    try:
+        tag = _mlair_normalize_disk_tag_from_model_version(model_version)
+        project_id = mlair_project_for_clinic(clinic_key)
+        try:
+            deb = float(os.getenv("MLAIR_PROMOTE_SYNC_DEBOUNCE_SECONDS", "3"))
+        except ValueError:
+            deb = 3.0
+        if deb > 0:
+            key = (project_id, tag)
+            now = time.monotonic()
+            prev = _last_vetai_to_mlair_promote_at.get(key)
+            if prev is not None and (now - prev) < deb:
+                return
+            _last_vetai_to_mlair_promote_at[key] = now
+
+        out = sync_active_model_version_to_mlair_production(clinic_key=clinic_key, model_version=model_version)
+        if out.get("status") == "error":
+            logger.warning("MLAir production sync (non-fatal): %s", out)
+    except Exception as exc:
+        logger.warning("MLAir production sync (non-fatal): %s", exc)
+
+
+def apply_mlair_promote_webhook_to_vet_ai(body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Apply an MLAir ``production`` promote event: pin Vet-AI active model to the disk folder for that version.
+
+    Expected JSON keys: ``project_id``, ``version`` (integer). Optional: ``tenant_id``, ``model_id``.
+    """
+    if not isinstance(body, dict):
+        return {"status": "error", "error": "body must be a JSON object"}
+    tenant_id = str(body.get("tenant_id") or mlair_tenant_id()).strip() or mlair_tenant_id()
+    project_id = str(body.get("project_id") or "").strip()
+    if not project_id:
+        return {"status": "error", "error": "project_id is required"}
+    ver_raw = body.get("version")
+    try:
+        version_int = int(ver_raw)
+    except (TypeError, ValueError):
+        return {"status": "error", "error": "version must be an integer"}
+
+    ck = clinic_key_from_mlair_project_id(project_id)
+    logical_name = mlair_logical_model_name(ck)
+    desc = (f"vet-ai webhook pin; clinic={ck or 'global'}")[:2000]
+
+    try:
+        tmo = min(_timeout(), 120.0)
+        with httpx.Client(timeout=tmo) as client:
+            mid = str(body.get("model_id") or "").strip()
+            if not mid:
+                mid = _ensure_model_id(client, tenant_id, project_id, logical_name, desc)
+            folder = resolve_disk_folder_for_mlair_version_number(
+                client, tenant_id, project_id, mid, version_int
+            )
+            if not folder:
+                return {
+                    "status": "error",
+                    "error": "could_not_resolve_disk_folder",
+                    "project_id": project_id,
+                    "model_id": mid,
+                    "version": version_int,
+                }
+
+        from ai_service.app.api.routers import predict as predict_router
+        from ai_service.app.infrastructure.storage import model_store as ms
+
+        candidates = [folder]
+        if ck is None:
+            candidates.append(f"{folder} - global")
+        allowed = set(ms.list_user_visible_model_versions(ck))
+        chosen = next((c for c in candidates if c in allowed), folder)
+
+        cur = ms.get_clinic_pinned_model(ck) if ck is not None else ms.get_active_model()
+        if cur is not None:
+            cur_tag = _mlair_normalize_disk_tag_from_model_version(cur.model_version)
+            new_tag = _mlair_normalize_disk_tag_from_model_version(chosen)
+            if cur_tag == new_tag:
+                return {
+                    "status": "ok",
+                    "skipped": "already_pinned",
+                    "clinic_id": ck,
+                    "model_version": cur.model_version,
+                    "mlair_project_id": project_id,
+                    "mlair_numeric_version": version_int,
+                }
+
+        if ck is None:
+            predict_router.set_active_model_and_reload(chosen)
+        else:
+            ms.set_clinic_active_model(ck, chosen)
+            predict_router.clear_artifact_cache()
+
+        logger.info(
+            "Vet-AI active pin from MLAir webhook project=%s version_int=%s -> %s (clinic=%s)",
+            project_id,
+            version_int,
+            chosen,
+            ck or "global",
+        )
+        return {
+            "status": "ok",
+            "clinic_id": ck,
+            "model_version": chosen,
+            "mlair_project_id": project_id,
+            "mlair_numeric_version": version_int,
+        }
+    except Exception as exc:
+        logger.warning("MLAir promote webhook apply failed: %s", exc)
+        return {"status": "error", "error": str(exc)}

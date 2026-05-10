@@ -3,18 +3,24 @@ MLOps API Endpoints for Veterinary AI System
 Provides REST endpoints for drift detection, monitoring, and MLOps management
 """
 
+import logging
+import os
+import secrets
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-import logging
 import pandas as pd
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from ai_service.app.api.deps import require_admin
 from ai_service.app.domain.services.clinic_scope_service import normalize_clinic_key
 from ai_service.app.domain.services.clinic_catalog_service import get_clinics_for_mlops
-from ai_service.app.infrastructure.external.mlair_client import list_mlair_models_for_mlops_ui
+from ai_service.app.infrastructure.external.mlair_client import (
+    apply_mlair_promote_webhook_to_vet_ai,
+    list_mlair_models_for_mlops_ui,
+    try_sync_vetai_pin_to_mlair_production,
+)
 from ai_service.app.infrastructure.storage.model_store import (
     display_label_for_model_version,
     get_active_model,
@@ -250,6 +256,7 @@ async def list_models(clinic_id: Optional[str] = Query(None)):
 async def set_active_model_version(request: ActiveModelRequest, _: bool = Depends(require_admin)):
     try:
         active = set_active_model(request.model_version)
+        try_sync_vetai_pin_to_mlair_production(None, active.model_version)
         return {"status": "success", "active": active.model_version, "model_dir": active.model_dir}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
@@ -330,6 +337,32 @@ async def mlair_status(_: bool = Depends(require_admin)):
     except Exception as exc:
         logger.error("mlair status failed: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post(
+    "/mlair/promote-webhook",
+    summary="Inbound MLAir model promote → pin Vet-AI active (set MLAIR_MODEL_PROMOTE_WEBHOOK_URL on mlair-api)",
+)
+async def mlair_promote_webhook(
+    body: Dict[str, Any],
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    When MLAir promotes a version to ``production``, call this URL so Vet-AI (and Spring callers of
+    the same pin) stay aligned. JSON body: ``project_id``, ``version`` (MLAir integer); optional ``tenant_id``, ``model_id``.
+    """
+    expected = (os.getenv("MLAIR_PROMOTE_WEBHOOK_INBOUND_TOKEN") or "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="MLAIR_PROMOTE_WEBHOOK_INBOUND_TOKEN is not set on vet-ai",
+        )
+    if not authorization or not secrets.compare_digest(authorization, f"Bearer {expected}"):
+        raise HTTPException(status_code=401, detail="invalid webhook authorization")
+    out = apply_mlair_promote_webhook_to_vet_ai(body)
+    if out.get("status") != "ok":
+        raise HTTPException(status_code=400, detail=out)
+    return out
 
 
 @router.get("/drift/summary", summary="Get drift summary + simple alert rule")
