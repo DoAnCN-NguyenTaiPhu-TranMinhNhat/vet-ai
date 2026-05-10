@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -35,7 +36,7 @@ async def _app_lifespan(app: FastAPI):
         refresh_fn = None
 
     stop_event = asyncio.Event()
-    task: asyncio.Task | None = None
+    bg_tasks: list[asyncio.Task] = []
 
     async def _refresh_loop() -> None:
         while not stop_event.is_set():
@@ -54,14 +55,64 @@ async def _app_lifespan(app: FastAPI):
             refresh_fn()
         except Exception as exc:
             logger.warning("Cannot refresh training metrics at startup: %s", exc)
-        task = asyncio.create_task(_refresh_loop())
+        bg_tasks.append(asyncio.create_task(_refresh_loop()))
+
+    try:
+        from ai_service.app.infrastructure.external.mlair_client import (
+            run_mlair_registry_bootstrap_with_retries,
+            sync_mlair_project_registry_periodic,
+        )
+
+        async def _mlair_registry_bootstrap() -> None:
+            try:
+                out = await asyncio.to_thread(run_mlair_registry_bootstrap_with_retries)
+                logger.info(
+                    "MLAir project registry bootstrap: status=%s clinics=%s source=%s",
+                    out.get("status"),
+                    out.get("catalog_clinic_count"),
+                    out.get("catalog_source"),
+                )
+            except Exception as exc:
+                logger.warning("MLAir project registry bootstrap failed: %s", exc)
+
+        bg_tasks.append(asyncio.create_task(_mlair_registry_bootstrap()))
+
+        try:
+            resync_sec = float(os.getenv("MLAIR_REGISTRY_RESYNC_SECONDS", "120"))
+        except ValueError:
+            resync_sec = 120.0
+
+        if resync_sec > 0:
+
+            async def _mlair_registry_periodic() -> None:
+                while not stop_event.is_set():
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=resync_sec)
+                    except asyncio.TimeoutError:
+                        pass
+                    if stop_event.is_set():
+                        break
+                    try:
+                        out = await asyncio.to_thread(sync_mlair_project_registry_periodic)
+                        if out.get("status") not in ("skipped",):
+                            logger.debug(
+                                "MLAir registry periodic: status=%s clinics=%s",
+                                out.get("status"),
+                                out.get("catalog_clinic_count"),
+                            )
+                    except Exception as exc:
+                        logger.warning("MLAir registry periodic sync failed: %s", exc)
+
+            bg_tasks.append(asyncio.create_task(_mlair_registry_periodic()))
+    except Exception as exc:
+        logger.warning("MLAir project registry tasks not scheduled: %s", exc)
 
     yield
     stop_event.set()
-    if task is not None:
-        task.cancel()
+    for t in bg_tasks:
+        t.cancel()
         try:
-            await task
+            await t
         except BaseException:
             pass
 

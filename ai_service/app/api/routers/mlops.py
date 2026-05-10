@@ -14,13 +14,16 @@ from pydantic import BaseModel, Field
 from ai_service.app.api.deps import require_admin
 from ai_service.app.domain.services.clinic_scope_service import normalize_clinic_key
 from ai_service.app.domain.services.clinic_catalog_service import get_clinics_for_mlops
+from ai_service.app.infrastructure.external.mlair_client import list_mlair_models_for_mlops_ui
 from ai_service.app.infrastructure.storage.model_store import (
+    display_label_for_model_version,
     get_active_model,
     get_active_model_for_clinic,
     get_clinic_pinned_model,
+    list_models_for_clinic_project_view,
     list_user_visible_model_versions,
-    list_user_visible_model_versions_clinic_storage_only,
     set_active_model,
+    storage_scope_for_version,
 )
 from ai_service.app.mlops.manager import MLOpsManager
 
@@ -193,13 +196,12 @@ async def run_health_check():
 @router.get("/models", summary="List model versions + active (global or per-clinic)")
 async def list_models(clinic_id: Optional[str] = Query(None)):
     ck = normalize_clinic_key(clinic_id)
-    # Clinic scope: list only on-disk versions under models/clinics/<slug>/ (do not merge global root).
-    versions = (
-        list_user_visible_model_versions(ck)
-        if ck is None
-        else list_user_visible_model_versions_clinic_storage_only(ck)
-    )
+    mlair_models = list_mlair_models_for_mlops_ui(ck)
     if ck is None:
+        versions = list_user_visible_model_versions(None)
+        models = [
+            {"version": v, "storageScope": "global", "label": v, "displayLabel": v} for v in versions
+        ]
         active = get_active_model()
         return {
             "status": "success",
@@ -207,20 +209,40 @@ async def list_models(clinic_id: Optional[str] = Query(None)):
             "active": active.model_version if active else None,
             "active_source": "state_file" if active else None,
             "versions": versions,
+            "models": models,
+            "mlair": mlair_models,
         }
 
+    # Clinic UI: on-disk models under clinics/<slug>/ first, then global root (label ``… - global``).
+    models = list_models_for_clinic_project_view(ck)
+    versions = [str(m["version"]) for m in models]
     pinned = get_clinic_pinned_model(ck)
     effective = get_active_model_for_clinic(ck)
     global_active = get_active_model()
+
+    def _label_for_version(mv: Optional[str]) -> Optional[str]:
+        if not mv:
+            return None
+        sc = storage_scope_for_version(ck, mv)
+        return display_label_for_model_version(ck, mv, sc)
+
+    pv = pinned.model_version if pinned else None
+    ev = effective.model_version if effective else None
+    gv = global_active.model_version if global_active else None
     return {
         "status": "success",
         "scope": "clinic",
         "clinic_id": ck,
-        "pinned": pinned.model_version if pinned else None,
-        "effective": effective.model_version if effective else None,
+        "pinned": pv,
+        "pinned_label": _label_for_version(pv),
+        "effective": ev,
+        "effective_label": _label_for_version(ev),
         "effective_source": "clinic_pin" if pinned is not None else "global_default",
-        "global_active": global_active.model_version if global_active else None,
+        "global_active": gv,
+        "global_active_label": _label_for_version(gv),
         "versions": versions,
+        "models": models,
+        "mlair": mlair_models,
     }
 
 
@@ -293,6 +315,20 @@ async def mlflow_latest_vs_active(clinic_id: Optional[str] = Query(None)):
         return compare_latest_run_to_active(clinic_id=clinic_id)
     except Exception as exc:
         logger.error("mlflow latest-vs-active failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get(
+    "/mlair/status",
+    summary="Check MLAir API reachability and bearer token scope (GET /v1/auth/whoami)",
+)
+async def mlair_status(_: bool = Depends(require_admin)):
+    try:
+        from ai_service.app.infrastructure.external.mlair_client import mlair_whoami
+
+        return mlair_whoami()
+    except Exception as exc:
+        logger.error("mlair status failed: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
 

@@ -3,11 +3,38 @@ import logging
 import os
 import shutil
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 from ai_service.app.domain.services.clinic_scope_service import clinic_dir_slug, normalize_clinic_key
 
 logger = logging.getLogger(__name__)
+
+
+def find_primary_model_pkl(version_dir: Union[str, Path]) -> Optional[Path]:
+    """
+    Resolve the serialized classifier file inside a version directory.
+
+    Supports:
+
+    - ``model.pkl`` (normal)
+    - ``.model.pkl`` (Unix dotfile / \"hidden\" name)
+    - Any casing of ``model.pkl`` on case-sensitive volumes (e.g. ``Model.pkl``)
+    """
+    p = Path(version_dir)
+    if not p.is_dir():
+        return None
+    for name in ("model.pkl", ".model.pkl"):
+        c = p / name
+        if c.is_file():
+            return c
+    try:
+        for child in p.iterdir():
+            if child.is_file() and child.name.lower() == "model.pkl":
+                return child
+    except OSError:
+        pass
+    return None
 
 
 def list_user_visible_model_versions(clinic_key: Optional[Union[str, int]] = None) -> List[str]:
@@ -17,6 +44,43 @@ def list_user_visible_model_versions(clinic_key: Optional[Union[str, int]] = Non
 
 def list_user_visible_model_versions_clinic_storage_only(clinic_key: Optional[Union[str, int]] = None) -> List[str]:
     return list_model_versions_clinic_storage_only(clinic_key)
+
+
+def _ordered_version_names(versions: List[str]) -> List[str]:
+    timestamped = sorted([v for v in versions if "_" in v], reverse=True)
+    semantic = sorted([v for v in versions if "_" not in v], reverse=True)
+    rest = [v for v in versions if v not in timestamped and v not in semantic]
+    merged = timestamped + semantic + rest
+    out: List[str] = []
+    seen: set[str] = set()
+    for v in merged:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def list_models_for_clinic_project_view(clinic_key: Union[str, int]) -> List[Dict[str, Union[str, None]]]:
+    """
+    On-disk models for MLOps when a clinic is selected: clinic folder first, then global root.
+
+    Each row has the real ``version`` folder name (for activate/train APIs), ``storageScope``,
+    and ``label`` (global rows use ``"{version} - global"`` so the UI can distinguish them).
+    """
+    ck = normalize_clinic_key(clinic_key)
+    if ck is None:
+        return []
+    root = _models_root()
+    clinic_sub = os.path.join(root, "clinics", clinic_dir_slug(ck))
+    clinic_versions = _ordered_version_names(_collect_versions_under(clinic_sub))
+    global_versions = _ordered_version_names(_collect_versions_under(root))
+    rows: List[Dict[str, Union[str, None]]] = []
+    for v in clinic_versions:
+        rows.append({"version": v, "storageScope": "clinic", "label": v, "displayLabel": v})
+    for v in global_versions:
+        lab = v if str(v).strip().endswith(" - global") else f"{v} - global"
+        rows.append({"version": v, "storageScope": "global", "label": lab, "displayLabel": lab})
+    return rows
 
 
 @dataclass(frozen=True)
@@ -36,10 +100,20 @@ def _models_root() -> str:
 
     env_dir = os.getenv("MODEL_DIR")
     if env_dir and str(env_dir).strip():
-        p = str(env_dir).strip().rstrip("/")
+        p = os.path.normpath(str(env_dir).strip().rstrip("/"))
         try:
-            if os.path.exists(os.path.join(p, "model.pkl")):
-                return os.path.dirname(p)
+            if find_primary_model_pkl(p) is not None:
+                return os.path.dirname(str(p))
+            # Compose often sets MODEL_DIR=/app/ai_service/models/v2 even before model.pkl exists.
+            # Treat .../models/<v*> as a version directory so listing scans sibling v* under .../models.
+            parent = os.path.dirname(p)
+            base = os.path.basename(p)
+            if (
+                base.startswith("v")
+                and os.path.isdir(parent)
+                and os.path.basename(parent.rstrip(os.sep)) == "models"
+            ):
+                return parent
         except Exception:
             pass
         return p
@@ -47,14 +121,28 @@ def _models_root() -> str:
 
 
 def _collect_versions_under(dir_path: str) -> List[str]:
+    """
+    Version folders under ``dir_path``: legacy names ``v*``, or any subdirectory that already
+    contains ``model.pkl`` (supports non-v version names). Skips the reserved ``clinics`` folder
+    when listing the global models root.
+    """
     if not os.path.isdir(dir_path):
         return []
+    root_norm = os.path.normpath(_models_root())
+    parent_norm = os.path.normpath(dir_path)
     out: List[str] = []
     for item in os.listdir(dir_path):
-        if not item.startswith("v"):
+        if item in (".", ".."):
+            continue
+        if item == "clinics" and parent_norm == root_norm:
             continue
         path = os.path.join(dir_path, item)
-        if os.path.isdir(path):
+        if not os.path.isdir(path):
+            continue
+        if find_primary_model_pkl(path) is not None:
+            out.append(item)
+            continue
+        if item.startswith("v"):
             out.append(item)
     return out
 
@@ -194,8 +282,9 @@ def resolve_model_dir(model_version: str, clinic_key: Optional[Union[str, int]] 
         # Empty/incomplete clinic folders can appear during failed syncs and should
         # not shadow valid global versions.
         if os.path.isdir(sub):
-            required = ("model.pkl", "tab_preprocess.pkl", "symptoms_mlb.pkl")
-            if all(os.path.isfile(os.path.join(sub, name)) for name in required):
+            tab = os.path.join(sub, "tab_preprocess.pkl")
+            sym = os.path.join(sub, "symptoms_mlb.pkl")
+            if find_primary_model_pkl(sub) is not None and os.path.isfile(tab) and os.path.isfile(sym):
                 return sub
             logger.warning(
                 "Clinic model folder incomplete; fallback to global version=%s clinic=%s path=%s",
@@ -229,6 +318,21 @@ def find_version_label_for_artifact_realpath(
     if not matches:
         return None
     return sorted(matches, reverse=True)[0]
+
+
+def display_label_for_model_version(
+    clinic_key: Optional[Union[str, int]],
+    model_version: str,
+    storage_scope: str,
+) -> str:
+    """Human-friendly label in clinic UIs: global-origin rows get the `` - global`` suffix."""
+    ck = normalize_clinic_key(clinic_key)
+    mv = str(model_version or "").strip()
+    if ck is not None and str(storage_scope or "").strip().lower() == "global":
+        if mv.endswith(" - global"):
+            return mv
+        return f"{mv} - global"
+    return mv
 
 
 def storage_scope_for_version(clinic_key: Optional[Union[str, int]], model_version: str) -> str:
@@ -297,15 +401,17 @@ def get_active_model() -> Optional[ActiveModel]:
 def _verify_inference_artifacts(model_dir: str) -> None:
     import joblib
 
-    required = ("model.pkl", "tab_preprocess.pkl", "symptoms_mlb.pkl")
-    for name in required:
+    mp = find_primary_model_pkl(model_dir)
+    if mp is None or not mp.is_file():
+        raise ValueError(f"Missing model pickle (model.pkl / .model.pkl) under {model_dir}")
+    for name in ("tab_preprocess.pkl", "symptoms_mlb.pkl"):
         p = os.path.join(model_dir, name)
         if not os.path.isfile(p):
             raise ValueError(f"Missing artifact {name} under {model_dir}")
     try:
-        joblib.load(os.path.join(model_dir, "model.pkl"))
+        joblib.load(str(mp))
     except Exception as e:
-        raise ValueError(f"model.pkl cannot be loaded from {model_dir}: {e}") from e
+        raise ValueError(f"Model pickle cannot be loaded from {mp}: {e}") from e
 
 
 def set_active_model(model_version: str) -> ActiveModel:

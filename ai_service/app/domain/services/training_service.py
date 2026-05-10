@@ -2038,7 +2038,38 @@ def execute_training(
             training_id=training_id,
             training_mode=training_mode,
         )
-        
+
+        try:
+            from ai_service.app.infrastructure.external.mlair_client import sync_training_directory_to_mlair
+
+            mlair_out = sync_training_directory_to_mlair(
+                model_version=model_version,
+                version_dir=model_path,
+                clinic_key=clinic_key,
+                training_id=training_id,
+                training_mode=training_mode,
+            )
+            training_metrics["mlair_sync"] = mlair_out
+        except Exception as exc:
+            logger.warning("MLAir post-training sync failed (non-fatal): %s", exc)
+            training_metrics["mlair_sync"] = {"status": "error", "error": str(exc)}
+
+        try:
+            from ai_service.app.infrastructure.external.mlair_client import push_mlair_training_tracking
+
+            training_metrics["mlair_tracking"] = push_mlair_training_tracking(
+                model_version=model_version,
+                version_dir=model_path,
+                clinic_key=clinic_key,
+                training_id=training_id,
+                training_mode=training_mode,
+                training_metrics=training_metrics,
+                pipeline_kind=pipeline_kind,
+            )
+        except Exception as exc:
+            logger.warning("MLAir training tracking failed (non-fatal): %s", exc)
+            training_metrics["mlair_tracking"] = {"status": "error", "error": str(exc)}
+
         result = {
             'status': 'completed',
             'model_version': model_version,

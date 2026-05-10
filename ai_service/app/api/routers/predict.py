@@ -18,6 +18,8 @@ from ai_service.app.infrastructure.storage.model_store import (
     ActiveModel,
     active_model_for_predict,
     detect_default_model,
+    display_label_for_model_version,
+    find_primary_model_pkl,
     get_active_model_for_clinic,
     get_clinic_pinned_model,
     list_user_visible_model_versions,
@@ -60,8 +62,11 @@ def load_artifacts_for_dir(model_dir: str, model_version: str) -> tuple[Any, Any
     if key not in _artifact_cache:
         cal_path = os.path.join(model_dir, "calibrated_classifier.pkl")
         calibrated = joblib.load(cal_path) if os.path.exists(cal_path) else None
+        mp = find_primary_model_pkl(model_dir)
+        if mp is None:
+            raise FileNotFoundError(f"No model pickle under {model_dir} (expected model.pkl or .model.pkl)")
         _artifact_cache[key] = (
-            joblib.load(os.path.join(model_dir, "model.pkl")),
+            joblib.load(str(mp)),
             joblib.load(os.path.join(model_dir, "tab_preprocess.pkl")),
             joblib.load(os.path.join(model_dir, "symptoms_mlb.pkl")),
             calibrated,
@@ -128,14 +133,17 @@ async def list_predict_models(
     Versions are those returned by ``list_user_visible_model_versions`` for the clinic key
     (merged global + clinic folder when a clinic is set).
 
-    Each row in ``models`` includes ``isActiveDefault`` so UIs can badge the active model and
-    offer "Set as default" on other rows. For dropdowns, omit rows where ``isActiveDefault``
-    is true to avoid duplicating the "Use active default" option.
+    Each row includes ``label`` (clinic scope: global-origin versions show ``… - global``),
+    ``storageScope``, and ``isActiveDefault`` so UIs can badge the active model.
     """
     ck = _clinic_id_for_model_router(clinic_id)
     fallback = detect_default_model() or ActiveModel(str(MODEL_VERSION), MODEL_DIR)
     effective = get_active_model_for_clinic(ck) or fallback
     versions = list_user_visible_model_versions(ck)
+    if not versions:
+        fb = detect_default_model()
+        if fb and str(fb.model_version or "").strip() and os.path.isdir(fb.model_dir):
+            versions = [str(fb.model_version).strip()]
     eff_ver = (effective.model_version or "").strip()
 
     if ck:
@@ -144,18 +152,30 @@ async def list_predict_models(
     else:
         active_source = "global"
 
-    models = [
-        {
-            "version": v,
-            "storageScope": storage_scope_for_version(ck, v),
-            "isActiveDefault": v == eff_ver,
-        }
-        for v in versions
-    ]
+    models = []
+    for v in versions:
+        scope = storage_scope_for_version(ck, v)
+        lbl = display_label_for_model_version(ck, v, scope)
+        models.append(
+            {
+                "version": v,
+                "storageScope": scope,
+                "label": lbl,
+                "displayLabel": lbl,
+                "isActiveDefault": v == eff_ver,
+            }
+        )
+    eff_scope = storage_scope_for_version(ck, eff_ver) if eff_ver else "global"
+    default_lbl = (
+        display_label_for_model_version(ck, eff_ver, eff_scope)
+        if eff_ver
+        else (effective.model_version or None)
+    )
     return {
         "clinicId": str(clinic_id).strip() if clinic_id is not None and str(clinic_id).strip() else None,
         "clinicKey": ck,
         "defaultModelVersion": effective.model_version,
+        "defaultModelLabel": default_lbl,
         "defaultModelScope": storage_scope_for_version(ck, effective.model_version),
         "activeSource": active_source,
         "models": models,

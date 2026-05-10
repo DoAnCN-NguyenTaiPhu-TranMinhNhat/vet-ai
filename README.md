@@ -98,9 +98,9 @@ Only two env files belong at the **repository root**:
 | **`.env.example`** | **Committed template.** Full variable set and defaults. | No — copy to `.env` and edit |
 | **`.env`** | **Your local secrets and overrides** (gitignored). | No — export in your shell or use `set -a && source .env && set +a` before `uvicorn` |
 
-In Docker, **`vet-microservices`** Compose usually injects variables via **`../vet-infra/.env`** or **`vet-microservices/.env.local`** for the `vet-ai` service — not from this repo’s `.env` unless you mount or pass it yourself.
+In Docker, **`vet-microservices`** Compose injects variables via **`../vet-infra/.env`** (optional) and **`vet-microservices/.env`** for the `vet-ai` service — not from this repo’s `.env` unless you mount or pass it yourself.
 
-Start from **`.env.example`**: `cp .env.example .env`, then fill in values. For the Java/Compose stack, merge the same keys into **`vet-infra/.env`** or **`vet-microservices/.env.local`** as needed.
+Start from **`.env.example`**: `cp .env.example .env`, then fill in values. For the Java/Compose stack, merge the same keys into **`vet-infra/.env`** and/or **`vet-microservices/.env`** (single file next to `docker-compose.yml`) as needed.
 
 Below are the most important variables. Training and ML code honor many more (split ratios, gates, fine-tuning) — see `ai_service/training_engine.py` and `ai_service/continuous_training.py`.
 
@@ -111,6 +111,9 @@ Below are the most important variables. Training and ML code honor many more (sp
 | `MODEL_DIR` / `MODEL_ROOT_DIR` | Paths to loaded model artifacts (`model.pkl`, encoders). |
 | `MLFLOW_TRACKING_URI` | MLflow server URL (e.g. `http://mlflow:5000`). |
 | `MLFLOW_EXPERIMENT_NAME` | Experiment name (default `vet-ai-continuous-training`). |
+| `MLAIR_API_BASE_URL` | Optional MLAir API URL (e.g. `http://ml-air-api:8080`). When set, successful training imports `model.pkl` into the MLAir registry (see `.env.example`). |
+| `MLAIR_API_TOKEN` | Bearer token with maintainer+ scope on the MLAir tenant/project (quickstart often uses `admin-token` on tenant `default`). |
+| `MLAIR_TENANT_ID` / `MLAIR_PROJECT_GLOBAL` / `MLAIR_PROJECT_CLINIC_PREFIX` | Scope for registry writes; clinic jobs use project `clinic_<slug>`. |
 | `TRAINING_WINDOW_DAYS` | Rolling window for eligible feedback (days). |
 | `ALLOW_EKS_HYBRID_TRAINING` | Set to `true` to run training as a separate K8s job from the API (advanced). |
 
@@ -147,6 +150,7 @@ In **vet-microservices**, `docker-compose.yml` usually builds this repo as servi
 | `POST /models/active`, `/models/clinic/{id}/active` | Switch active model (admin / internal use). |
 | `/continuous-training/*` | Config, eligibility, feedback, prediction logging, training trigger/history, bootstrap CSV (admin). |
 | `/mlops/*` | Registry, drift, alignment helpers. |
+| `GET /mlops/mlair/status` (admin) | MLAir `whoami` probe when integrating the control plane. |
 | `/mlops/v2/*` | Champion–challenger workflow (Bearer admin). |
 | `/metrics` | Prometheus scrape endpoint. |
 

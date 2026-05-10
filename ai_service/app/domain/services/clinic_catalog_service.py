@@ -27,6 +27,14 @@ _cache_until: float = 0.0
 _last_good: list[dict[str, Any]] | None = None
 
 
+def bust_clinic_catalog_cache() -> None:
+    """Invalidate the in-process clinic list cache (e.g. after MLAir becomes reachable or before a registry sync)."""
+    global _cache_clinics, _cache_until
+    with _lock:
+        _cache_clinics = None
+        _cache_until = 0.0
+
+
 def _merge_clinic_lists(*lists: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     merged: dict[str, dict[str, Any]] = {}
     for clinics in lists:

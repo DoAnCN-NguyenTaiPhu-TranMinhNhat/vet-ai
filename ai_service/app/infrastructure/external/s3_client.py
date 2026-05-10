@@ -57,12 +57,15 @@ def upload_model_directory(local_dir: str, model_version: str, clinic_key: Optio
 
 
 def ensure_model_directory_from_s3(model_version: str, clinic_key: Optional[str] = None) -> Tuple[bool, Optional[str]]:
-    from ai_service.app.infrastructure.storage.model_store import resolve_model_dir
+    from ai_service.app.infrastructure.storage.model_store import find_primary_model_pkl, resolve_model_dir
 
     local = resolve_model_dir(model_version, clinic_key)
-    required = ("model.pkl", "tab_preprocess.pkl", "symptoms_mlb.pkl")
-    if os.path.isdir(local) and all(os.path.isfile(os.path.join(local, f)) for f in required):
-        return True, None
+    if os.path.isdir(local):
+        mp = find_primary_model_pkl(local)
+        tab = os.path.join(local, "tab_preprocess.pkl")
+        sym = os.path.join(local, "symptoms_mlb.pkl")
+        if mp is not None and mp.is_file() and os.path.isfile(tab) and os.path.isfile(sym):
+            return True, None
 
     bucket = s3_bucket()
     if not bucket:
@@ -98,8 +101,8 @@ def ensure_model_directory_from_s3(model_version: str, clinic_key: Optional[str]
         # with an uncaught botocore exception (e.g. during active-model restore).
         return False, f"S3 restore failed ({type(e).__name__}): {e}"
 
-    if not os.path.isfile(os.path.join(local, "model.pkl")):
-        return False, f"Downloaded from S3 but model.pkl missing under {local}"
+    if find_primary_model_pkl(local) is None:
+        return False, f"Downloaded from S3 but no model pickle under {local}"
 
     logger.info("Restored model %s from s3://%s/%s/ to %s", model_version, bucket, prefix, local)
     return True, None
