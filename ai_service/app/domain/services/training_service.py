@@ -14,7 +14,7 @@ import logging
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Any, AbstractSet, Dict, List, Optional, Tuple
+from typing import Any, AbstractSet, Callable, Dict, List, Optional, Tuple
 try:
     from sklearn.model_selection import train_test_split, cross_val_score, RepeatedStratifiedKFold
     from sklearn.ensemble import RandomForestClassifier
@@ -270,12 +270,18 @@ class ModelTrainer:
         else:
             min_samples_leaf = max(int(os.getenv("MIN_SAMPLES_LEAF_LARGE", "4")), int(0.01 * n_samples))
         
+        # On tiny feedback batches with many classes, bootstrap sampling can cause some trees to
+        # see only a subset of classes; in practice this has triggered unstable proba shapes in
+        # downstream predict() / predict_proba() flows. Disable bootstrap for very small datasets.
+        bootstrap = not (n_samples < thresholds["small"])
+
         return {
             'n_estimators': n_estimators,
             'max_depth': max_depth,
             'random_state': int(os.getenv("RANDOM_STATE", "42")),
             'min_samples_split': min_samples_split,
             'min_samples_leaf': min_samples_leaf,
+            'bootstrap': bootstrap,
             # IMPORTANT: avoid sklearn's internal class_weight balancing while we do
             # dataset-derived balancing via sample_weight (stable for warm_start).
             'class_weight': None
@@ -341,13 +347,16 @@ class ModelTrainer:
         """Get adaptive cross-validation folds based on class distribution"""
         class_counts = y.value_counts()
         min_samples_per_class = class_counts.min()
-        
-        # Ensure at least 2 samples per fold for each class
-        max_folds = min_samples_per_class // 2
+
+        # Cross-validation requires at least `n_splits` samples in every class.
+        # If we have only 1 sample in the smallest class, CV is not valid; caller should skip.
+        if int(min_samples_per_class) < 2:
+            return 1
+
         max_cv_folds = int(os.getenv("MAX_CV_FOLDS", "5"))
-        cv_folds = min(max_cv_folds, max(2, max_folds))
-        
-        return cv_folds
+        # Keep `n_splits` <= min_samples_per_class to avoid sklearn ValueError.
+        cv_folds = min(max_cv_folds, int(min_samples_per_class))
+        return max(2, cv_folds)
     
     def collect_feedback_only_training_frame(
         self,
@@ -1697,6 +1706,8 @@ def execute_training(
     pipeline_kind: str = "continuous_training",
     feedback_id_allowlist: Optional[AbstractSet[int]] = None,
     finetune_base_model_dir: Optional[str] = None,
+    progress_callback: Optional[Callable] = None,
+    mlair_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Execute training pipeline with dynamic parameters.
 
@@ -1713,6 +1724,15 @@ def execute_training(
     except (TypeError, ValueError):
         dw_days = 30
     logger.info("Starting %s training pipeline (clinic_id=%s)", training_mode, clinic_key)
+
+    def _progress(phase: str, pct: int, metrics: Optional[Dict[str, Any]] = None) -> None:
+        if progress_callback is not None:
+            try:
+                progress_callback(phase, pct, metrics or {})
+            except Exception:
+                pass
+
+    _progress("initializing", 0)
 
     try:
         # Train only on eligible feedback (aligns with eligibility used to trigger jobs).
@@ -1732,10 +1752,13 @@ def execute_training(
             training_id=training_id,
             eligible_feedback_data=eligible_feedback_data,
         )
+        _progress("data_collection", 5)
         trainer = ModelTrainer()        
         X, y, sample_weights, sample_timestamps = trainer.collect_training_data(
             eligible_feedback_data, prediction_logs
         )
+
+        _progress("preprocessing", 10, {"samples": len(y)})
 
         # Safety guard: don't train/persist a model when feedback has too low class diversity.
         # If y contains only 1 diagnosis class, RandomForest will end up predicting that class
@@ -1759,6 +1782,7 @@ def execute_training(
                 base_kw["base_model_dir"] = fdir
             base_model, base_dir = trainer.load_active_artifacts(clinic_key, **base_kw)
             X_processed, preprocessing_info = trainer.preprocess_features(X, fit_encoders=False)
+            _progress("model_fit", 40, {"mode": "finetune"})
             add_trees = int(os.getenv("FINETUNE_ADD_TREES", "20"))
             try:
                 model, training_metrics = trainer.train_model(
@@ -1790,6 +1814,7 @@ def execute_training(
             training_metrics["finetune_base_dir"] = base_dir
         else:
             X_processed, preprocessing_info = trainer.preprocess_features(X, fit_encoders=True)
+            _progress("model_fit", 40, {"mode": "full_retrain"})
             model, training_metrics = trainer.train_model(
                 X_processed,
                 y,
@@ -1799,11 +1824,17 @@ def execute_training(
             )
             training_metrics["finetune"] = False
 
+        _progress("calibration", 50, {
+            "training_accuracy": training_metrics.get("training_accuracy"),
+            "cv_mean_accuracy": training_metrics.get("cv_mean_accuracy"),
+        })
         _annotate_small_sample_metrics(training_metrics)
         _annotate_accept_only_feedback_metrics(eligible_feedback_data, training_metrics)
         if clinic_key is not None:
             training_metrics["clinic_id"] = clinic_key
         
+        _progress("cv_scoring", 65)
+
         # ----------------------------
         # Regression Test Gate (golden set)
         # ----------------------------
@@ -1920,6 +1951,8 @@ def execute_training(
         else:
             training_metrics["regression_gate_enabled"] = False
 
+        _progress("regression_gate", 75)
+
         # ----------------------------
         # Feedback improvement gate (expert feedback batch only, no core memory)
         # ----------------------------
@@ -2003,6 +2036,8 @@ def execute_training(
         else:
             training_metrics["feedback_gate_enabled"] = False
 
+        _progress("feedback_gate", 85)
+
         # Generate version (global runs: suffix " - global" so UIs and disk dirs are easy to spot;
         # clinics without a pinned model fall back to this default via model_store.)
         model_version = trainer.generate_model_version()
@@ -2015,7 +2050,7 @@ def execute_training(
             training_metrics["training_scope"] = "clinic"
         training_metrics["model_version"] = model_version
 
-        # Save model
+        _progress("model_save", 90)
         model_path = trainer.save_model(model, training_metrics, model_version, clinic_key=clinic_key)
 
         try:
@@ -2039,6 +2074,7 @@ def execute_training(
             training_mode=training_mode,
         )
 
+        _progress("mlair_sync", 95)
         try:
             from ai_service.app.infrastructure.external.mlair_client import sync_training_directory_to_mlair
 
@@ -2065,10 +2101,13 @@ def execute_training(
                 training_mode=training_mode,
                 training_metrics=training_metrics,
                 pipeline_kind=pipeline_kind,
+                mlair_run_id=mlair_run_id,
             )
         except Exception as exc:
             logger.warning("MLAir training tracking failed (non-fatal): %s", exc)
             training_metrics["mlair_tracking"] = {"status": "error", "error": str(exc)}
+
+        _progress("done", 100, training_metrics)
 
         result = {
             'status': 'completed',
@@ -2098,6 +2137,499 @@ def execute_training(
             'error': str(e),
             'training_mode': training_mode
         }
+
+
+# ── Multi-phase pipeline functions ──────────────────────────────────────
+#
+# These break ``execute_training`` into four independently callable phases.
+# Intermediate state is persisted via ``training_session`` so separate MLAir
+# pipeline tasks can pick up where the previous one left off.
+
+
+def execute_phase_data_prep(
+    session_id: str,
+    feedback_data: List[Dict],
+    prediction_logs: List[Dict],
+    training_mode: str = "local",
+    clinic_id: Optional[Any] = None,
+    training_id: Optional[int] = None,
+    *,
+    dataset_window_days: Optional[int] = None,
+    pipeline_kind: str = "continuous_training",
+    feedback_id_allowlist: Optional[AbstractSet[int]] = None,
+    finetune_base_model_dir: Optional[str] = None,
+    progress_callback: Optional[Callable] = None,
+) -> Dict[str, Any]:
+    """Phase 1: data collection + preprocessing. Saves intermediate state to session."""
+    from ai_service.app.domain.services.training_session import (
+        create_session, save_data_prep_results,
+    )
+
+    clinic_key = normalize_clinic_key(clinic_id)
+    try:
+        dw_days = (
+            int(dataset_window_days)
+            if dataset_window_days is not None
+            else int(os.getenv("TRAINING_WINDOW_DAYS", "30"))
+        )
+    except (TypeError, ValueError):
+        dw_days = 30
+
+    def _progress(phase: str, pct: int, metrics: Optional[Dict[str, Any]] = None) -> None:
+        if progress_callback is not None:
+            try:
+                progress_callback(phase, pct, metrics or {})
+            except Exception:
+                pass
+
+    _progress("initializing", 0)
+    try:
+        eligible_feedback_data = [
+            f for f in (feedback_data or []) if f.get("is_training_eligible", True)
+        ]
+        if feedback_id_allowlist is not None:
+            allowed = {int(x) for x in feedback_id_allowlist}
+            eligible_feedback_data = [
+                f for f in eligible_feedback_data
+                if f.get("id") is not None and int(f["id"]) in allowed
+            ]
+        if not eligible_feedback_data:
+            raise ValueError("No eligible feedback data to train on")
+
+        split_seed = _derive_split_random_state(
+            training_id=training_id,
+            eligible_feedback_data=eligible_feedback_data,
+        )
+        _progress("data_collection", 15)
+        trainer = ModelTrainer()
+        X, y, sample_weights, sample_timestamps = trainer.collect_training_data(
+            eligible_feedback_data, prediction_logs
+        )
+
+        _progress("preprocessing", 40, {"samples": len(y)})
+
+        min_unique_classes = int(os.getenv("TRAINING_MIN_UNIQUE_CLASSES", "2"))
+        y_str = y.astype(str) if hasattr(y, "astype") else np.asarray(y).astype(str)
+        unique_classes = np.unique(y_str)
+        if len(unique_classes) < min_unique_classes:
+            class_counts = dict(pd.Series(y_str).value_counts().to_dict())
+            raise ValueError(
+                f"Insufficient class diversity for training: unique_classes={len(unique_classes)} "
+                f"< {min_unique_classes}. class_counts={class_counts}"
+            )
+
+        finetune = os.getenv("FINETUNE_PREVIOUS_MODEL", "true").lower() in ("1", "true", "yes", "y")
+        if finetune:
+            fdir = str(finetune_base_model_dir).strip() if finetune_base_model_dir else ""
+            base_kw: Dict[str, Any] = {}
+            if fdir and os.path.isdir(fdir):
+                base_kw["base_model_dir"] = fdir
+            base_model, base_dir = trainer.load_active_artifacts(clinic_key, **base_kw)
+            X_processed, preprocessing_info = trainer.preprocess_features(X, fit_encoders=False)
+        else:
+            X_processed, preprocessing_info = trainer.preprocess_features(X, fit_encoders=True)
+
+        create_session(session_id)
+        save_data_prep_results(
+            session_id,
+            X_processed=X_processed,
+            y=y,
+            sample_weights=sample_weights,
+            sample_timestamps=sample_timestamps,
+            preprocessing_info=preprocessing_info,
+            split_seed=split_seed,
+            trainer=trainer,
+            eligible_feedback_data=eligible_feedback_data,
+            prediction_logs=prediction_logs,
+            finetune=finetune,
+            finetune_base_model_dir=finetune_base_model_dir,
+            clinic_key=clinic_key,
+            training_id=training_id,
+            training_mode=training_mode,
+            dataset_window_days=dw_days,
+        )
+        _progress("data_prep_done", 100, {"samples": len(y), "features": X_processed.shape[1] if hasattr(X_processed, "shape") else 0})
+
+        return {
+            "status": "completed",
+            "session_id": session_id,
+            "samples": len(y),
+            "finetune": finetune,
+        }
+    except Exception as e:
+        logger.exception("Phase data_prep failed")
+        return {"status": "failed", "error": str(e)}
+
+
+def execute_phase_model_train(
+    session_id: str,
+    *,
+    progress_callback: Optional[Callable] = None,
+) -> Dict[str, Any]:
+    """Phase 2: model fitting + calibration. Loads data from session, saves model."""
+    from ai_service.app.domain.services.training_session import (
+        load_data_prep_results, save_model_train_results,
+    )
+
+    def _progress(phase: str, pct: int, metrics: Optional[Dict[str, Any]] = None) -> None:
+        if progress_callback is not None:
+            try:
+                progress_callback(phase, pct, metrics or {})
+            except Exception:
+                pass
+
+    _progress("model_fit", 0)
+    try:
+        data = load_data_prep_results(session_id)
+        X_processed = data["X_processed"]
+        y = data["y"]
+        sample_weights = data["sample_weights"]
+        sample_timestamps = data["sample_timestamps"]
+        split_seed = data["split_seed"]
+        finetune = data["finetune"]
+        finetune_base_model_dir = data.get("finetune_base_model_dir")
+        trainer = data["trainer"]
+        clinic_key = data.get("clinic_key")
+
+        _progress("model_fit", 30, {"mode": "finetune" if finetune else "full_retrain"})
+
+        if finetune:
+            fdir = str(finetune_base_model_dir).strip() if finetune_base_model_dir else ""
+            base_kw: Dict[str, Any] = {}
+            if fdir and os.path.isdir(fdir):
+                base_kw["base_model_dir"] = fdir
+            base_model, base_dir = trainer.load_active_artifacts(clinic_key, **base_kw)
+            add_trees = int(os.getenv("FINETUNE_ADD_TREES", "20"))
+            try:
+                model, training_metrics = trainer.train_model(
+                    X_processed, y, sample_weights,
+                    base_model=base_model,
+                    finetune_add_trees=add_trees,
+                    split_random_state=split_seed,
+                    sample_timestamps=sample_timestamps,
+                )
+                training_metrics["finetune"] = True
+                training_metrics["finetune_fallback"] = False
+            except Exception as e:
+                logger.warning("Warm-start fine-tune failed (%s). Falling back to retrain.", e)
+                model, training_metrics = trainer.train_model(
+                    X_processed, y, sample_weights,
+                    base_model=None,
+                    split_random_state=split_seed,
+                    sample_timestamps=sample_timestamps,
+                )
+                training_metrics["finetune"] = True
+                training_metrics["finetune_fallback"] = True
+            training_metrics["finetune"] = True
+            training_metrics["finetune_base_dir"] = base_dir
+        else:
+            model, training_metrics = trainer.train_model(
+                X_processed, y, sample_weights,
+                split_random_state=split_seed,
+                sample_timestamps=sample_timestamps,
+            )
+            training_metrics["finetune"] = False
+
+        _progress("calibration", 70, {
+            "training_accuracy": training_metrics.get("training_accuracy"),
+            "cv_mean_accuracy": training_metrics.get("cv_mean_accuracy"),
+        })
+        _annotate_small_sample_metrics(training_metrics)
+        eligible_feedback_data = data.get("eligible_feedback_data", [])
+        _annotate_accept_only_feedback_metrics(eligible_feedback_data, training_metrics)
+        if clinic_key is not None:
+            training_metrics["clinic_id"] = clinic_key
+
+        save_model_train_results(session_id, model=model, training_metrics=training_metrics)
+        _progress("model_train_done", 100, {
+            "training_accuracy": training_metrics.get("training_accuracy"),
+        })
+
+        return {"status": "completed", "session_id": session_id}
+    except Exception as e:
+        logger.exception("Phase model_train failed")
+        return {"status": "failed", "error": str(e)}
+
+
+def execute_phase_validation(
+    session_id: str,
+    *,
+    progress_callback: Optional[Callable] = None,
+) -> Dict[str, Any]:
+    """Phase 3: regression gate + feedback improvement gate."""
+    from ai_service.app.domain.services.training_session import (
+        load_data_prep_results, load_model_train_results, save_validation_results,
+    )
+
+    def _progress(phase: str, pct: int, metrics: Optional[Dict[str, Any]] = None) -> None:
+        if progress_callback is not None:
+            try:
+                progress_callback(phase, pct, metrics or {})
+            except Exception:
+                pass
+
+    _progress("cv_scoring", 0)
+    try:
+        data = load_data_prep_results(session_id)
+        model_data = load_model_train_results(session_id)
+        model = model_data["model"]
+        training_metrics = model_data["training_metrics"]
+        trainer = data["trainer"]
+        finetune = data["finetune"]
+        clinic_key = data.get("clinic_key")
+        eligible_feedback_data = data.get("eligible_feedback_data", [])
+        prediction_logs = data.get("prediction_logs", [])
+
+        # ── Regression gate ──
+        regression_gate_enabled = os.getenv("REGRESSION_GATE_ENABLED", "true").lower() in ("1", "true", "yes", "y")
+        regression_tol_f1 = float(os.getenv("REGRESSION_TOLERANCE_F1", "0.01"))
+        golden_test_max_rows = int(os.getenv("GOLDEN_TEST_MAX_ROWS", "2000"))
+        golden_test_random_state = int(os.getenv("RANDOM_STATE", "42"))
+        regression_min_feedback = int(os.getenv("REGRESSION_GATE_MIN_FEEDBACK_SAMPLES", "20"))
+
+        _progress("regression_gate", 30)
+
+        if (
+            regression_gate_enabled
+            and finetune
+            and os.getenv("BASELINE_DATASET_CSV")
+            and len(eligible_feedback_data) < regression_min_feedback
+        ):
+            training_metrics["regression_gate_enabled"] = False
+            training_metrics["regression_gate_skipped_reason"] = "low_feedback_count"
+            training_metrics["regression_gate_min_feedback_samples"] = regression_min_feedback
+        elif regression_gate_enabled and finetune and os.getenv("BASELINE_DATASET_CSV"):
+            try:
+                baseline_csv = os.getenv("BASELINE_DATASET_CSV")
+                baseline_label_col = os.getenv("BASELINE_LABEL_COL", "target_diagnosis")
+                feature_cols = [
+                    "animal_type", "gender", "age_months", "weight_kg", "temperature",
+                    "heart_rate", "current_season", "vaccination_status",
+                    "medical_history", "symptom_duration", "symptoms_list",
+                ]
+                needed_cols = feature_cols + [baseline_label_col]
+                golden_df = pd.read_csv(baseline_csv, usecols=needed_cols)
+                if len(golden_df) > golden_test_max_rows:
+                    golden_df = golden_df.sample(n=golden_test_max_rows, random_state=golden_test_random_state)
+
+                y_gold = _normalize_label_array(golden_df[baseline_label_col])
+                X_gold_features = golden_df[feature_cols]
+                X_gold_processed, _ = trainer.preprocess_features(X_gold_features, fit_encoders=False)
+
+                base_dir = training_metrics.get("finetune_base_dir", "")
+                base_model_fresh = joblib.load(os.path.join(base_dir, "model.pkl"))
+                base_preds = _normalize_label_array(base_model_fresh.predict(X_gold_processed))
+                new_preds = _normalize_label_array(model.predict(X_gold_processed))
+
+                from sklearn.metrics import f1_score, accuracy_score
+                try:
+                    base_f1 = float(f1_score(y_gold, base_preds, average="weighted", zero_division=0))
+                    new_f1 = float(f1_score(y_gold, new_preds, average="weighted", zero_division=0))
+                except TypeError:
+                    base_f1 = float(f1_score(y_gold, base_preds, average="weighted"))
+                    new_f1 = float(f1_score(y_gold, new_preds, average="weighted"))
+                base_acc = float(accuracy_score(y_gold, base_preds))
+                new_acc = float(accuracy_score(y_gold, new_preds))
+
+                regression_high_base_f1_threshold = float(os.getenv("REGRESSION_HIGH_BASE_F1_THRESHOLD", "0.99"))
+                regression_tolerance_high_base = float(os.getenv("REGRESSION_TOLERANCE_F1_HIGH_BASE", "0.35"))
+                effective_tol = regression_tol_f1
+                if base_f1 >= regression_high_base_f1_threshold:
+                    effective_tol = max(regression_tol_f1, regression_tolerance_high_base)
+
+                training_metrics["regression_gate_enabled"] = True
+                training_metrics["golden_test_size"] = int(len(golden_df))
+                training_metrics["golden_base_f1_weighted"] = base_f1
+                training_metrics["golden_new_f1_weighted"] = new_f1
+                training_metrics["golden_base_accuracy"] = base_acc
+                training_metrics["golden_new_accuracy"] = new_acc
+                training_metrics["regression_effective_tolerance_f1"] = effective_tol
+
+                if new_f1 < base_f1 - effective_tol:
+                    err = (
+                        f"Regression gate failed on golden test: "
+                        f"base_f1={base_f1:.4f}, new_f1={new_f1:.4f}, tolerance={effective_tol:.4f}"
+                    )
+                    logger.warning(err)
+                    save_validation_results(session_id, training_metrics=training_metrics)
+                    return {"status": "failed", "error": err, "training_metrics": training_metrics}
+            except Exception as e:
+                logger.warning("Regression gate skipped due to error: %s", e)
+                training_metrics["regression_gate_skipped_error"] = str(e)
+        else:
+            training_metrics["regression_gate_enabled"] = False
+
+        # ── Feedback improvement gate ──
+        _progress("feedback_gate", 60)
+        feedback_gate_enabled = os.getenv("FEEDBACK_IMPROVEMENT_GATE_ENABLED", "true").lower() in ("1", "true", "yes", "y")
+        feedback_gate_tolerance = float(os.getenv("FEEDBACK_GATE_TOLERANCE", "0.05"))
+
+        if feedback_gate_enabled and finetune and training_metrics.get("finetune_base_dir"):
+            base_dir_fb = str(training_metrics["finetune_base_dir"])
+            try:
+                X_fb, y_fb = trainer.collect_feedback_only_training_frame(
+                    eligible_feedback_data, prediction_logs
+                )
+                y_fb_str = y_fb.astype(str)
+                X_fb_proc, _ = trainer.preprocess_features(X_fb, fit_encoders=False)
+                base_model_feedback = joblib.load(os.path.join(base_dir_fb, "model.pkl"))
+                base_preds_fb = base_model_feedback.predict(X_fb_proc)
+                new_preds_fb = model.predict(X_fb_proc)
+
+                from sklearn.metrics import f1_score, accuracy_score
+                n_unique_fb = int(y_fb_str.nunique())
+                if n_unique_fb < 2:
+                    metric_name = "accuracy"
+                    base_sc = float(accuracy_score(y_fb_str, base_preds_fb))
+                    new_sc = float(accuracy_score(y_fb_str, new_preds_fb))
+                else:
+                    metric_name = "f1_weighted"
+                    try:
+                        base_sc = float(f1_score(y_fb_str, base_preds_fb, average="weighted", zero_division=0))
+                        new_sc = float(f1_score(y_fb_str, new_preds_fb, average="weighted", zero_division=0))
+                    except TypeError:
+                        base_sc = float(f1_score(y_fb_str, base_preds_fb, average="weighted"))
+                        new_sc = float(f1_score(y_fb_str, new_preds_fb, average="weighted"))
+
+                training_metrics["feedback_gate_enabled"] = True
+                training_metrics["feedback_eval_size"] = int(len(y_fb))
+                training_metrics["feedback_gate_metric"] = metric_name
+                training_metrics["feedback_base_score"] = base_sc
+                training_metrics["feedback_new_score"] = new_sc
+
+                if new_sc < base_sc - feedback_gate_tolerance:
+                    err = (
+                        f"Feedback improvement gate failed: metric={metric_name} "
+                        f"base={base_sc:.4f}, new={new_sc:.4f}, tolerance={feedback_gate_tolerance:.4f}"
+                    )
+                    logger.warning(err)
+                    save_validation_results(session_id, training_metrics=training_metrics)
+                    return {"status": "failed", "error": err, "training_metrics": training_metrics}
+            except Exception as e:
+                logger.warning("Feedback improvement gate skipped: %s", e)
+                training_metrics["feedback_gate_skipped_error"] = str(e)
+        else:
+            training_metrics["feedback_gate_enabled"] = False
+
+        save_validation_results(session_id, training_metrics=training_metrics)
+        _progress("validation_done", 100)
+
+        return {"status": "completed", "session_id": session_id}
+    except Exception as e:
+        logger.exception("Phase validation failed")
+        return {"status": "failed", "error": str(e)}
+
+
+def execute_phase_persist(
+    session_id: str,
+    *,
+    mlair_run_id: Optional[str] = None,
+    progress_callback: Optional[Callable] = None,
+) -> Dict[str, Any]:
+    """Phase 4: model save, S3 upload, MLflow log, MLAir sync, session cleanup."""
+    from ai_service.app.domain.services.training_session import (
+        load_data_prep_results, load_model_train_results, cleanup_session,
+    )
+
+    def _progress(phase: str, pct: int, metrics: Optional[Dict[str, Any]] = None) -> None:
+        if progress_callback is not None:
+            try:
+                progress_callback(phase, pct, metrics or {})
+            except Exception:
+                pass
+
+    _progress("model_save", 0)
+    try:
+        data = load_data_prep_results(session_id)
+        model_data = load_model_train_results(session_id)
+        model = model_data["model"]
+        training_metrics = model_data["training_metrics"]
+        trainer = data["trainer"]
+        clinic_key = data.get("clinic_key")
+        training_mode = data.get("training_mode", "local")
+        training_id = data.get("training_id")
+        dw_days = data.get("dataset_window_days", 30)
+        preprocessing_info = data.get("preprocessing_info", {})
+        pipeline_kind = "continuous_training"
+
+        model_version = trainer.generate_model_version()
+        if clinic_key is None:
+            base_ver = str(model_version).strip()
+            if not base_ver.endswith(" - global"):
+                model_version = f"{base_ver} - global"
+            training_metrics["training_scope"] = "global"
+        else:
+            training_metrics["training_scope"] = "clinic"
+        training_metrics["model_version"] = model_version
+
+        _progress("model_save", 30)
+        model_path = trainer.save_model(model, training_metrics, model_version, clinic_key=clinic_key)
+
+        try:
+            from ai_service.app.infrastructure.external.s3_client import upload_model_directory
+            upload_model_directory(model_path, model_version, clinic_key=clinic_key)
+        except Exception as e:
+            logger.warning("S3 artifact upload after training failed (non-fatal): %s", e)
+
+        training_metrics["training_mode"] = training_mode
+        training_metrics["dataset_window_days"] = dw_days
+        training_metrics["pipeline_kind"] = pipeline_kind
+
+        trainer.log_to_mlflow(
+            model, training_metrics, model_version,
+            clinic_key=clinic_key,
+            training_id=training_id,
+            training_mode=training_mode,
+        )
+
+        _progress("mlair_sync", 70)
+        try:
+            from ai_service.app.infrastructure.external.mlair_client import sync_training_directory_to_mlair
+            mlair_out = sync_training_directory_to_mlair(
+                model_version=model_version,
+                version_dir=model_path,
+                clinic_key=clinic_key,
+                training_id=training_id,
+                training_mode=training_mode,
+            )
+            training_metrics["mlair_sync"] = mlair_out
+        except Exception as exc:
+            logger.warning("MLAir post-training sync failed (non-fatal): %s", exc)
+            training_metrics["mlair_sync"] = {"status": "error", "error": str(exc)}
+
+        try:
+            from ai_service.app.infrastructure.external.mlair_client import push_mlair_training_tracking
+            training_metrics["mlair_tracking"] = push_mlair_training_tracking(
+                model_version=model_version,
+                version_dir=model_path,
+                clinic_key=clinic_key,
+                training_id=training_id,
+                training_mode=training_mode,
+                training_metrics=training_metrics,
+                pipeline_kind=pipeline_kind,
+                mlair_run_id=mlair_run_id,
+            )
+        except Exception as exc:
+            logger.warning("MLAir training tracking failed (non-fatal): %s", exc)
+            training_metrics["mlair_tracking"] = {"status": "error", "error": str(exc)}
+
+        _progress("persist_done", 100, training_metrics)
+        cleanup_session(session_id)
+
+        return {
+            "status": "completed",
+            "model_version": model_version,
+            "model_path": model_path,
+            "training_metrics": training_metrics,
+            "preprocessing_info": preprocessing_info,
+            "training_mode": training_mode,
+            "training_id": training_id,
+            "dataset_window_days": dw_days,
+            "pipeline_kind": pipeline_kind,
+        }
+    except Exception as e:
+        logger.exception("Phase persist failed")
+        return {"status": "failed", "error": str(e)}
 
 
 # Bridge helpers used by app layers

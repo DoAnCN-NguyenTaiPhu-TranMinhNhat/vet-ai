@@ -117,6 +117,10 @@ class TrainingStatus(BaseModel):
     promote_guardrail_passed: Optional[bool] = None
     promote_guardrail_reason: Optional[str] = None
     audit_snapshot: Optional[Dict[str, Any]] = None
+    training_metrics: Optional[Dict[str, Any]] = None
+    current_phase: Optional[str] = None
+    progress_pct: Optional[int] = None
+    phase_metrics: Optional[Dict[str, Any]] = None
 
 
 class TrainingPolicyUpdate(BaseModel):

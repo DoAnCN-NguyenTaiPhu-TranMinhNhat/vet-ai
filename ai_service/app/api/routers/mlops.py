@@ -10,15 +10,20 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
+import asyncio
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from ai_service.app.api.deps import require_admin
 from ai_service.app.domain.services.clinic_scope_service import normalize_clinic_key
 from ai_service.app.domain.services.clinic_catalog_service import get_clinics_for_mlops
+from ai_service.app.domain.schemas.training import TrainingTriggerRequest
 from ai_service.app.infrastructure.external.mlair_client import (
     apply_mlair_promote_webhook_to_vet_ai,
+    clinic_key_from_mlair_project_id,
     list_mlair_models_for_mlops_ui,
+    mlair_project_for_clinic,
+    mlair_tenant_id,
     try_sync_vetai_pin_to_mlair_production,
 )
 from ai_service.app.infrastructure.storage.model_store import (
@@ -70,6 +75,48 @@ class ActiveModelRequest(BaseModel):
 
 class ClinicTrainingPolicyBody(BaseModel):
     feedback_pool: str = Field(..., pattern="^(GLOBAL|CLINIC_ONLY)$")
+
+
+class MLAirTrainingInvokeBody(BaseModel):
+    """MLAir (or any automation) calls this to start the same PyTorch training as POST /training/trigger."""
+
+    project_id: str = Field(..., min_length=1, description="MLAir project id: global project or clinic_<clinic_id>")
+    tenant_id: Optional[str] = Field(
+        default=None,
+        description="If set, must equal Vet-AI MLAIR_TENANT_ID (usually default).",
+    )
+    training_mode: str = Field(default="local", pattern="^(local|eks_hybrid)$")
+    force: bool = Field(
+        default=True,
+        description="When true, bypass TRAINING_THRESHOLD if at least one eligible sample exists (same as admin trigger).",
+    )
+    finetune_base_model_version: Optional[str] = None
+
+
+class MLAirDatasetTrainInvokeBody(BaseModel):
+    dataset_version_id: str = Field(..., min_length=1, description="MLAir dataset_versions.id (UUID)")
+    project_id: str = Field(..., min_length=1, description="MLAir project id (global or clinic_<id>)")
+    tenant_id: Optional[str] = Field(default=None)
+    training_mode: str = Field(default="local", pattern="^(local|eks_hybrid)$")
+    clinic_id: Optional[str] = Field(
+        default=None,
+        description="Optional explicit clinic_id override; otherwise derived from project_id prefix clinic_.",
+    )
+    trigger_reason: Optional[str] = Field(default="mlair_dataset_train_invoke")
+    mlair_run_id: Optional[str] = Field(
+        default=None,
+        description="Pipeline run_id so tracking data is posted to the same run instead of creating a new one.",
+    )
+
+
+class MLAirPhaseInvokeBody(BaseModel):
+    """Shared request body for multi-phase pipeline task endpoints."""
+    dataset_version_id: Optional[str] = Field(default=None, description="Required for data_prep phase only")
+    project_id: str = Field(..., min_length=1, description="MLAir project id")
+    tenant_id: Optional[str] = Field(default=None)
+    training_mode: str = Field(default="local", pattern="^(local|eks_hybrid)$")
+    clinic_id: Optional[str] = Field(default=None)
+    mlair_run_id: Optional[str] = Field(default=None, description="Pipeline run_id (used as session key)")
 
 
 @router.get(
@@ -365,6 +412,170 @@ async def mlair_promote_webhook(
     return out
 
 
+@router.post(
+    "/mlair/training-invoke",
+    status_code=201,
+    summary="Inbound hook: MLAir pipeline → real Vet-AI training (Bearer MLAIR_TRAINING_INVOKE_TOKEN)",
+)
+async def mlair_training_invoke(
+    body: MLAirTrainingInvokeBody,
+    background_tasks: BackgroundTasks,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Starts the in-process / EKS training job (``execute_training``), not MLAir's demo executor tasks.
+    Configure MLAir (plugin or external HTTP step) to POST here after dataset snapshot / promote, etc.
+    """
+    expected = (os.getenv("MLAIR_TRAINING_INVOKE_TOKEN") or "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="MLAIR_TRAINING_INVOKE_TOKEN is not set on vet-ai",
+        )
+    if not authorization or not secrets.compare_digest(authorization, f"Bearer {expected}"):
+        raise HTTPException(status_code=401, detail="invalid webhook authorization")
+
+    tid = (body.tenant_id or "").strip()
+    if tid and tid != mlair_tenant_id():
+        raise HTTPException(status_code=400, detail="tenant_id does not match MLAIR_TENANT_ID")
+
+    pid = body.project_id.strip()
+    gid = mlair_project_for_clinic(None)
+    pref = (os.getenv("MLAIR_PROJECT_CLINIC_PREFIX") or "clinic_").strip() or "clinic_"
+    if pid != gid and not pid.startswith(pref):
+        raise HTTPException(
+            status_code=400,
+            detail=f"project_id must be the global MLAir project ({gid!r}) or {pref}<clinic_id>",
+        )
+
+    clinic_id = clinic_key_from_mlair_project_id(pid)
+    from ai_service.app.api.routers.training import run_training_trigger_flow
+
+    req = TrainingTriggerRequest(
+        trigger_type="manual",
+        trigger_reason="mlair_training_invoke",
+        force=body.force,
+        training_mode=body.training_mode,
+        clinic_id=clinic_id,
+        finetune_base_model_version=body.finetune_base_model_version,
+    )
+    out = await run_training_trigger_flow(req, background_tasks)
+    return {**out, "clinic_id": clinic_id, "mlair_project_id": pid}
+
+
+@router.post(
+    "/mlair/dataset-train-invoke",
+    status_code=201,
+    summary="Inbound hook: MLAir dataset_version → Vet-AI bootstrap CSV training (Bearer MLAIR_TRAINING_INVOKE_TOKEN)",
+)
+async def mlair_dataset_train_invoke(
+    body: MLAirDatasetTrainInvokeBody,
+    authorization: Optional[str] = Header(default=None),
+):
+    expected = (os.getenv("MLAIR_TRAINING_INVOKE_TOKEN") or "").strip()
+    if not expected:
+        raise HTTPException(status_code=503, detail="MLAIR_TRAINING_INVOKE_TOKEN is not set on vet-ai")
+    if not authorization or not secrets.compare_digest(authorization, f"Bearer {expected}"):
+        raise HTTPException(status_code=401, detail="invalid webhook authorization")
+
+    tid = (body.tenant_id or "").strip()
+    if tid and tid != mlair_tenant_id():
+        raise HTTPException(status_code=400, detail="tenant_id does not match MLAIR_TENANT_ID")
+
+    pid = body.project_id.strip()
+    gid = mlair_project_for_clinic(None)
+    pref = (os.getenv("MLAIR_PROJECT_CLINIC_PREFIX") or "clinic_").strip() or "clinic_"
+    if pid != gid and not pid.startswith(pref):
+        raise HTTPException(
+            status_code=400,
+            detail=f"project_id must be the global MLAir project ({gid!r}) or {pref}<clinic_id>",
+        )
+
+    ck = normalize_clinic_key(body.clinic_id) if body.clinic_id else clinic_key_from_mlair_project_id(pid)
+
+    from ai_service.app.infrastructure.external.mlair_client import download_mlair_dataset_version_csv_bytes
+    from ai_service.app.api.routers.training import (
+        build_training_dataset_snapshot,
+        ct_store,
+        execute_bootstrap_training,
+        training_datasets,
+        training_jobs,
+        _refresh_training_metrics,
+        _snapshot_active_model_version,
+    )
+    from ai_service.app.domain.services.training_service import parse_bootstrap_csv
+
+    raw = download_mlair_dataset_version_csv_bytes(
+        tenant_id=mlair_tenant_id(),
+        project_id=pid,
+        dataset_version_id=body.dataset_version_id,
+    )
+    if not raw:
+        raise HTTPException(status_code=400, detail="downloaded dataset CSV is empty")
+
+    try:
+        fb_rows, pred_rows = parse_bootstrap_csv(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    tm = (body.training_mode or "local").strip() or "local"
+    if tm != "local":
+        raise HTTPException(
+            status_code=400,
+            detail="CSV bootstrap training is local-only (training_mode=local) in this stack",
+        )
+
+    dataset_rows = build_training_dataset_snapshot(fb_rows, pred_rows)
+    prev_bootstrap = _snapshot_active_model_version(ck)
+    training_id = ct_store.create_training_job(
+        status="running",
+        total_predictions=ct_store.count_predictions(clinic_id=ck),
+        eligible_feedback_count=len(fb_rows),
+        previous_model_version=prev_bootstrap,
+        trigger_type="bootstrap_csv",
+        training_mode=tm,
+        eks_node_group=None,
+        dataset_row_count=len(dataset_rows),
+        clinic_id=ck,
+    )
+
+    training_datasets[training_id] = dataset_rows
+    training_jobs[training_id] = {
+        "training_id": training_id,
+        "status": "running",
+        "start_time": datetime.now(),
+        "end_time": None,
+        "total_predictions": ct_store.count_predictions(clinic_id=ck),
+        "eligible_feedback_count": len(fb_rows),
+        "previous_model_version": prev_bootstrap,
+        "new_model_version": None,
+        "training_accuracy": None,
+        "validation_accuracy": None,
+        "f1_score": None,
+        "is_deployed": False,
+        "error_message": None,
+        "trigger_type": "bootstrap_csv",
+        "training_mode": tm,
+        "dataset_row_count": len(dataset_rows),
+        "small_sample_warning": None,
+        "metrics_note": None,
+        "clinic_id": ck,
+        "trigger_reason": str(body.trigger_reason or "").strip() or "mlair_dataset_train_invoke",
+    }
+
+    asyncio.create_task(execute_bootstrap_training(training_id, fb_rows, pred_rows, ck, tm, mlair_run_id=body.mlair_run_id))
+    _refresh_training_metrics()
+    return {
+        "training_id": training_id,
+        "status": "triggered",
+        "trigger_type": "bootstrap_csv",
+        "row_count": len(fb_rows),
+        "clinic_id": ck,
+        "mlair_project_id": pid,
+        "mlair_dataset_version_id": body.dataset_version_id,
+    }
+
+
 @router.get("/drift/summary", summary="Get drift summary + simple alert rule")
 async def get_drift_summary(days: int = 7, clinic_id: Optional[str] = Query(None)):
     try:
@@ -498,4 +709,245 @@ async def get_system_info():
     except Exception as exc:
         logger.error("Error getting system info: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── Multi-phase pipeline endpoints ─────────────────────────────────────
+
+
+def _validate_mlair_phase_auth(authorization: Optional[str]) -> None:
+    expected = (os.getenv("MLAIR_TRAINING_INVOKE_TOKEN") or "").strip()
+    if not expected:
+        raise HTTPException(status_code=503, detail="MLAIR_TRAINING_INVOKE_TOKEN is not set on vet-ai")
+    if not authorization or not secrets.compare_digest(authorization, f"Bearer {expected}"):
+        raise HTTPException(status_code=401, detail="invalid webhook authorization")
+
+
+def _validate_mlair_phase_project(body: MLAirPhaseInvokeBody) -> Optional[str]:
+    tid = (body.tenant_id or "").strip()
+    if tid and tid != mlair_tenant_id():
+        raise HTTPException(status_code=400, detail="tenant_id does not match MLAIR_TENANT_ID")
+    pid = body.project_id.strip()
+    gid = mlair_project_for_clinic(None)
+    pref = (os.getenv("MLAIR_PROJECT_CLINIC_PREFIX") or "clinic_").strip() or "clinic_"
+    if pid != gid and not pid.startswith(pref):
+        raise HTTPException(
+            status_code=400,
+            detail=f"project_id must be the global MLAir project ({gid!r}) or {pref}<clinic_id>",
+        )
+    return normalize_clinic_key(body.clinic_id) if body.clinic_id else clinic_key_from_mlair_project_id(pid)
+
+
+@router.get(
+    "/mlair/phase-status",
+    summary="Poll phase job status for multi-phase pipeline tasks",
+)
+async def mlair_phase_status(
+    session_id: str = Query(..., min_length=1),
+    phase: str = Query(..., min_length=1),
+):
+    from ai_service.app.api.routers.training import phase_jobs
+
+    pjk = f"{phase}:{session_id}"
+    job = phase_jobs.get(pjk)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Phase job not found: {pjk}")
+    return {
+        "status": job.get("status", "running"),
+        "progress_pct": job.get("progress_pct", 0),
+        "current_phase": job.get("current_phase", ""),
+        "phase_metrics": job.get("phase_metrics", {}),
+        "error_message": job.get("error_message"),
+        "result": job.get("result"),
+    }
+
+
+@router.post(
+    "/mlair/data-prep-invoke",
+    status_code=201,
+    summary="Phase 1: Data collection + preprocessing (multi-phase pipeline)",
+)
+async def mlair_data_prep_invoke(
+    body: MLAirPhaseInvokeBody,
+    authorization: Optional[str] = Header(default=None),
+):
+    _validate_mlair_phase_auth(authorization)
+    ck = _validate_mlair_phase_project(body)
+
+    if not body.dataset_version_id:
+        raise HTTPException(status_code=400, detail="dataset_version_id is required for data_prep phase")
+    if not body.mlair_run_id:
+        raise HTTPException(status_code=400, detail="mlair_run_id is required as session key")
+
+    session_id = body.mlair_run_id
+    tm = (body.training_mode or "local").strip() or "local"
+    if tm != "local":
+        raise HTTPException(status_code=400, detail="CSV bootstrap training is local-only (training_mode=local)")
+
+    from ai_service.app.infrastructure.external.mlair_client import download_mlair_dataset_version_csv_bytes
+    from ai_service.app.api.routers.training import (
+        build_training_dataset_snapshot, ct_store, phase_jobs, run_phase_data_prep,
+        _snapshot_active_model_version, _refresh_training_metrics,
+    )
+    from ai_service.app.domain.services.training_service import parse_bootstrap_csv
+
+    raw = download_mlair_dataset_version_csv_bytes(
+        tenant_id=mlair_tenant_id(),
+        project_id=body.project_id.strip(),
+        dataset_version_id=body.dataset_version_id,
+    )
+    if not raw:
+        raise HTTPException(status_code=400, detail="downloaded dataset CSV is empty")
+
+    try:
+        fb_rows, pred_rows = parse_bootstrap_csv(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    prev_model = _snapshot_active_model_version(ck)
+    training_id = ct_store.create_training_job(
+        status="running",
+        total_predictions=ct_store.count_predictions(clinic_id=ck),
+        eligible_feedback_count=len(fb_rows),
+        previous_model_version=prev_model,
+        trigger_type="bootstrap_csv",
+        training_mode=tm,
+        eks_node_group=None,
+        dataset_row_count=len(fb_rows),
+        clinic_id=ck,
+    )
+
+    finetune_base_model_dir: Optional[str] = None
+    try:
+        from ai_service.app.api.routers.training import resolve_model_dir
+        if prev_model and str(prev_model).strip():
+            cand = resolve_model_dir(str(prev_model).strip(), ck)
+            if os.path.isdir(cand):
+                finetune_base_model_dir = cand
+    except Exception:
+        pass
+
+    pjk = f"data_prep:{session_id}"
+    phase_jobs[pjk] = {"status": "running", "progress_pct": 0, "current_phase": "initializing"}
+
+    asyncio.create_task(run_phase_data_prep(
+        session_id, fb_rows, pred_rows, ck, tm, training_id,
+        finetune_base_model_dir=finetune_base_model_dir,
+    ))
+    _refresh_training_metrics()
+
+    return {
+        "phase_job_id": pjk,
+        "session_id": session_id,
+        "training_id": training_id,
+        "status": "triggered",
+        "phase": "data_prep",
+    }
+
+
+@router.post(
+    "/mlair/model-train-invoke",
+    status_code=201,
+    summary="Phase 2: Model fitting + calibration (multi-phase pipeline)",
+)
+async def mlair_model_train_invoke(
+    body: MLAirPhaseInvokeBody,
+    authorization: Optional[str] = Header(default=None),
+):
+    _validate_mlair_phase_auth(authorization)
+    _validate_mlair_phase_project(body)
+
+    if not body.mlair_run_id:
+        raise HTTPException(status_code=400, detail="mlair_run_id is required as session key")
+
+    session_id = body.mlair_run_id
+
+    from ai_service.app.domain.services.training_session import session_exists
+    if not session_exists(session_id):
+        raise HTTPException(status_code=400, detail=f"Session not found: {session_id}. data_prep must run first.")
+
+    from ai_service.app.api.routers.training import phase_jobs, run_phase_model_train
+
+    pjk = f"model_train:{session_id}"
+    phase_jobs[pjk] = {"status": "running", "progress_pct": 0, "current_phase": "model_fit"}
+
+    asyncio.create_task(run_phase_model_train(session_id))
+
+    return {
+        "phase_job_id": pjk,
+        "session_id": session_id,
+        "status": "triggered",
+        "phase": "model_train",
+    }
+
+
+@router.post(
+    "/mlair/validation-invoke",
+    status_code=201,
+    summary="Phase 3: Regression gate + feedback improvement gate (multi-phase pipeline)",
+)
+async def mlair_validation_invoke(
+    body: MLAirPhaseInvokeBody,
+    authorization: Optional[str] = Header(default=None),
+):
+    _validate_mlair_phase_auth(authorization)
+    _validate_mlair_phase_project(body)
+
+    if not body.mlair_run_id:
+        raise HTTPException(status_code=400, detail="mlair_run_id is required as session key")
+
+    session_id = body.mlair_run_id
+
+    from ai_service.app.domain.services.training_session import session_exists
+    if not session_exists(session_id):
+        raise HTTPException(status_code=400, detail=f"Session not found: {session_id}. model_train must run first.")
+
+    from ai_service.app.api.routers.training import phase_jobs, run_phase_validation
+
+    pjk = f"validation:{session_id}"
+    phase_jobs[pjk] = {"status": "running", "progress_pct": 0, "current_phase": "cv_scoring"}
+
+    asyncio.create_task(run_phase_validation(session_id))
+
+    return {
+        "phase_job_id": pjk,
+        "session_id": session_id,
+        "status": "triggered",
+        "phase": "validation",
+    }
+
+
+@router.post(
+    "/mlair/persist-invoke",
+    status_code=201,
+    summary="Phase 4: Model save + S3 + MLflow + MLAir sync (multi-phase pipeline)",
+)
+async def mlair_persist_invoke(
+    body: MLAirPhaseInvokeBody,
+    authorization: Optional[str] = Header(default=None),
+):
+    _validate_mlair_phase_auth(authorization)
+    _validate_mlair_phase_project(body)
+
+    if not body.mlair_run_id:
+        raise HTTPException(status_code=400, detail="mlair_run_id is required as session key")
+
+    session_id = body.mlair_run_id
+
+    from ai_service.app.domain.services.training_session import session_exists
+    if not session_exists(session_id):
+        raise HTTPException(status_code=400, detail=f"Session not found: {session_id}. validation must run first.")
+
+    from ai_service.app.api.routers.training import phase_jobs, run_phase_persist
+
+    pjk = f"persist:{session_id}"
+    phase_jobs[pjk] = {"status": "running", "progress_pct": 0, "current_phase": "model_save"}
+
+    asyncio.create_task(run_phase_persist(session_id, mlair_run_id=body.mlair_run_id))
+
+    return {
+        "phase_job_id": pjk,
+        "session_id": session_id,
+        "status": "triggered",
+        "phase": "persist",
+    }
 

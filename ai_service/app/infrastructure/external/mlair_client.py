@@ -45,6 +45,13 @@ Env:
         (imports **missing** folders such as ``v2`` even when ``v1`` already exists; duplicate imports are skipped)
   MLAIR_DISK_IMPORT_CLINIC_FALLBACK_GLOBAL  default: 1 — if a clinic has no local model.pkl dirs, import global on-disk
         bundles into that clinic's MLAir logical model so versions are not empty
+  MLAIR_FEEDBACK_BUFFER_SYNC  default: 1 — after each training-eligible doctor feedback, POST MLAir lineage ingest to bump
+        the ``runtime_feedback`` accumulation buffer for dataset MLAIR_FEEDBACK_DATASET_NAME (per MLAir project).
+  MLAIR_FEEDBACK_DATASET_NAME  default: vetai_runtime_feedback — one logical dataset per MLAir project (global vs clinic_*).
+  MLAIR_FEEDBACK_TARGET_THRESHOLD  default: 1000 — PATCH buffer after first ingest (MLAir materialization target).
+  MLAIR_FEEDBACK_ACCUMULATION_STRATEGY  default: snapshot_on_threshold — MLAir buffer strategy (see MLAir PATCH /buffer).
+  MLAIR_FEEDBACK_SINK_PIPELINE_ID  default: MLAIR_STUB_PIPELINE_ID / demo_pipeline — POST /runs sink for lineage ingest.
+  MLAIR_FEEDBACK_SINK_PLUGIN  default: echo_tracking — must exist in mlair-api plugin registry.
 """
 
 from __future__ import annotations
@@ -54,6 +61,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -100,6 +108,287 @@ def mlair_logical_model_name(clinic_key: Optional[str]) -> str:
         return os.getenv("MLAIR_MODEL_NAME_GLOBAL", "vetai-diagnosis-global").strip() or "vetai-diagnosis-global"
     base = os.getenv("MLAIR_MODEL_NAME_CLINIC_PREFIX", "vetai-diagnosis-clinic").strip() or "vetai-diagnosis-clinic"
     return f"{base}-{clinic_dir_slug(ck)}"
+
+
+def mlair_feedback_buffer_project_id(training_pool: str, prediction_clinic_id: Optional[str]) -> Optional[str]:
+    """MLAir project_id used for feedback accumulation (matches training pool)."""
+    pool = (training_pool or "GLOBAL").strip().upper()
+    if pool == "GLOBAL":
+        return mlair_project_for_clinic(None)
+    if pool != "CLINIC_ONLY":
+        return mlair_project_for_clinic(None)
+    ck = normalize_clinic_key(prediction_clinic_id)
+    if ck is None:
+        return None
+    return mlair_project_for_clinic(ck)
+
+
+def _mlair_feedback_buffer_sync_enabled() -> bool:
+    if not mlair_enabled():
+        return False
+    raw = os.getenv("MLAIR_FEEDBACK_BUFFER_SYNC", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _mlair_feedback_dataset_display_name() -> str:
+    return (os.getenv("MLAIR_FEEDBACK_DATASET_NAME", "vetai_runtime_feedback") or "vetai_runtime_feedback").strip()
+
+
+def _mlair_feedback_sink_plugin() -> str:
+    return (os.getenv("MLAIR_FEEDBACK_SINK_PLUGIN", "echo_tracking") or "echo_tracking").strip()
+
+
+def _mlair_feedback_sink_pipeline_id() -> str:
+    explicit = (os.getenv("MLAIR_FEEDBACK_SINK_PIPELINE_ID", "") or "").strip()
+    return explicit or stub_pipeline_id()
+
+
+def download_mlair_dataset_version_csv_bytes(
+    *,
+    tenant_id: str,
+    project_id: str,
+    dataset_version_id: str,
+) -> bytes:
+    """
+    Download an immutable dataset version as CSV from MLAir.
+
+    MLAir endpoint: GET /v1/tenants/{tenant}/projects/{project}/dataset-versions/{version_id}/download
+    (see openapi-v1-draft.yaml).
+    """
+    base = mlair_api_base_url().rstrip("/")
+    if not base:
+        raise RuntimeError("MLAIR_API_BASE_URL is unset")
+    tid = quote(str(tenant_id or "").strip() or mlair_tenant_id(), safe="")
+    pid = quote(str(project_id or "").strip(), safe="")
+    vid = quote(str(dataset_version_id or "").strip(), safe="")
+    if not pid:
+        raise ValueError("project_id is required")
+    if not vid:
+        raise ValueError("dataset_version_id is required")
+    url = f"{base}/v1/tenants/{tid}/projects/{pid}/dataset-versions/{vid}/download"
+    with httpx.Client(timeout=_timeout()) as client:
+        r = client.get(url, headers=_headers())
+        r.raise_for_status()
+        return r.content or b""
+
+
+def _mlair_feedback_target_threshold() -> int:
+    try:
+        return max(1, int(os.getenv("MLAIR_FEEDBACK_TARGET_THRESHOLD", "1000")))
+    except ValueError:
+        return 1000
+
+
+def _mlair_feedback_accumulation_strategy() -> str:
+    s = (os.getenv("MLAIR_FEEDBACK_ACCUMULATION_STRATEGY", "snapshot_on_threshold") or "snapshot_on_threshold").strip()
+    allowed = {"snapshot_on_threshold", "rolling_accumulate", "snapshot_on_schedule", "manual_materialize_only"}
+    return s if s in allowed else "snapshot_on_threshold"
+
+
+_feedback_sink_run_id_cache: Dict[tuple[str, str], str] = {}
+_feedback_sink_locks: Dict[tuple[str, str], threading.Lock] = {}
+_feedback_sink_locks_guard = threading.Lock()
+
+
+def _feedback_sink_lock(tenant_id: str, project_id: str) -> threading.Lock:
+    key = (tenant_id, project_id)
+    with _feedback_sink_locks_guard:
+        if key not in _feedback_sink_locks:
+            _feedback_sink_locks[key] = threading.Lock()
+        return _feedback_sink_locks[key]
+
+
+def ensure_mlair_feedback_sink_run_id(client: httpx.Client, tenant_id: str, project_id: str) -> Optional[str]:
+    """Idempotent MLAir run used only as lineage/ingest scope (echo_tracking)."""
+    key = (tenant_id, project_id)
+    if key in _feedback_sink_run_id_cache:
+        return _feedback_sink_run_id_cache[key]
+    base = mlair_api_base_url().rstrip("/")
+    pid = quote(project_id, safe="")
+    tid = quote(tenant_id, safe="")
+    url = f"{base}/v1/tenants/{tid}/projects/{pid}/runs"
+    idem = f"vetai-feedback-sink:v1:{tenant_id}:{project_id}"
+    body: Dict[str, Any] = {
+        "pipeline_id": _mlair_feedback_sink_pipeline_id(),
+        "plugin_name": _mlair_feedback_sink_plugin(),
+        "idempotency_key": idem,
+        "training_mode": "full",
+        "override_config": {},
+    }
+    try:
+        r = client.post(url, headers={**_headers(), "Content-Type": "application/json"}, json=body, timeout=_timeout())
+        r.raise_for_status()
+        data = r.json() if r.content else {}
+        rid = str(data.get("run_id") or "").strip()
+        if not rid:
+            logger.warning("MLAir feedback sink: missing run_id in response project=%s", project_id)
+            return None
+        _feedback_sink_run_id_cache[key] = rid
+        logger.info("MLAir feedback sink run ready tenant=%s project=%s run_id=%s", tenant_id, project_id, rid)
+        return rid
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text[:1200] if exc.response is not None else ""
+        logger.warning("MLAir feedback sink run HTTP error project=%s: %s body=%s", project_id, exc, detail)
+        return None
+    except Exception as exc:
+        logger.warning("MLAir feedback sink run failed project=%s: %s", project_id, exc)
+        return None
+
+
+def _mlair_find_dataset_id_by_name(client: httpx.Client, tenant_id: str, project_id: str, name: str) -> Optional[str]:
+    base = mlair_api_base_url().rstrip("/")
+    pid = quote(project_id, safe="")
+    tid = quote(tenant_id, safe="")
+    url = f"{base}/v1/tenants/{tid}/projects/{pid}/datasets"
+    try:
+        r = client.get(url, headers=_headers(), params={"limit": 500, "offset": 0}, timeout=_timeout())
+        if r.status_code in (404, 405):
+            return None
+        r.raise_for_status()
+        body = r.json() if r.content else {}
+        items = body.get("items") if isinstance(body, dict) else None
+        if not isinstance(items, list):
+            return None
+        for it in items:
+            if str(it.get("name") or "").strip() == name:
+                ds = str(it.get("dataset_id") or "").strip()
+                return ds or None
+        return None
+    except Exception as exc:
+        logger.warning("MLAir list datasets failed project=%s: %s", project_id, exc)
+        return None
+
+
+def _mlair_get_buffer_current_size(client: httpx.Client, tenant_id: str, project_id: str, dataset_id: str) -> int:
+    base = mlair_api_base_url().rstrip("/")
+    did = quote(dataset_id, safe="")
+    pid = quote(project_id, safe="")
+    tid = quote(tenant_id, safe="")
+    url = f"{base}/v1/tenants/{tid}/projects/{pid}/datasets/{did}/buffer"
+    try:
+        r = client.get(url, headers=_headers(), timeout=_timeout())
+        if r.status_code == 404:
+            return 0
+        r.raise_for_status()
+        j = r.json() if r.content else {}
+        return max(0, int(j.get("current_size") if j.get("current_size") is not None else j.get("record_count") or 0))
+    except Exception:
+        return 0
+
+
+def _mlair_post_lineage_ingest_runtime_feedback(
+    client: httpx.Client,
+    tenant_id: str,
+    project_id: str,
+    run_id: str,
+    dataset_name: str,
+    cumulative_size: int,
+) -> None:
+    base = mlair_api_base_url().rstrip("/")
+    pid = quote(project_id, safe="")
+    tid = quote(tenant_id, safe="")
+    url = f"{base}/v1/tenants/{tid}/projects/{pid}/lineage/ingest"
+    body: Dict[str, Any] = {
+        "run_id": run_id,
+        "task_id": "vetai:runtime_feedback",
+        "lineage": {
+            "inputs": [
+                {
+                    "name": dataset_name,
+                    "version": None,
+                    "source_type": "runtime_feedback",
+                    "current_size": int(max(0, cumulative_size)),
+                }
+            ],
+            "outputs": [],
+        },
+    }
+    r = client.post(url, headers={**_headers(), "Content-Type": "application/json"}, json=body, timeout=_timeout())
+    r.raise_for_status()
+
+
+def _mlair_patch_dataset_buffer_after_first_feedback(
+    client: httpx.Client, tenant_id: str, project_id: str, dataset_id: str
+) -> None:
+    base = mlair_api_base_url().rstrip("/")
+    did = quote(dataset_id, safe="")
+    pid = quote(project_id, safe="")
+    tid = quote(tenant_id, safe="")
+    url = f"{base}/v1/tenants/{tid}/projects/{pid}/datasets/{did}/buffer"
+    payload = {
+        "target_threshold": _mlair_feedback_target_threshold(),
+        "accumulation_strategy": _mlair_feedback_accumulation_strategy(),
+    }
+    r = client.patch(url, headers={**_headers(), "Content-Type": "application/json"}, json=payload, timeout=_timeout())
+    r.raise_for_status()
+
+
+def push_clinic_feedback_to_mlair_runtime_buffer(
+    *,
+    training_pool: str,
+    prediction_clinic_id: Optional[str],
+    increment: int = 1,
+) -> Dict[str, Any]:
+    """
+    Mirror eligible Vet-AI feedback into MLAir's runtime_feedback accumulation buffer for the matching
+    tenant project (global vs per-clinic). MLAir creates dataset versions when ``current_size`` reaches
+    ``target_threshold`` (``snapshot_on_threshold`` strategy).
+    """
+    out: Dict[str, Any] = {"status": "skipped"}
+    if not _mlair_feedback_buffer_sync_enabled():
+        out["reason"] = "MLAIR_FEEDBACK_BUFFER_SYNC disabled"
+        return out
+    project_id = mlair_feedback_buffer_project_id(training_pool, prediction_clinic_id)
+    if not project_id:
+        out["reason"] = "no_mlair_project_for_pool"
+        return out
+    tenant_id = mlair_tenant_id()
+    ds_name = _mlair_feedback_dataset_display_name()
+    inc = max(1, int(increment or 1))
+    lock = _feedback_sink_lock(tenant_id, project_id)
+    with lock:
+        try:
+            tmo = min(_timeout(), 60.0)
+            with httpx.Client(timeout=tmo) as client:
+                rid = ensure_mlair_feedback_sink_run_id(client, tenant_id, project_id)
+                if not rid:
+                    return {"status": "error", "reason": "sink_run_unavailable", "project_id": project_id}
+                ds_id_before = _mlair_find_dataset_id_by_name(client, tenant_id, project_id, ds_name)
+                had_dataset_before = ds_id_before is not None
+                cur = 0
+                if ds_id_before:
+                    cur = _mlair_get_buffer_current_size(client, tenant_id, project_id, ds_id_before)
+                new_size = cur + inc
+                _mlair_post_lineage_ingest_runtime_feedback(client, tenant_id, project_id, rid, ds_name, new_size)
+                ds_id_after = _mlair_find_dataset_id_by_name(client, tenant_id, project_id, ds_name)
+                if ds_id_after and not had_dataset_before:
+                    try:
+                        _mlair_patch_dataset_buffer_after_first_feedback(
+                            client, tenant_id, project_id, ds_id_after
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "MLAir buffer PATCH after first feedback ingest failed project=%s: %s",
+                            project_id,
+                            exc,
+                        )
+                return {
+                    "status": "ok",
+                    "tenant_id": tenant_id,
+                    "project_id": project_id,
+                    "dataset_name": ds_name,
+                    "dataset_id": ds_id_after,
+                    "previous_size": cur,
+                    "new_size": new_size,
+                    "run_id": rid,
+                }
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text[:1200] if exc.response is not None else ""
+            logger.warning("MLAir feedback buffer HTTP error: %s body=%s", exc, detail)
+            return {"status": "error", "http": str(exc), "body": detail}
+        except Exception as exc:
+            logger.warning("MLAir feedback buffer sync failed: %s", exc)
+            return {"status": "error", "error": str(exc)}
 
 
 def _timeout() -> float:
@@ -207,9 +496,30 @@ def _default_seed_pipeline_config() -> dict[str, Any]:
             logger.warning("MLAIR_SEED_PIPELINE_CONFIG_JSON is not valid JSON; using built-in seed_demo tasks")
     return {
         "tasks": [
-            {"id": "extract", "plugin": "app_etl_adapter"},
-            {"id": "transform", "plugin": "app_etl_adapter", "depends_on": ["extract"]},
-            {"id": "train", "plugin": "echo_tracking", "depends_on": ["transform"]},
+            {
+                "id": "data_prep",
+                "plugin": "vetai_data_prep",
+                "context": {
+                    "tenant_id": mlair_tenant_id(),
+                    "project_id": mlair_project_for_clinic(None),
+                    "training_mode": "local",
+                },
+            },
+            {
+                "id": "model_train",
+                "plugin": "vetai_model_train",
+                "depends_on": ["data_prep"],
+            },
+            {
+                "id": "validation",
+                "plugin": "vetai_validation",
+                "depends_on": ["model_train"],
+            },
+            {
+                "id": "persist",
+                "plugin": "vetai_persist",
+                "depends_on": ["validation"],
+            },
         ]
     }
 
@@ -218,10 +528,14 @@ def seed_pipeline_id() -> str:
     return (os.getenv("MLAIR_SEED_PIPELINE_ID", "fail_once_demo_pipeline") or "fail_once_demo_pipeline").strip()
 
 
+def _seed_dataset_version_id() -> str:
+    return os.getenv("MLAIR_SEED_DATASET_VERSION_ID", "").strip()
+
+
 def seed_mlair_demo_executor_track(tenant_id: str, project_id: str) -> Dict[str, Any]:
     """
-    Create the same pipeline version + optional run as ml-air ``scripts/seed_demo.py`` (real plugins:
-    app_etl_adapter, echo_tracking). Idempotent: skips version create if versions exist; run uses stable idempotency_key.
+    Create a pipeline version for dataset-based training and optionally trigger a run.
+    Idempotent: skips version create if versions exist; run uses stable idempotency_key.
     """
     base = mlair_api_base_url()
     if not base:
@@ -279,29 +593,24 @@ def seed_mlair_demo_executor_track(tenant_id: str, project_id: str) -> Dict[str,
                 out["run_reason"] = "MLAIR_SEED_DEMO_EXECUTOR_RUN off"
                 return out
 
-            run_tag = str(int(time.time() * 1000))
-            idem = f"vet-ai-exec-seed-{tid}-{pid}-{pipe}"
+            dsv_id = _seed_dataset_version_id()
+            if not dsv_id:
+                out["status"] = "ok"
+                out["run"] = "skipped"
+                out["run_reason"] = "MLAIR_SEED_DATASET_VERSION_ID not set"
+                return out
+
+            idem = f"vet-ai-exec-seed-{tid}-{pid}-{pipe}-{dsv_id}"
             plugin_context: Dict[str, Any] = {
-                "params": {"demo_source": "vet_ai_seed", "run_tag": run_tag},
-                "metrics": {"demo_score": {"step": 1, "value": 0.93}},
-                "artifacts": [{"path": f"demo/{run_tag}/model.pkl", "uri": f"s3://mlair/demo/{run_tag}/model.pkl"}],
-                "lineage": {
-                    "inputs": [
-                        {"name": "raw_data", "version": f"v{run_tag}", "uri": f"s3://mlair/demo/{run_tag}/raw.parquet"}
-                    ],
-                    "outputs": [
-                        {
-                            "name": "features",
-                            "version": f"v{run_tag}",
-                            "uri": f"s3://mlair/demo/{run_tag}/features.parquet",
-                        }
-                    ],
-                },
+                "tenant_id": tid,
+                "project_id": pid,
+                "dataset_version_id": dsv_id,
+                "training_mode": "local",
             }
             trigger = {
                 "pipeline_id": pipe,
                 "idempotency_key": idem,
-                "plugin_name": "echo_tracking",
+                "plugin_name": "vetai_train_from_dataset_version",
                 "context": plugin_context,
                 "use_latest_pipeline_version": True,
             }
@@ -1139,10 +1448,12 @@ def push_mlair_training_tracking(
     training_mode: str,
     training_metrics: Dict[str, Any],
     pipeline_kind: Optional[str] = None,
+    mlair_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    After local training, create (or reuse) an MLAir run and mirror key params/metrics into MLAir tracking APIs
-    so the control plane UI shows real experiment data tied to vet-ai training.
+    After local training, post params/metrics/artifacts to an MLAir run.
+    If ``mlair_run_id`` is provided (pipeline-triggered training), post to that existing run
+    instead of creating a separate tracking run — this merges tracking onto the pipeline run.
     """
     base = mlair_api_base_url()
     if not base:
@@ -1152,79 +1463,85 @@ def push_mlair_training_tracking(
 
     tenant_id = mlair_tenant_id()
     project_id = mlair_project_for_clinic(clinic_key)
-    pipe = mlair_tracking_pipeline_id()
-    plugin = mlair_tracking_plugin_name()
-    idem = _mlair_training_idempotency_key(training_id=training_id, model_version=model_version)
 
     out: Dict[str, Any] = {
         "status": "pending",
         "tenant_id": tenant_id,
         "project_id": project_id,
-        "pipeline_id": pipe,
-        "idempotency_key": idem,
     }
 
     try:
         tmo = min(_timeout(), 120.0)
         with httpx.Client(timeout=tmo) as client:
-            pv = ensure_mlair_tracking_pipeline_version(client, tenant_id, project_id)
-            out["pipeline_ensure"] = pv
-            if pv.get("status") == "error":
-                out["status"] = "error"
-                out["error"] = pv.get("error")
-                return out
-            if pv.get("status") == "skipped":
-                out["status"] = "skipped"
-                out["reason"] = pv.get("reason")
-                return out
-
-            experiment_id = _resolve_mlair_tracking_experiment_id(client, tenant_id, project_id)
-            out["experiment_id"] = experiment_id
-
-            safe_proj = quote(project_id, safe="")
-            runs_url = f"{base}/v1/tenants/{tenant_id}/projects/{safe_proj}/runs"
             ck = normalize_clinic_key(clinic_key)
-            ctx: Dict[str, Any] = {
-                "vetai_source": "continuous_training",
-                "vetai_model_version": model_version,
-                "vetai_clinic_id": ck if ck is not None else "global",
-                "vetai_training_id": training_id,
-                "vetai_pipeline_kind": pipeline_kind or training_metrics.get("pipeline_kind"),
-            }
-            trigger: Dict[str, Any] = {
-                "pipeline_id": pipe,
-                "plugin_name": plugin,
-                "context": ctx,
-                "idempotency_key": idem,
-                "use_latest_pipeline_version": True,
-                "training_mode": _mlair_norm_training_mode(training_mode),
-                "override_config": {},
-            }
-            if experiment_id:
-                trigger["experiment_id"] = experiment_id
 
-            rr = client.post(runs_url, headers={**_headers(), "Content-Type": "application/json"}, json=trigger)
-            rr.raise_for_status()
-            run_row = rr.json() if rr.content else {}
-            run_id = str(run_row.get("run_id") or "") if isinstance(run_row, dict) else ""
-            if not run_id:
-                out["status"] = "error"
-                out["error"] = "MLAir POST /runs returned no run_id"
-                return out
-            out["run_id"] = run_id
-            out["run"] = run_row
+            if mlair_run_id:
+                run_id = mlair_run_id
+                out["run_id"] = run_id
+                out["merged_onto_pipeline_run"] = True
+            else:
+                pipe = mlair_tracking_pipeline_id()
+                plugin = mlair_tracking_plugin_name()
+                idem = _mlair_training_idempotency_key(training_id=training_id, model_version=model_version)
+                out["pipeline_id"] = pipe
+                out["idempotency_key"] = idem
 
-            poll_budget = max(5.0, min(_mlair_tracking_poll_seconds(), 180.0))
-            poll = _mlair_poll_run_until_terminal(
-                client,
-                tenant_id,
-                project_id,
-                run_id,
-                time.monotonic() + poll_budget,
-            )
-            out["poll"] = poll
+                pv = ensure_mlair_tracking_pipeline_version(client, tenant_id, project_id)
+                out["pipeline_ensure"] = pv
+                if pv.get("status") == "error":
+                    out["status"] = "error"
+                    out["error"] = pv.get("error")
+                    return out
+                if pv.get("status") == "skipped":
+                    out["status"] = "skipped"
+                    out["reason"] = pv.get("reason")
+                    return out
 
-            # Params (string values per MLAir API)
+                experiment_id = _resolve_mlair_tracking_experiment_id(client, tenant_id, project_id)
+                out["experiment_id"] = experiment_id
+
+                safe_proj = quote(project_id, safe="")
+                runs_url = f"{base}/v1/tenants/{tenant_id}/projects/{safe_proj}/runs"
+                ctx: Dict[str, Any] = {
+                    "vetai_source": "continuous_training",
+                    "vetai_model_version": model_version,
+                    "vetai_clinic_id": ck if ck is not None else "global",
+                    "vetai_training_id": training_id,
+                    "vetai_pipeline_kind": pipeline_kind or training_metrics.get("pipeline_kind"),
+                }
+                trigger: Dict[str, Any] = {
+                    "pipeline_id": pipe,
+                    "plugin_name": plugin,
+                    "context": ctx,
+                    "idempotency_key": idem,
+                    "use_latest_pipeline_version": True,
+                    "training_mode": _mlair_norm_training_mode(training_mode),
+                    "override_config": {},
+                }
+                if experiment_id:
+                    trigger["experiment_id"] = experiment_id
+
+                rr = client.post(runs_url, headers={**_headers(), "Content-Type": "application/json"}, json=trigger)
+                rr.raise_for_status()
+                run_row = rr.json() if rr.content else {}
+                run_id = str(run_row.get("run_id") or "") if isinstance(run_row, dict) else ""
+                if not run_id:
+                    out["status"] = "error"
+                    out["error"] = "MLAir POST /runs returned no run_id"
+                    return out
+                out["run_id"] = run_id
+                out["run"] = run_row
+
+                poll_budget = max(5.0, min(_mlair_tracking_poll_seconds(), 180.0))
+                poll = _mlair_poll_run_until_terminal(
+                    client,
+                    tenant_id,
+                    project_id,
+                    run_id,
+                    time.monotonic() + poll_budget,
+                )
+                out["poll"] = poll
+
             try:
                 _mlair_post_param(client, tenant_id, project_id, run_id, "vetai_model_version", model_version)
                 _mlair_post_param(client, tenant_id, project_id, run_id, "vetai_training_mode", str(training_mode))

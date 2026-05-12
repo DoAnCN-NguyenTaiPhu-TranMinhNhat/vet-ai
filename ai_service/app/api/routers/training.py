@@ -229,6 +229,9 @@ class CTPostgresStore:
                     "ALTER TABLE ai_training_jobs ADD COLUMN IF NOT EXISTS audit_snapshot JSONB NULL"
                 )
                 cur.execute(
+                    "ALTER TABLE ai_training_jobs ADD COLUMN IF NOT EXISTS training_metrics JSONB NULL"
+                )
+                cur.execute(
                     """
                     SELECT data_type FROM information_schema.columns
                     WHERE table_schema = 'public'
@@ -1171,6 +1174,7 @@ class CTPostgresStore:
             promote_guardrail_passed = %(promote_guardrail_passed)s,
             promote_guardrail_reason = %(promote_guardrail_reason)s,
             audit_snapshot = %(audit_snapshot)s,
+            training_metrics = %(training_metrics)s,
             updated_at = NOW()
         WHERE training_id = %(training_id)s
         """
@@ -1188,11 +1192,39 @@ class CTPostgresStore:
                 str(promote_guardrail_reason)[:4000] if promote_guardrail_reason is not None else None
             ),
             "audit_snapshot": Json(audit_snapshot or {}),
+            "training_metrics": Json(tm),
         }
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
             conn.commit()
+
+    def update_training_job_progress(
+        self,
+        training_id: int,
+        *,
+        training_metrics: Dict[str, Any],
+    ) -> None:
+        """Persist partial training_metrics JSON during training (progress updates)."""
+        self._ensure_schema()
+        sql = """
+        UPDATE ai_training_jobs
+        SET
+            training_metrics = %(training_metrics)s,
+            updated_at = NOW()
+        WHERE training_id = %(training_id)s
+        """
+        params = {
+            "training_id": int(training_id),
+            "training_metrics": Json(training_metrics or {}),
+        }
+        try:
+            with self._conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, params)
+                conn.commit()
+        except Exception:
+            pass
 
     def update_training_job_failed(
         self,
@@ -1245,6 +1277,7 @@ class CTPostgresStore:
             promote_guardrail_passed,
             promote_guardrail_reason,
             audit_snapshot,
+            training_metrics,
             clinic_id,
             idempotency_key,
             batch_start_feedback_id,
@@ -1499,6 +1532,23 @@ async def save_feedback(feedback: DoctorFeedback) -> bool:
         logger.exception("Failed to record feedback metrics")
     _refresh_training_metrics()
 
+    if feedback.is_training_eligible:
+        try:
+            from ai_service.app.infrastructure.external.mlair_client import push_clinic_feedback_to_mlair_runtime_buffer
+
+            mlair_fb = await asyncio.to_thread(
+                push_clinic_feedback_to_mlair_runtime_buffer,
+                training_pool=pool,
+                prediction_clinic_id=pred_clinic,
+                increment=1,
+            )
+            if mlair_fb.get("status") == "ok":
+                logger.info("MLAir runtime feedback buffer: %s", mlair_fb)
+            elif mlair_fb.get("status") == "error":
+                logger.warning("MLAir runtime feedback buffer: %s", mlair_fb)
+        except Exception:
+            logger.exception("MLAir runtime feedback buffer sync failed")
+
     try:
         await schedule_automatic_batch_training_if_ready(pred_clinic, pool)
     except Exception:
@@ -1512,9 +1562,14 @@ async def save_feedback(feedback: DoctorFeedback) -> bool:
 training_jobs: Dict[int, Dict[str, Any]] = {}
 training_datasets: Dict[int, List[Dict[str, Any]]] = {}
 
+# In-memory tracker for multi-phase pipeline jobs.
+# Key: "{mlair_run_id}:{phase}" → status dict with progress_pct, current_phase, etc.
+phase_jobs: Dict[str, Dict[str, Any]] = {}
+
 # Initialize in-memory runtime caches
 training_jobs.clear()
 training_datasets.clear()
+phase_jobs.clear()
 
 logger.info("Production-ready continuous training system initialized")
 
@@ -2122,6 +2177,7 @@ async def execute_actual_training(training_id: int, training_mode: str):
                     "promote_guardrail_passed": guardrail_passed,
                     "promote_guardrail_reason": guardrail_reason,
                     "audit_snapshot": audit_snapshot,
+                    "training_metrics": tm,
                 })
 
             # Promote new model: global default or per-clinic pin when clinic_id was set on the job.
@@ -2239,6 +2295,7 @@ async def execute_bootstrap_training(
     prediction_rows: List[Dict[str, Any]],
     clinic_key: Optional[str],
     training_mode: str,
+    mlair_run_id: Optional[str] = None,
 ) -> None:
     """
     Run training from in-memory CSV-derived rows; do not clear Postgres feedback on success.
@@ -2256,6 +2313,20 @@ async def execute_bootstrap_training(
             clinic_key,
             len(feedback_rows),
         )
+
+        def _on_progress(phase: str, pct: int, metrics: Dict[str, Any]) -> None:
+            if training_id in training_jobs:
+                training_jobs[training_id]["current_phase"] = phase
+                training_jobs[training_id]["progress_pct"] = pct
+                training_jobs[training_id]["phase_metrics"] = metrics
+            try:
+                ct_store.update_training_job_progress(
+                    training_id,
+                    training_metrics={"current_phase": phase, "progress_pct": pct, **metrics},
+                )
+            except Exception:
+                pass
+
         finetune_base_model_dir: Optional[str] = None
         try:
             job_row_bs = ct_store.get_training_job(training_id)
@@ -2272,10 +2343,11 @@ async def execute_bootstrap_training(
             "training_id": training_id,
             "dataset_window_days": TRAINING_WINDOW_DAYS,
             "pipeline_kind": "bootstrap_csv",
+            "progress_callback": _on_progress,
+            "mlair_run_id": mlair_run_id,
         }
         if finetune_base_model_dir:
             exec_bs["finetune_base_model_dir"] = finetune_base_model_dir
-        # Bootstrap train is also CPU-bound; offload to thread to avoid blocking inference endpoints.
         result = await asyncio.to_thread(
             execute_training,
             feedback_rows,
@@ -2635,6 +2707,7 @@ async def get_training_status(training_id: int) -> Optional[TrainingStatus]:
     # Try persisted DB record
     job_data = ct_store.get_training_job(training_id)
     if job_data:
+        tm = job_data.get("training_metrics") or {}
         return TrainingStatus(
             training_id=job_data["training_id"],
             status=job_data["status"],
@@ -2656,6 +2729,10 @@ async def get_training_status(training_id: int) -> Optional[TrainingStatus]:
             promote_guardrail_passed=job_data.get("promote_guardrail_passed"),
             promote_guardrail_reason=job_data.get("promote_guardrail_reason"),
             audit_snapshot=job_data.get("audit_snapshot"),
+            training_metrics=tm,
+            current_phase=tm.get("current_phase"),
+            progress_pct=tm.get("progress_pct"),
+            phase_metrics={k: v for k, v in tm.items() if k not in ("current_phase", "progress_pct")} or None,
         )
 
     # Return default pending status for unknown jobs
@@ -2752,13 +2829,11 @@ async def get_training_status_endpoint(training_id: int):
         logger.error(f"Failed to get training status: {e}")
         raise HTTPException(status_code=500, detail="Failed to get training status")
 
-@router.post("/training/trigger", status_code=201)
-async def trigger_training_endpoint(
+async def run_training_trigger_flow(
     request: TrainingTriggerRequest,
     background_tasks: BackgroundTasks,
-    _: bool = Depends(verify_admin)
-):
-    """Trigger a training job"""
+) -> Dict[str, Any]:
+    """Shared implementation for POST /training/trigger and inbound MLAir training hook."""
     try:
         ck = normalize_clinic_key(request.clinic_id)
 
@@ -2800,8 +2875,8 @@ async def trigger_training_endpoint(
             eligible_count = await count_eligible_feedback(clinic_id=ck)
             if eligible_count < TRAINING_THRESHOLD:
                 raise HTTPException(
-                    status_code=400, 
-                    detail=f"Insufficient data: {eligible_count} < {TRAINING_THRESHOLD}"
+                    status_code=400,
+                    detail=f"Insufficient data: {eligible_count} < {TRAINING_THRESHOLD}",
                 )
         else:
             # Even when forced, training requires at least one eligible feedback+prediction pair
@@ -2809,27 +2884,33 @@ async def trigger_training_endpoint(
             if eligible_count <= 0:
                 raise HTTPException(
                     status_code=400,
-                    detail="No eligible feedback data to train on. Collect feedback first, then trigger training."
+                    detail="No eligible feedback data to train on. Collect feedback first, then trigger training.",
                 )
-        
+
         training_id = await trigger_training_job(request)
-        
-        # Add background task to monitor training
-        background_tasks.add_task(
-            monitor_training_progress,
-            training_id
-        )
-        
+
+        background_tasks.add_task(monitor_training_progress, training_id)
+
         return {
             "training_id": training_id,
             "status": "triggered",
-            "trigger_type": request.trigger_type
+            "trigger_type": request.trigger_type,
         }
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Failed to trigger training: {e}")
-        raise HTTPException(status_code=500, detail="Failed to trigger training")
+        raise HTTPException(status_code=500, detail="Failed to trigger training") from e
+
+
+@router.post("/training/trigger", status_code=201)
+async def trigger_training_endpoint(
+    request: TrainingTriggerRequest,
+    background_tasks: BackgroundTasks,
+    _: bool = Depends(verify_admin),
+):
+    """Trigger a training job"""
+    return await run_training_trigger_flow(request, background_tasks)
 
 
 @router.get(
@@ -3291,3 +3372,182 @@ async def monitor_training_progress(training_id: int):
             logger.warning("Training job %s timed out", training_id)
     except Exception as e:
         logger.warning("monitor_training_progress: failed timeout update: %s", e)
+
+
+# ── Multi-phase pipeline helpers ───────────────────────────────────────
+
+
+def _phase_job_key(session_id: str, phase: str) -> str:
+    return f"{phase}:{session_id}"
+
+
+def _make_phase_progress_callback(pjk: str):
+    """Return a progress callback that updates phase_jobs[pjk] in place."""
+    def _cb(phase: str, pct: int, metrics: Dict[str, Any]) -> None:
+        if pjk in phase_jobs:
+            phase_jobs[pjk]["current_phase"] = phase
+            phase_jobs[pjk]["progress_pct"] = pct
+            phase_jobs[pjk]["phase_metrics"] = metrics
+    return _cb
+
+
+async def run_phase_data_prep(
+    session_id: str,
+    feedback_rows: List[Dict[str, Any]],
+    prediction_rows: List[Dict[str, Any]],
+    clinic_key: Optional[str],
+    training_mode: str,
+    training_id: int,
+    finetune_base_model_dir: Optional[str] = None,
+) -> None:
+    """Background task: execute data_prep phase."""
+    from ai_service.app.domain.services.training_service import execute_phase_data_prep
+
+    pjk = _phase_job_key(session_id, "data_prep")
+    try:
+        result = await asyncio.to_thread(
+            execute_phase_data_prep,
+            session_id,
+            feedback_rows,
+            prediction_rows,
+            training_mode,
+            clinic_key,
+            training_id,
+            dataset_window_days=TRAINING_WINDOW_DAYS,
+            pipeline_kind="bootstrap_csv",
+            finetune_base_model_dir=finetune_base_model_dir,
+            progress_callback=_make_phase_progress_callback(pjk),
+        )
+        if result.get("status") == "completed":
+            phase_jobs[pjk]["status"] = "completed"
+            phase_jobs[pjk]["progress_pct"] = 100
+        else:
+            phase_jobs[pjk]["status"] = "failed"
+            phase_jobs[pjk]["error_message"] = result.get("error", "data_prep failed")
+    except Exception as exc:
+        logger.exception("run_phase_data_prep failed")
+        if pjk in phase_jobs:
+            phase_jobs[pjk]["status"] = "failed"
+            phase_jobs[pjk]["error_message"] = str(exc)
+
+
+async def run_phase_model_train(session_id: str) -> None:
+    """Background task: execute model_train phase."""
+    from ai_service.app.domain.services.training_service import execute_phase_model_train
+
+    pjk = _phase_job_key(session_id, "model_train")
+    try:
+        result = await asyncio.to_thread(
+            execute_phase_model_train,
+            session_id,
+            progress_callback=_make_phase_progress_callback(pjk),
+        )
+        if result.get("status") == "completed":
+            phase_jobs[pjk]["status"] = "completed"
+            phase_jobs[pjk]["progress_pct"] = 100
+        else:
+            phase_jobs[pjk]["status"] = "failed"
+            phase_jobs[pjk]["error_message"] = result.get("error", "model_train failed")
+    except Exception as exc:
+        logger.exception("run_phase_model_train failed")
+        if pjk in phase_jobs:
+            phase_jobs[pjk]["status"] = "failed"
+            phase_jobs[pjk]["error_message"] = str(exc)
+
+
+async def run_phase_validation(session_id: str) -> None:
+    """Background task: execute validation phase."""
+    from ai_service.app.domain.services.training_service import execute_phase_validation
+
+    pjk = _phase_job_key(session_id, "validation")
+    try:
+        result = await asyncio.to_thread(
+            execute_phase_validation,
+            session_id,
+            progress_callback=_make_phase_progress_callback(pjk),
+        )
+        if result.get("status") == "completed":
+            phase_jobs[pjk]["status"] = "completed"
+            phase_jobs[pjk]["progress_pct"] = 100
+        else:
+            phase_jobs[pjk]["status"] = "failed"
+            phase_jobs[pjk]["error_message"] = result.get("error", "validation failed")
+    except Exception as exc:
+        logger.exception("run_phase_validation failed")
+        if pjk in phase_jobs:
+            phase_jobs[pjk]["status"] = "failed"
+            phase_jobs[pjk]["error_message"] = str(exc)
+
+
+async def run_phase_persist(session_id: str, mlair_run_id: Optional[str] = None) -> None:
+    """Background task: execute persist phase."""
+    from ai_service.app.domain.services.training_service import execute_phase_persist
+    from ai_service.app.domain.services.training_session import load_data_prep_results
+
+    pjk = _phase_job_key(session_id, "persist")
+    try:
+        result = await asyncio.to_thread(
+            execute_phase_persist,
+            session_id,
+            mlair_run_id=mlair_run_id,
+            progress_callback=_make_phase_progress_callback(pjk),
+        )
+        if result.get("status") == "completed":
+            phase_jobs[pjk]["status"] = "completed"
+            phase_jobs[pjk]["progress_pct"] = 100
+            phase_jobs[pjk]["result"] = {
+                "model_version": result.get("model_version"),
+                "model_path": result.get("model_path"),
+                "training_metrics": result.get("training_metrics"),
+            }
+
+            # Update the main training job record
+            tm = result.get("training_metrics") or {}
+            model_version = result.get("model_version")
+            try:
+                data = load_data_prep_results(session_id)
+            except Exception:
+                data = {}
+            training_id = data.get("training_id") or result.get("training_id")
+            clinic_key = data.get("clinic_key")
+
+            if training_id is not None:
+                previous_model_version: Optional[str] = None
+                try:
+                    if clinic_key is not None:
+                        from ai_service.app.infrastructure.storage.model_store import get_active_model_for_clinic
+                        prev_active = get_active_model_for_clinic(clinic_key)
+                    else:
+                        from ai_service.app.infrastructure.storage.model_store import get_active_model
+                        prev_active = get_active_model()
+                    previous_model_version = prev_active.model_version if prev_active else None
+                except Exception:
+                    previous_model_version = None
+
+                guardrail_passed, guardrail_reason, guardrail_details = _evaluate_promote_guardrail(
+                    training_metrics=tm,
+                    previous_model_version=previous_model_version,
+                    clinic_key=clinic_key,
+                )
+                ct_store.update_training_job_completed(
+                    training_id,
+                    model_version=model_version,
+                    training_metrics=tm,
+                    is_deployed=guardrail_passed,
+                    promote_guardrail_passed=guardrail_passed,
+                    promote_guardrail_reason=guardrail_reason,
+                )
+                if guardrail_passed and model_version:
+                    try:
+                        from ai_service.app.infrastructure.storage.model_store import set_active_model
+                        set_active_model(model_version, clinic_key=clinic_key)
+                    except Exception:
+                        pass
+        else:
+            phase_jobs[pjk]["status"] = "failed"
+            phase_jobs[pjk]["error_message"] = result.get("error", "persist failed")
+    except Exception as exc:
+        logger.exception("run_phase_persist failed")
+        if pjk in phase_jobs:
+            phase_jobs[pjk]["status"] = "failed"
+            phase_jobs[pjk]["error_message"] = str(exc)
